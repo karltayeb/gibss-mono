@@ -1,0 +1,31 @@
+[project]
+name = "gibss-mono"
+version = "0.1.0"
+description = "Standalone gibss core packages"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "jax",
+    "numpy",
+    "polars",
+    "scipy",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gseasusie = ["msigdb/*.gmt"]

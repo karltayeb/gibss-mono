@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: gibss-mono
+Version: 0.1.0
+Summary: Standalone gibss core packages
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: jax
+Requires-Dist: numpy
+Requires-Dist: polars
+Requires-Dist: scipy
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+
+gibss + gsea mono repo

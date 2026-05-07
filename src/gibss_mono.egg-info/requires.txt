@@ -1,0 +1,7 @@
+jax
+numpy
+polars
+scipy
+
+[test]
+pytest
