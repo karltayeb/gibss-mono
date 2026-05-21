@@ -21,7 +21,7 @@
 - [ ] **Step 1: Prove current imports pull non-core layers**
 
 Run: `uv run python -m pytest -q tests/test_gsea_scale_mixture.py`
-Expected: import failures or dependency failures from `gsea.__init__` eager imports
+Expected: import failures or dependency failures from `gseasusie.__init__` eager imports
 
 - [ ] **Step 2: Remove `de_runner` and `summary` from active package surface**
 

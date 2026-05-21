@@ -22,7 +22,7 @@
 - [ ] **Step 1: Write or enable failing import-path test**
 
 Run: `uv run python -m pytest -q tests/test_reference_logistic.py`
-Expected: FAIL during import because `reference.logistic` imports missing `gibss.kernels`
+Expected: FAIL during import because `gibss_reference.logistic` imports missing `gibss.kernels`
 
 - [ ] **Step 2: Implement missing helper locally in `reference`**
 
@@ -72,7 +72,7 @@ Expected: PASS
 
 - [ ] **Step 1: Write one parity test first**
 
-Choose linear first. Compare stable outputs from `gibss.linear` and `reference.linear` on deterministic fixture.
+Choose linear first. Compare stable outputs from `gibss.linear` and `gibss_reference.linear` on deterministic fixture.
 
 - [ ] **Step 2: Verify red**
 
