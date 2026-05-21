@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, replace
-from functools import partial
+from functools import partial, wraps
 from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
@@ -176,6 +176,13 @@ def _run_inner_intercept_step(
     data: Any,
     state: GIBSSState[TwoGroupFamilyState, Any],
 ) -> GIBSSState[TwoGroupFamilyState, Any]:
+    intercept_step = _resolve_inner_intercept_step(state)
+    return use_ez_as_y(intercept_step)(data, state)
+
+
+def _resolve_inner_intercept_step(
+    state: GIBSSState[TwoGroupFamilyState, Any],
+):
     family = state.family_state
     inner_family = family.inner_family_state
     module = import_module(inner_family.__class__.__module__)
@@ -185,8 +192,7 @@ def _run_inner_intercept_step(
             "twogroup intercept alignment requires an inner family with an "
             "estimate_intercept_step and intercept"
         )
-
-    return use_ez_as_y(intercept_step)(data, state)
+    return intercept_step
 
 
 def estimate_intercept_step(
@@ -307,13 +313,19 @@ def wrap_schedule_with_ez(schedule: Schedule) -> Schedule:
     )
 
 
-def _validate_base_schedule_intercept_step(base_schedule: Schedule) -> None:
+def _unwrap_partial_step(step):
+    while isinstance(step, partial):
+        step = step.func
+    return step
+
+
+def _resolve_base_schedule_intercept_step(base_schedule: Schedule):
     intercept_steps = tuple(base_schedule.before_effect_update)
-    if any(
-        getattr(step, "__name__", None) == "estimate_intercept_step"
-        for step in intercept_steps
-    ):
-        return
+    for step in intercept_steps:
+        if getattr(_unwrap_partial_step(step), "__name__", None) == (
+            "estimate_intercept_step"
+        ):
+            return step
 
     raise ValueError(
         "twogroup intercept alignment requires a base schedule with an "
@@ -321,19 +333,35 @@ def _validate_base_schedule_intercept_step(base_schedule: Schedule) -> None:
     )
 
 
+def _make_before_fit_intercept_step(intercept_step):
+    wrapped_step = use_ez_as_y(intercept_step)
+
+    @wraps(_unwrap_partial_step(intercept_step))
+    def estimate_intercept_step(data, state):
+        for _ in range(state.family_state.n_intercept_iter):
+            state = wrapped_step(data, state)
+            state = update_Ez_step(data, state)
+        return state
+
+    return estimate_intercept_step
+
+
 def default_schedule(base_schedule: Schedule) -> Schedule:
     """
     Constructs a TwoGroup schedule by wrapping a base SuSiE schedule
     (like localjj.default_schedule) and injecting the EM updates.
     """
-    _validate_base_schedule_intercept_step(base_schedule)
+    base_intercept_step = _resolve_base_schedule_intercept_step(base_schedule)
 
     # 1. Wrap SuSiE kernels to use Ez
     schedule = wrap_schedule_with_ez(base_schedule)
 
     # 2. Inject Two-Group EM steps
     schedule = add_step(schedule, before_fit=(estimate_f_step, 0))
-    schedule = add_step(schedule, before_fit=(estimate_intercept_step, 0))
+    schedule = add_step(
+        schedule,
+        before_fit=(_make_before_fit_intercept_step(base_intercept_step), 0),
+    )
     schedule = add_step(schedule, before_effect_update=(update_Ez_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f0_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f1_step, 1))

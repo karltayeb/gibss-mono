@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+from functools import partial
 
 import numpy as np
 import pytest
@@ -115,6 +116,44 @@ def test_default_schedule_runs_intercept_alignment_before_estimate_f():
     assert before_fit_names[:2] == ["estimate_intercept_step", "estimate_f_step"]
 
 
+def test_default_schedule_uses_wrapped_base_intercept_step_and_preserves_name():
+    X, bhat, se, _ = _make_case()
+    data = twogroup.prep_data(X, bhat=bhat, se=se)
+    inner_state = _make_inner_state(
+        X,
+        L=1,
+        intercept=-3.0,
+        estimate_prior_variance=False,
+    )
+    state = twogroup.initialize_state(
+        data,
+        inner_state=inner_state,
+        f0=PointMass(),
+        f1=Normal(scale=1.0),
+        n_intercept_iter=3,
+    )
+
+    calls = []
+
+    def estimate_intercept_step(data, state):
+        calls.append("base")
+        return localjj.estimate_intercept_step(data, state)
+
+    base_schedule = replace(
+        localjj.default_schedule(),
+        before_effect_update=(partial(estimate_intercept_step),),
+    )
+
+    schedule = twogroup.default_schedule(base_schedule)
+    before_fit_names = [step.__name__ for step in schedule.before_fit]
+
+    assert before_fit_names[:2] == ["estimate_intercept_step", "estimate_f_step"]
+
+    schedule.before_fit[0](data, state)
+
+    assert calls == ["base"] * state.family_state.n_intercept_iter
+
+
 def test_estimate_intercept_step_updates_intercept_and_ez_but_not_f1():
     X, bhat, se, _ = _make_case()
     data = twogroup.prep_data(X, bhat=bhat, se=se)
@@ -143,6 +182,37 @@ def test_estimate_intercept_step_updates_intercept_and_ez_but_not_f1():
     assert updated.family_state.f1 == f1_before
     assert updated.family_state.inner_family_state.intercept != intercept_before
     assert not np.allclose(np.asarray(updated.family_state.Ez), ez_before)
+
+
+def test_estimate_intercept_step_runs_n_intercept_iterations(monkeypatch):
+    X, bhat, se, _ = _make_case()
+    data = twogroup.prep_data(X, bhat=bhat, se=se)
+    inner_state = _make_inner_state(X, L=1)
+    state = twogroup.initialize_state(
+        data,
+        inner_state=inner_state,
+        f0=PointMass(),
+        f1=Normal(scale=1.0),
+        n_intercept_iter=3,
+    )
+
+    calls = []
+
+    def fake_intercept_step(data, state):
+        calls.append("intercept")
+        return state
+
+    def fake_update_ez_step(data, state):
+        calls.append("ez")
+        return state
+
+    monkeypatch.setattr(twogroup, "_run_inner_intercept_step", fake_intercept_step)
+    monkeypatch.setattr(twogroup, "update_Ez_step", fake_update_ez_step)
+
+    updated = twogroup.estimate_intercept_step(data, state)
+
+    assert updated is state
+    assert calls == ["intercept", "ez"] * state.family_state.n_intercept_iter
 
 
 def test_estimate_intercept_step_requires_inner_intercept_support():
