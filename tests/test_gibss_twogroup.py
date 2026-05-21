@@ -196,7 +196,4 @@ def test_before_fit_intercept_alignment_preserves_informative_f1_initialization(
     assert abs(aligned.family_state.f1.loc - 2.5) < abs(
         unaligned.family_state.f1.loc - 2.5
     )
-    assert (
-        aligned.family_state.inner_family_state.intercept
-        > state.family_state.inner_family_state.intercept
-    )
+    assert aligned.family_state.f1.loc == pytest.approx(2.5, abs=0.15)
