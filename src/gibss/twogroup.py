@@ -307,11 +307,27 @@ def wrap_schedule_with_ez(schedule: Schedule) -> Schedule:
     )
 
 
+def _validate_base_schedule_intercept_step(base_schedule: Schedule) -> None:
+    intercept_steps = tuple(base_schedule.before_effect_update)
+    if any(
+        getattr(step, "__name__", None) == "estimate_intercept_step"
+        for step in intercept_steps
+    ):
+        return
+
+    raise ValueError(
+        "twogroup intercept alignment requires a base schedule with an "
+        "estimate_intercept_step in before_effect_update"
+    )
+
+
 def default_schedule(base_schedule: Schedule) -> Schedule:
     """
     Constructs a TwoGroup schedule by wrapping a base SuSiE schedule
     (like localjj.default_schedule) and injecting the EM updates.
     """
+    _validate_base_schedule_intercept_step(base_schedule)
+
     # 1. Wrap SuSiE kernels to use Ez
     schedule = wrap_schedule_with_ez(base_schedule)
 
