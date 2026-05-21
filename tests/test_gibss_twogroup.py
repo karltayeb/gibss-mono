@@ -154,6 +154,84 @@ def test_default_schedule_uses_wrapped_base_intercept_step_and_preserves_name():
     assert calls == ["base"] * state.family_state.n_intercept_iter
 
 
+def test_default_schedule_replays_full_wrapped_before_effect_sequence_during_alignment(
+    monkeypatch,
+):
+    X, bhat, se, _ = _make_case()
+    data = twogroup.prep_data(X, bhat=bhat, se=se)
+    inner_state = _make_inner_state(
+        X,
+        L=1,
+        intercept=-3.0,
+        estimate_prior_variance=False,
+    )
+    state = twogroup.initialize_state(
+        data,
+        inner_state=inner_state,
+        f0=PointMass(),
+        f1=Normal(scale=1.0),
+        n_intercept_iter=3,
+    )
+
+    calls = []
+    wrapped_y_values = []
+
+    def estimate_intercept_step(data, state):
+        calls.append("intercept")
+        wrapped_y_values.append(float(np.asarray(data.y)[0]))
+        return state
+
+    def coupled_before_effect_step(data, state):
+        calls.append("coupled")
+        wrapped_y_values.append(float(np.asarray(data.y)[0]))
+        return state
+
+    def fake_update_ez_step(data, state):
+        calls.append("ez")
+        next_ez = np.asarray(state.family_state.Ez) + 1.0
+        return replace(
+            state,
+            family_state=replace(state.family_state, Ez=next_ez),
+        )
+
+    base_schedule = replace(
+        localjj.default_schedule(),
+        before_effect_update=(
+            partial(estimate_intercept_step),
+            coupled_before_effect_step,
+        ),
+    )
+
+    monkeypatch.setattr(twogroup, "update_Ez_step", fake_update_ez_step)
+
+    schedule = twogroup.default_schedule(base_schedule)
+    before_fit_names = [step.__name__ for step in schedule.before_fit]
+
+    assert before_fit_names[:2] == ["estimate_intercept_step", "estimate_f_step"]
+
+    schedule.before_fit[0](data, state)
+
+    assert calls == ["intercept", "coupled", "ez"] * state.family_state.n_intercept_iter
+    assert wrapped_y_values == [0.5, 0.5, 1.5, 1.5, 2.5, 2.5]
+
+
+def test_default_schedule_skips_before_fit_alignment_without_intercept_step():
+    def coupled_before_effect_step(data, state):
+        del data
+        return state
+
+    base_schedule = replace(
+        localjj.default_schedule(),
+        before_effect_update=(coupled_before_effect_step,),
+    )
+
+    schedule = twogroup.default_schedule(base_schedule)
+    before_fit_names = [step.__name__ for step in schedule.before_fit]
+
+    assert before_fit_names[0] == "estimate_f_step"
+    assert "estimate_intercept_step" not in before_fit_names
+
+
 def test_estimate_intercept_step_updates_intercept_and_ez_but_not_f1():
     X, bhat, se, _ = _make_case()
     data = twogroup.prep_data(X, bhat=bhat, se=se)

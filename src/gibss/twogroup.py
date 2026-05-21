@@ -319,27 +319,21 @@ def _unwrap_partial_step(step):
     return step
 
 
-def _resolve_base_schedule_intercept_step(base_schedule: Schedule):
-    intercept_steps = tuple(base_schedule.before_effect_update)
-    for step in intercept_steps:
+def _find_base_schedule_intercept_step(base_schedule: Schedule):
+    for step in tuple(base_schedule.before_effect_update):
         if getattr(_unwrap_partial_step(step), "__name__", None) == (
             "estimate_intercept_step"
         ):
             return step
-
-    raise ValueError(
-        "twogroup intercept alignment requires a base schedule with an "
-        "estimate_intercept_step in before_effect_update"
-    )
+    return None
 
 
-def _make_before_fit_intercept_step(intercept_step):
-    wrapped_step = use_ez_as_y(intercept_step)
-
+def _make_before_fit_intercept_step(before_effect_steps, intercept_step):
     @wraps(_unwrap_partial_step(intercept_step))
     def estimate_intercept_step(data, state):
         for _ in range(state.family_state.n_intercept_iter):
-            state = wrapped_step(data, state)
+            for step in before_effect_steps:
+                state = step(data, state)
             state = update_Ez_step(data, state)
         return state
 
@@ -351,17 +345,22 @@ def default_schedule(base_schedule: Schedule) -> Schedule:
     Constructs a TwoGroup schedule by wrapping a base SuSiE schedule
     (like localjj.default_schedule) and injecting the EM updates.
     """
-    base_intercept_step = _resolve_base_schedule_intercept_step(base_schedule)
+    base_intercept_step = _find_base_schedule_intercept_step(base_schedule)
 
     # 1. Wrap SuSiE kernels to use Ez
     schedule = wrap_schedule_with_ez(base_schedule)
+    alignment_steps = tuple(schedule.before_effect_update)
 
     # 2. Inject Two-Group EM steps
     schedule = add_step(schedule, before_fit=(estimate_f_step, 0))
-    schedule = add_step(
-        schedule,
-        before_fit=(_make_before_fit_intercept_step(base_intercept_step), 0),
-    )
+    if base_intercept_step is not None:
+        schedule = add_step(
+            schedule,
+            before_fit=(
+                _make_before_fit_intercept_step(alignment_steps, base_intercept_step),
+                0,
+            ),
+        )
     schedule = add_step(schedule, before_effect_update=(update_Ez_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f0_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f1_step, 1))
