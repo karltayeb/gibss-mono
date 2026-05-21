@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, replace
-from types import SimpleNamespace
 from functools import partial
+from importlib import import_module
+from types import SimpleNamespace
 from typing import Any
 import jax
 import jax.numpy as jnp
@@ -78,6 +79,7 @@ class TwoGroupFamilyState:
     update_f0: bool = True
     update_f1: bool = True
     n_null_iter: int = 10
+    n_intercept_iter: int = 5
 
 
 def initialize_state(
@@ -86,6 +88,7 @@ def initialize_state(
     f0: Any,
     f1: Any,
     n_null_iter: int = 10,
+    n_intercept_iter: int = 5,
 ) -> GIBSSState[TwoGroupFamilyState, Any]:
     """
     Initialize TwoGroup state by wrapping an existing SuSiE state.
@@ -97,6 +100,7 @@ def initialize_state(
         f1=f1,
         inner_family_state=inner_state.family_state,
         n_null_iter=int(n_null_iter),
+        n_intercept_iter=int(n_intercept_iter),
     )
     return replace(inner_state, family_state=tg_fs)
 
@@ -166,6 +170,33 @@ def update_Ez_step(
     new_Ez = compute_Ez(data, state)
     new_family = replace(state.family_state, Ez=new_Ez)
     return replace(state, family_state=new_family)
+
+
+def _run_inner_intercept_step(
+    data: Any,
+    state: GIBSSState[TwoGroupFamilyState, Any],
+) -> GIBSSState[TwoGroupFamilyState, Any]:
+    family = state.family_state
+    inner_family = family.inner_family_state
+    module = import_module(inner_family.__class__.__module__)
+    intercept_step = getattr(module, "estimate_intercept_step", None)
+    if not hasattr(inner_family, "intercept") or intercept_step is None:
+        raise ValueError(
+            "twogroup intercept alignment requires an inner family with an "
+            "estimate_intercept_step and intercept"
+        )
+
+    return use_ez_as_y(intercept_step)(data, state)
+
+
+def estimate_intercept_step(
+    data: Any,
+    state: GIBSSState[TwoGroupFamilyState, Any],
+) -> GIBSSState[TwoGroupFamilyState, Any]:
+    for _ in range(state.family_state.n_intercept_iter):
+        state = _run_inner_intercept_step(data, state)
+        state = update_Ez_step(data, state)
+    return state
 
 
 def update_f0_step(
@@ -286,6 +317,7 @@ def default_schedule(base_schedule: Schedule) -> Schedule:
 
     # 2. Inject Two-Group EM steps
     schedule = add_step(schedule, before_fit=(estimate_f_step, 0))
+    schedule = add_step(schedule, before_fit=(estimate_intercept_step, 0))
     schedule = add_step(schedule, before_effect_update=(update_Ez_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f0_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f1_step, 1))
