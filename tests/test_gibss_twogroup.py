@@ -1,3 +1,5 @@
+from dataclasses import dataclass, replace
+
 import numpy as np
 import pytest
 
@@ -61,3 +63,59 @@ def test_initialize_state_wraps_inner_family_state():
     )
 
     assert state.family_state.inner_family_state == inner_state.family_state
+
+
+def test_initialize_state_stores_n_intercept_iter():
+    X, bhat, se, _ = _make_case()
+    data = twogroup.prep_data(X, bhat=bhat, se=se)
+    inner_data = localjj.prep_data(X, np.full(X.shape[0], 0.5))
+    inner_state = localjj.initialize_state(inner_data, L=2)
+
+    state = twogroup.initialize_state(
+        data,
+        inner_state=inner_state,
+        f0=PointMass(),
+        f1=Normal(scale=1.0),
+        n_intercept_iter=7,
+    )
+
+    assert state.family_state.n_intercept_iter == 7
+
+
+def test_default_schedule_runs_intercept_alignment_before_estimate_f():
+    schedule = twogroup.default_schedule(localjj.default_schedule())
+    before_fit_names = [step.__name__ for step in schedule.before_fit]
+
+    assert before_fit_names[:2] == ["estimate_intercept_step", "estimate_f_step"]
+
+
+def test_estimate_intercept_step_updates_intercept_and_ez_but_not_f1():
+    X, bhat, se, _ = _make_case()
+    data = twogroup.prep_data(X, bhat=bhat, se=se)
+    inner_data = localjj.prep_data(X, np.full(X.shape[0], 0.5))
+    inner_state = localjj.initialize_state(inner_data, L=1)
+    inner_family = replace(
+        inner_state.family_state,
+        intercept=-3.0,
+        estimate_prior_variance=False,
+    )
+    inner_state = replace(inner_state, family_state=inner_family)
+
+    f1 = Normal(loc=2.0, scale=0.2, estimate_loc=False, estimate_scale=False)
+    state = twogroup.initialize_state(
+        data,
+        inner_state=inner_state,
+        f0=PointMass(),
+        f1=f1,
+        n_intercept_iter=4,
+    )
+
+    intercept_before = state.family_state.inner_family_state.intercept
+    ez_before = np.asarray(state.family_state.Ez)
+    f1_before = state.family_state.f1
+
+    updated = twogroup.estimate_intercept_step(data, state)
+
+    assert updated.family_state.f1 == f1_before
+    assert updated.family_state.inner_family_state.intercept != intercept_before
+    assert not np.allclose(np.asarray(updated.family_state.Ez), ez_before)
