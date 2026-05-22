@@ -243,14 +243,14 @@ def estimate_f_step(
     data: Any, state: GIBSSState[TwoGroupFamilyState, Any]
 ) -> GIBSSState[TwoGroupFamilyState, Any]:
     """
-    Performs multiple EM steps to initialize f0 and f1, holding the SuSiE
-    enrichment model (eta) fixed. Typically called in before_fit.
+    Performs multiple EM steps to initialize f0 and f1 during before_fit.
+    When the inner model supports intercept updates, refresh the intercept/Ez
+    pair within the loop so poor f1 initialization does not lock in a bad Ez.
     """
     for _ in range(state.family_state.n_null_iter):
         state = update_f0_step(data, state)
         state = update_f1_step(data, state)
-        # Re-estimate Ez given new distributions
-        state = update_Ez_step(data, state)
+        state = estimate_intercept_step(data, state)
     return state
 
 
