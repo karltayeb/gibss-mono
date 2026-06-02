@@ -69,7 +69,7 @@ def prep_data(X, y) -> LinearData:
 
 def fit_univariate_linear_regression(data, tau, offset, prior_variance):
     X = data.X
-    y = jnp.asarray(data.y)
+    y = jdata.y
     tau = jnp.asarray(tau)
     offset = jnp.asarray(offset)
     X_sq = data.X_sq
@@ -91,7 +91,7 @@ def fit_univariate_linear_regression(data, tau, offset, prior_variance):
 
 
 def linear_null_log_likelihood(data, tau, offset):
-    resid = jnp.asarray(data.y) - jnp.asarray(offset)
+    resid = jdata.y - jnp.asarray(offset)
     tau = jnp.asarray(tau)
     return float(-0.5 * jnp.sum(jnp.log(2.0 * jnp.pi / tau) + tau * jnp.square(resid)))
 
@@ -117,10 +117,10 @@ def initialize_state(
     L: int = 1,
     family_state_kwargs: dict | None = None,
 ) -> GIBSSState[LinearFamilyState, Message]:
-    X = np.asarray(data.X)
-    p = X.shape[1]
+    p = data.X.shape[1]
+    n = data.X.shape[0]
     family_state = LinearFamilyState(**({} if family_state_kwargs is None else dict(family_state_kwargs)))
-    zero_message = Message(np.zeros(X.shape[0]), np.zeros(X.shape[0]))
+    zero_message = Message(np.zeros(n), np.zeros(n))
     return GIBSSState(
         single_effects=[_empty_effect(p, 1.0) for _ in range(L)],
         total_message=zero_message,
@@ -132,7 +132,7 @@ def fit_linear_ser(data, tau, offset, prior_variance) -> BaseSERState:
     mu, var, feature_log_evidence = fit_univariate_linear_regression(
         data, tau, offset, prior_variance
     )
-    p = np.asarray(data.X).shape[1]
+    p = data.X.shape[1]
     log_norm = _logsumexp(feature_log_evidence)
     alpha = np.exp(feature_log_evidence - log_norm)
     alpha = alpha / np.sum(alpha)
@@ -162,7 +162,7 @@ def fit_linear_ser(data, tau, offset, prior_variance) -> BaseSERState:
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
     tau = np.full(
-        np.asarray(data.y).shape[0], 1.0 / state.family_state.residual_variance
+        data.y.shape[0], 1.0 / state.family_state.residual_variance
     )
     new_effect = fit_linear_ser(
         data,
@@ -199,11 +199,11 @@ def update_residual_variance_step(data, state):
         return state
 
     residual = (
-        np.asarray(data.y) - state.family_state.intercept - state.total_message.mean
+        data.y - state.family_state.intercept - state.total_message.mean
     )
     expected_rss = np.sum(np.square(residual) + state.total_message.var)
     new_residual_variance = max(
-        expected_rss / np.asarray(data.y).shape[0],
+        expected_rss / data.y.shape[0],
         state.family_state.min_residual_variance,
     )
     family_state = replace(
@@ -213,7 +213,7 @@ def update_residual_variance_step(data, state):
 
 
 def estimate_intercept(data, state) -> float:
-    return float(np.mean(np.asarray(data.y) - state.total_message.mean))
+    return float(np.mean(data.y - state.total_message.mean))
 
 
 def estimate_intercept_step(data, state):
@@ -226,9 +226,9 @@ def estimate_intercept_step(data, state):
 
 def compute_elbo(data, state) -> float:
     family_state = state.family_state
-    residual = np.asarray(data.y) - family_state.intercept - state.total_message.mean
+    residual = data.y - family_state.intercept - state.total_message.mean
     expected_rss = np.sum(np.square(residual) + state.total_message.var)
-    n = np.asarray(data.y).shape[0]
+    n = data.y.shape[0]
     residual_variance = float(family_state.residual_variance)
     expected_ll = (
         -0.5 * n * np.log(2.0 * np.pi * residual_variance)
