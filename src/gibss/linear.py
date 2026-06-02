@@ -69,7 +69,7 @@ def prep_data(X, y) -> LinearData:
 
 def fit_univariate_linear_regression(data, tau, offset, prior_variance):
     X = data.X
-    y = jdata.y
+    y = data.y
     tau = jnp.asarray(tau)
     offset = jnp.asarray(offset)
     X_sq = data.X_sq
@@ -91,7 +91,7 @@ def fit_univariate_linear_regression(data, tau, offset, prior_variance):
 
 
 def linear_null_log_likelihood(data, tau, offset):
-    resid = jdata.y - jnp.asarray(offset)
+    resid = data.y - jnp.asarray(offset)
     tau = jnp.asarray(tau)
     return float(-0.5 * jnp.sum(jnp.log(2.0 * jnp.pi / tau) + tau * jnp.square(resid)))
 
