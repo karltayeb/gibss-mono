@@ -75,10 +75,10 @@ def fit_univariate_linear_regression(data, tau, offset, prior_variance):
     X_sq = data.X_sq
 
     if is_bcoo(X):
-        weighted_x2 = X_sq.transpose() @ tau
+        weighted_x2 = tau @ X_sq
         precision = (1.0 / prior_variance) + weighted_x2
         var = 1.0 / precision
-        mu = var * (X.transpose() @ (tau * (y - offset)))
+        mu = var * ((tau * (y - offset)) @ X)
     else:
         weighted_x2 = jnp.sum(tau[:, None] * X_sq, axis=0)
         precision = (1.0 / prior_variance) + weighted_x2
