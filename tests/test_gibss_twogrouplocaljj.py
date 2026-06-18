@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import pytest
 from jax.experimental import sparse
 
+import gibss.localjj as ljj
 import gibss.twogroup as tg
 import gibss.twogrouplocaljj as tgl
 from gibss.distributions import PointMass, Normal
@@ -134,6 +135,70 @@ def test_inner_em_objective_non_decreasing():
         vals.append(elbo(mu, var))
     diffs = np.diff(np.array(vals))
     assert np.all(diffs >= -1e-6), vals
+
+
+def test_local_logbf_ge_global_per_feature():
+    """Fused inner EM (twogrouplocaljj) yields a per-feature two-group ELBO at
+    least as large as the global-Ez + localjj base fit evaluated under the same
+    objective. The local model performs coordinate ascent on exactly this ELBO,
+    so its optimum dominates the global posterior (a feasible point) feature by
+    feature, and therefore in total."""
+    rng = np.random.default_rng(7)
+    n, p = 60, 8
+    X = rng.normal(size=(n, p))
+    bhat = rng.normal(size=n)
+    bhat[:20] += 2.5  # enrichment signal in the first block
+    se = np.ones(n)
+
+    # Fixed, identical generative components for both fits.
+    f0 = PointMass(0.0)
+    f1 = Normal(loc=0.0, scale=2.0, estimate_loc=False)
+    llr = np.asarray(
+        f1.log_likelihood_nm(jnp.asarray(bhat), jnp.asarray(se))
+        - f0.log_likelihood_nm(jnp.asarray(bhat), jnp.asarray(se))
+    )
+
+    offset = np.zeros(n)
+    offset_var = np.zeros(n)
+    pv = 1.0
+    mu0 = np.zeros(p)
+    var0 = np.ones(p)
+
+    # Local fused-EM two-group SER.
+    base_data = tgl.prep_data(X, llr)
+    local = tgl.fit_local_twogroup_ser(
+        base_data, offset, offset_var, mu0, var0, pv, n_inner_iter=50
+    )
+    local_logbf = np.asarray(local.feature_log_evidence) - local.null_log_likelihood
+
+    # Global: localjj fit on the fixed global Ez = sigmoid(offset + llr), then
+    # score its posterior under the *same* two-group ELBO objective.
+    Ez = 1.0 / (1.0 + np.exp(-(offset + llr)))
+    g = ljj.fit_local_jj_ser(
+        ljj.prep_data(X, Ez), offset, mu0, var0, pv, offset_var=offset_var
+    )
+    gmu = np.asarray(g.mu)
+    gvar = np.asarray(g.var)
+
+    X_sq = X**2
+    eta = offset[:, None] + X * gmu[None, :]
+    e_eta_sq = (
+        X_sq * (gmu**2 + gvar)[None, :]
+        + 2.0 * X * gmu[None, :] * offset[:, None]
+        + offset[:, None] ** 2
+        + offset_var[:, None]
+    )
+    obj = np.asarray(
+        jax.vmap(tgl._twogroup_jj_objective, in_axes=(None, 1, 1))(
+            jnp.asarray(llr), jnp.asarray(eta), jnp.asarray(e_eta_sq)
+        )
+    )
+    kl_gauss = 0.5 * (np.log(pv / gvar) + (gvar + gmu**2) / pv - 1.0)
+    global_logbf = (obj - kl_gauss) - local.null_log_likelihood  # null is shared
+
+    # Per-feature dominance and (consequently) total dominance.
+    assert np.all(local_logbf >= global_logbf - 1e-6), np.c_[local_logbf, global_logbf]
+    assert local_logbf.sum() >= global_logbf.sum() - 1e-6
 
 
 def test_sparse_X_raises_not_implemented():
