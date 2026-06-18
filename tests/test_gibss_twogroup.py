@@ -156,14 +156,14 @@ def test_estimate_intercept_step_updates_intercept_and_ez_but_not_f1():
     )
 
     intercept_before = state.family_state.inner_family_state.intercept
-    ez_before = np.asarray(state.family_state.Ez)
+    ez_before = np.asarray(twogroup.compute_Ez(data, state))
     f1_before = state.family_state.f1
 
     updated = twogroup.estimate_intercept_step(data, state)
 
     assert updated.family_state.f1 == f1_before
     assert updated.family_state.inner_family_state.intercept != intercept_before
-    assert not np.allclose(np.asarray(updated.family_state.Ez), ez_before)
+    assert not np.allclose(np.asarray(twogroup.compute_Ez(data, updated)), ez_before)
 
 
 def test_estimate_intercept_step_runs_n_intercept_iterations(monkeypatch):
@@ -184,17 +184,12 @@ def test_estimate_intercept_step_runs_n_intercept_iterations(monkeypatch):
         calls.append("intercept")
         return state
 
-    def fake_update_ez_step(data, state):
-        calls.append("ez")
-        return state
-
     monkeypatch.setattr(twogroup, "_run_inner_intercept_step", fake_intercept_step)
-    monkeypatch.setattr(twogroup, "update_Ez_step", fake_update_ez_step)
 
     updated = twogroup.estimate_intercept_step(data, state)
 
     assert updated is state
-    assert calls == ["intercept", "ez"] * state.family_state.n_intercept_iter
+    assert calls == ["intercept"] * state.family_state.n_intercept_iter
 
 
 def test_estimate_intercept_step_is_identity_without_inner_intercept_support():
@@ -246,7 +241,9 @@ def test_before_fit_intercept_alignment_preserves_informative_f1_initialization(
         twogroup.estimate_intercept_step(data, state),
     )
 
-    assert abs(aligned.family_state.f1.loc - 2.5) < abs(
-        unaligned.family_state.f1.loc - 2.5
-    )
+    # Ez is always derived (sigmoid(intercept + eta + llr)), so even without an
+    # explicit pre-alignment pass the f-step is intercept-aware: the informative
+    # f1 init (loc=2.5) is preserved rather than collapsing toward the global
+    # mean (~1.25). Explicit pre-alignment must not break that either.
+    assert unaligned.family_state.f1.loc == pytest.approx(2.5, abs=0.15)
     assert aligned.family_state.f1.loc == pytest.approx(2.5, abs=0.15)
