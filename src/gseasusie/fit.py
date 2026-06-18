@@ -18,6 +18,7 @@ import gibss.localjj
 import gibss.logistic_quadrature
 import gibss.cox
 import gibss.twogroup
+import gibss.twogrouplocaljj
 
 from gseasusie.gene_data import (
     align,
@@ -761,19 +762,31 @@ def fit_gsea_susie_twogroup(
         max_set_size=max_set_size,
         normalize=normalize,
     )
-    X_sparse = sparse.BCOO.fromdense(
-        jnp.asarray(prepared["membership"], dtype=jnp.float32)
-    )
+    X_dense = jnp.asarray(prepared["membership"], dtype=jnp.float32)
+    # The local two-group base is dense-only; other bases use sparse membership.
+    use_local_base = base_method == "twogroup_local"
+    X_model = X_dense if use_local_base else sparse.BCOO.fromdense(X_dense)
     y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)
-    l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
+    l_model = min(10, X_model.shape[1]) if L is None else int(L)
 
     # Prepare TwoGroupData
-    tg_data = gibss.twogroup.prep_data(X_sparse, y_jax)
+    tg_data = gibss.twogroup.prep_data(X_model, y_jax)
 
     # 1. Initialize Base SuSiE State and Schedule
-    if base_method == "logistic":
+    if base_method == "twogroup_local":
+        base_data = gibss.twogrouplocaljj.prep_data(X_model, y_jax[:, 0])  # dummy y
+        base_state = gibss.twogrouplocaljj.initialize_state(
+            base_data,
+            L=l_model,
+            family_state_kwargs={
+                "estimate_prior_variance": bool(estimate_prior_variance),
+                **family_kwargs,
+            },
+        )
+        base_schedule = gibss.twogrouplocaljj.default_schedule()
+    elif base_method == "logistic":
         if variant == "local_jj":
-            base_data = gibss.localjj.prep_data(X_sparse, y_jax[:, 0])  # dummy y
+            base_data = gibss.localjj.prep_data(X_model, y_jax[:, 0])  # dummy y
             base_state = gibss.localjj.initialize_state(
                 base_data,
                 L=l_model,
@@ -784,7 +797,7 @@ def fit_gsea_susie_twogroup(
             )
             base_schedule = gibss.localjj.default_schedule()
         elif variant == "quadrature":
-            base_data = gibss.logistic_quadrature.prep_data(X_sparse, y_jax[:, 0])
+            base_data = gibss.logistic_quadrature.prep_data(X_model, y_jax[:, 0])
             base_state = gibss.logistic_quadrature.initialize_state(
                 base_data,
                 L=l_model,
@@ -795,7 +808,7 @@ def fit_gsea_susie_twogroup(
             )
             base_schedule = gibss.logistic_quadrature.default_schedule()
     elif base_method == "cox":
-        base_data = gibss.cox.prep_data(X_sparse, y_jax)
+        base_data = gibss.cox.prep_data(X_model, y_jax)
         base_state = gibss.cox.initialize_state(
             base_data,
             L=l_model,
@@ -806,7 +819,7 @@ def fit_gsea_susie_twogroup(
         )
         base_schedule = gibss.cox.default_schedule()
     elif base_method == "linear":
-        base_data = gibss.linear.prep_data(X_sparse, y_jax[:, 0])
+        base_data = gibss.linear.prep_data(X_model, y_jax[:, 0])
         base_state = gibss.linear.initialize_state(
             base_data,
             L=l_model,
@@ -838,7 +851,10 @@ def fit_gsea_susie_twogroup(
         f1=f1_obj,
         n_null_iter=family_kwargs.get("n_null_iter", 10),
     )
-    schedule = gibss.twogroup.default_schedule(base_schedule)
+    if base_method == "twogroup_local":
+        schedule = gibss.twogroup.local_default_schedule(base_schedule)
+    else:
+        schedule = gibss.twogroup.default_schedule(base_schedule)
 
     # 3. Handle Thresholding
     if threshold_method == "hard":

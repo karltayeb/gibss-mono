@@ -69,9 +69,16 @@ class TwoGroupFamilyState:
     Holds the state for the Two-Group enrichment model, wrapping
     the inner family state (e.g., LocalJJFamilyState) used for the
     SuSiE latent target regression.
+
+    The stored latent quantity is the per-observation log-likelihood ratio
+    ``llr = log f1 - log f0`` (a function of ``f0``/``f1`` and the data only,
+    recomputed whenever ``f0``/``f1`` change). The enrichment probability
+    ``Ez = sigmoid(eta + llr)`` is always derived on demand via ``compute_Ez``
+    since it also depends on the linear predictor ``eta`` held on the GIBSS
+    total message.
     """
 
-    Ez: jnp.ndarray
+    llr: jnp.ndarray
     f0: Any  # Component distribution (e.g., Normal/PointMass)
     f1: Any  # Component distribution
     inner_family_state: Any
@@ -79,6 +86,10 @@ class TwoGroupFamilyState:
     update_f1: bool = True
     n_null_iter: int = 10
     n_intercept_iter: int = 5
+    # Optional fixed clamp on the enrichment probability, set only by the
+    # hard/lfdr thresholding steps. When not None, ``compute_Ez`` returns it
+    # verbatim and ignores both ``eta`` and ``llr``.
+    Ez_override: Any = None
 
 
 def initialize_state(
@@ -92,9 +103,11 @@ def initialize_state(
     """
     Initialize TwoGroup state by wrapping an existing SuSiE state.
     """
-    n = data.X.shape[0]
+    llr = f1.log_likelihood_nm(data.bhat, data.se) - f0.log_likelihood_nm(
+        data.bhat, data.se
+    )
     tg_fs = TwoGroupFamilyState(
-        Ez=jnp.full(n, 0.5),
+        llr=llr,
         f0=f0,
         f1=f1,
         inner_family_state=inner_state.family_state,
@@ -114,7 +127,7 @@ def hard_threshold_Ez_step(
     """
     z = jnp.abs(data.bhat / data.se)
     new_Ez = (z > threshold).astype(jnp.float64)
-    new_family = replace(state.family_state, Ez=new_Ez)
+    new_family = replace(state.family_state, Ez_override=new_Ez)
     return replace(state, family_state=new_family)
 
 
@@ -137,38 +150,64 @@ def lfdr_threshold_Ez_step(
     ez_no_enrichment = jax.nn.sigmoid(diff)
     new_Ez = (ez_no_enrichment > (1.0 - threshold)).astype(jnp.float64)
 
-    new_family = replace(state.family_state, Ez=new_Ez)
+    new_family = replace(state.family_state, Ez_override=new_Ez)
+    return replace(state, family_state=new_family)
+
+
+def compute_llr(data: Any, state: GIBSSState[TwoGroupFamilyState, Any]) -> jnp.ndarray:
+    """
+    Per-observation log-likelihood ratio ``llr = log f1 - log f0``.
+
+    Depends only on ``f0``/``f1`` and the data, so it is recomputed whenever the
+    component distributions change (not every sweep).
+    """
+    family = state.family_state
+    log_L0 = family.f0.log_likelihood_nm(data.bhat, data.se)
+    log_L1 = family.f1.log_likelihood_nm(data.bhat, data.se)
+    return log_L1 - log_L0
+
+
+def update_llr_step(
+    data: Any, state: GIBSSState[TwoGroupFamilyState, Any]
+) -> GIBSSState[TwoGroupFamilyState, Any]:
+    """Recompute and store ``llr`` from the current ``f0``/``f1``."""
+    new_family = replace(state.family_state, llr=compute_llr(data, state))
     return replace(state, family_state=new_family)
 
 
 def compute_Ez(data: Any, state: GIBSSState[TwoGroupFamilyState, Any]) -> jnp.ndarray:
     """
-    Calculate E[z] = P(z=1 | data, model)
+    Calculate E[z] = P(z=1 | data, model) = sigmoid(eta + llr).
+
+    Reads the stored ``llr`` instead of recomputing the component
+    log-likelihoods. If a fixed ``Ez_override`` clamp is set (thresholding
+    modes), it is returned verbatim.
     """
     family = state.family_state
+    if family.Ez_override is not None:
+        return jnp.asarray(family.Ez_override)
 
-    # 1. SuSiE prediction (linear predictor for enrichment)
+    # SuSiE prediction (linear predictor for enrichment)
     eta = jnp.asarray(state.total_message.mean)
     if hasattr(family.inner_family_state, "intercept"):
         eta = eta + family.inner_family_state.intercept
 
-    # 2. Likelihood of data under each component
-    log_L0 = family.f0.log_likelihood_nm(data.bhat, data.se)
-    log_L1 = family.f1.log_likelihood_nm(data.bhat, data.se)
-
-    # 3. Posterior probability of enrichment
-    return jax.nn.sigmoid(eta + log_L1 - log_L0)
+    return jax.nn.sigmoid(eta + jnp.asarray(family.llr))
 
 
-def update_Ez_step(
-    data: Any, state: GIBSSState[TwoGroupFamilyState, Any]
-) -> GIBSSState[TwoGroupFamilyState, Any]:
+def _inner_response_step(state: GIBSSState[TwoGroupFamilyState, Any]):
     """
-    Updates the latent inclusion probability Ez.
+    Pick the response injector matching what the inner base model expects.
+
+    A base module may declare ``TWOGROUP_RESPONSE = "llr"`` to receive the
+    log-likelihood ratio (it performs the E-step internally). Otherwise the
+    derived enrichment probability ``Ez`` is injected.
     """
-    new_Ez = compute_Ez(data, state)
-    new_family = replace(state.family_state, Ez=new_Ez)
-    return replace(state, family_state=new_family)
+    inner_family = state.family_state.inner_family_state
+    module = import_module(inner_family.__class__.__module__)
+    if getattr(module, "TWOGROUP_RESPONSE", "Ez") == "llr":
+        return use_llr_as_response_step
+    return use_Ez_as_response_step
 
 
 def _run_inner_intercept_step(
@@ -178,7 +217,7 @@ def _run_inner_intercept_step(
     intercept_step = _resolve_inner_intercept_step(state)
     if intercept_step is None:
         return state
-    return use_ez_as_y(intercept_step)(data, state)
+    return _inner_response_step(state)(intercept_step)(data, state)
 
 
 def _resolve_inner_intercept_step(
@@ -199,9 +238,11 @@ def estimate_intercept_step(
 ) -> GIBSSState[TwoGroupFamilyState, Any]:
     if _resolve_inner_intercept_step(state) is None:
         return state
+    # Each inner intercept step reads Ez fresh via compute_Ez (derived from the
+    # current intercept + llr), so no explicit Ez refresh is needed between
+    # iterations.
     for _ in range(state.family_state.n_intercept_iter):
         state = _run_inner_intercept_step(data, state)
-        state = update_Ez_step(data, state)
     return state
 
 
@@ -215,7 +256,7 @@ def update_f0_step(
     if not family.update_f0:
         return state
 
-    weights = 1.0 - family.Ez
+    weights = 1.0 - compute_Ez(data, state)
     new_f0 = family.f0.update_nm(data.bhat, data.se, weights)
 
     new_family = replace(family, f0=new_f0)
@@ -232,7 +273,7 @@ def update_f1_step(
     if not family.update_f1:
         return state
 
-    weights = family.Ez
+    weights = compute_Ez(data, state)
     new_f1 = family.f1.update_nm(data.bhat, data.se, weights)
 
     new_family = replace(family, f1=new_f1)
@@ -250,15 +291,18 @@ def estimate_f_step(
     for _ in range(state.family_state.n_null_iter):
         state = update_f0_step(data, state)
         state = update_f1_step(data, state)
+        state = update_llr_step(data, state)
         state = estimate_intercept_step(data, state)
     return state
 
 
-def use_ez_as_y(step):
+def _use_response_step(step, response_fn):
     """
-    Wrapper that replaces data.y with Ez and unwraps the inner_family_state
-    so existing SuSiE steps (like localjj) can be used without modification.
-    Supports both Step(data, state) and IndexStep(data, l, state).
+    Wrapper that replaces ``data.y`` with a per-observation response derived from
+    the TwoGroup state and unwraps ``inner_family_state`` so existing SuSiE steps
+    (like localjj) can be used without modification. ``response_fn(data, state)``
+    returns the response vector. Supports both Step(data, state) and
+    IndexStep(data, l, state).
     """
 
     def wrapped_step(data, *args):
@@ -269,12 +313,12 @@ def use_ez_as_y(step):
             l = None
             state = args[0]
 
-        # 1. Swap data target from summary-stat response to Ez while preserving
-        # the base-model fields that wrapped steps expect.
-        ez_data = SimpleNamespace(
+        # 1. Swap data target from summary-stat response to the chosen response
+        # while preserving the base-model fields that wrapped steps expect.
+        response_data = SimpleNamespace(
             X=data.X,
             X_sq=data.X_sq,
-            y=state.family_state.Ez,
+            y=response_fn(data, state),
         )
 
         # 2. Extract inner family state for the underlying SuSiE step
@@ -282,9 +326,9 @@ def use_ez_as_y(step):
 
         # 3. Call the unmodified step
         if l is not None:
-            new_inner_state = step(ez_data, l, inner_state)
+            new_inner_state = step(response_data, l, inner_state)
         else:
-            new_inner_state = step(ez_data, inner_state)
+            new_inner_state = step(response_data, inner_state)
 
         # 4. Re-wrap the updated inner family state
         new_family_state = replace(
@@ -295,22 +339,52 @@ def use_ez_as_y(step):
     return wrapped_step
 
 
-def wrap_schedule_with_ez(schedule: Schedule) -> Schedule:
+def use_Ez_as_response_step(step):
+    """Inject the derived enrichment probability ``Ez`` as the base response."""
+    return _use_response_step(step, compute_Ez)
+
+
+def use_llr_as_response_step(step):
+    """Inject the per-observation log-likelihood ratio ``llr`` as the base response.
+
+    Used for base models (e.g. ``twogrouplocaljj``) that consume ``llr`` as a
+    likelihood log-odds offset and perform the E-step (``ez = sigmoid(offset +
+    Xb + llr)``) internally.
     """
-    Wraps all steps in a schedule to use Ez as the regression target.
-    """
+    return _use_response_step(
+        step, lambda data, state: jnp.asarray(state.family_state.llr)
+    )
+
+
+# Backwards-compatible alias (historical name).
+use_ez_as_y = use_Ez_as_response_step
+
+
+def _wrap_schedule_with(schedule: Schedule, response_step) -> Schedule:
     return replace(
         schedule,
-        before_fit=tuple(use_ez_as_y(s) for s in schedule.before_fit),
-        before_sweep=tuple(use_ez_as_y(s) for s in schedule.before_sweep),
+        before_fit=tuple(response_step(s) for s in schedule.before_fit),
+        before_sweep=tuple(response_step(s) for s in schedule.before_sweep),
         before_effect_update=tuple(
-            use_ez_as_y(s) for s in schedule.before_effect_update
+            response_step(s) for s in schedule.before_effect_update
         ),
-        effect_update=tuple(use_ez_as_y(s) for s in schedule.effect_update),
-        after_effect_update=tuple(use_ez_as_y(s) for s in schedule.after_effect_update),
-        after_sweep=tuple(use_ez_as_y(s) for s in schedule.after_sweep),
+        effect_update=tuple(response_step(s) for s in schedule.effect_update),
+        after_effect_update=tuple(
+            response_step(s) for s in schedule.after_effect_update
+        ),
+        after_sweep=tuple(response_step(s) for s in schedule.after_sweep),
         # after_fit usually doesn't touch data.y
     )
+
+
+def wrap_schedule_with_ez(schedule: Schedule) -> Schedule:
+    """Wraps all steps in a schedule to use ``Ez`` as the regression target."""
+    return _wrap_schedule_with(schedule, use_Ez_as_response_step)
+
+
+def wrap_schedule_with_llr(schedule: Schedule) -> Schedule:
+    """Wraps all steps in a schedule to use ``llr`` as the regression target."""
+    return _wrap_schedule_with(schedule, use_llr_as_response_step)
 
 
 def default_schedule(base_schedule: Schedule) -> Schedule:
@@ -318,14 +392,37 @@ def default_schedule(base_schedule: Schedule) -> Schedule:
     Constructs a TwoGroup schedule by wrapping a base SuSiE schedule
     (like localjj.default_schedule) and injecting the EM updates.
     """
-    # 1. Wrap SuSiE kernels to use Ez
+    # 1. Wrap SuSiE kernels to use Ez (derived fresh via compute_Ez)
     schedule = wrap_schedule_with_ez(base_schedule)
 
     # 2. Inject Two-Group EM steps
     schedule = add_step(schedule, before_fit=(estimate_f_step, 0))
     schedule = add_step(schedule, before_fit=(estimate_intercept_step, 0))
-    schedule = add_step(schedule, before_effect_update=(update_Ez_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f0_step, 0))
     schedule = add_step(schedule, after_sweep=(update_f1_step, 1))
+    schedule = add_step(schedule, after_sweep=(update_llr_step, 2))
+
+    return schedule
+
+
+def local_default_schedule(base_schedule: Schedule) -> Schedule:
+    """
+    Constructs a TwoGroup schedule for a *local* base model (e.g.
+    ``twogrouplocaljj``) that consumes ``llr`` as its response and performs the
+    per-covariate E-step internally.
+
+    Unlike :func:`default_schedule`, the base schedule is wrapped with the
+    ``llr`` injector and no global ``Ez`` refresh step is needed.
+    """
+    # 1. Wrap SuSiE kernels to use llr as the response
+    schedule = wrap_schedule_with_llr(base_schedule)
+
+    # 2. Inject Two-Group EM steps. f0/f1 M-steps (and the llr they feed) run
+    #    after each sweep; estimate_f_step initializes them before fitting.
+    schedule = add_step(schedule, before_fit=(estimate_f_step, 0))
+    schedule = add_step(schedule, before_fit=(estimate_intercept_step, 0))
+    schedule = add_step(schedule, after_sweep=(update_f0_step, 0))
+    schedule = add_step(schedule, after_sweep=(update_f1_step, 1))
+    schedule = add_step(schedule, after_sweep=(update_llr_step, 2))
 
     return schedule
