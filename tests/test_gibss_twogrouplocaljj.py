@@ -201,19 +201,60 @@ def test_local_logbf_ge_global_per_feature():
     assert local_logbf.sum() >= global_logbf.sum() - 1e-6
 
 
-def test_sparse_X_raises_not_implemented():
-    X = sparse.BCOO.fromdense(jnp.asarray(np.eye(4), dtype=jnp.float32))
-    base_data = tgl.prep_data(X, np.zeros(4))
-    with pytest.raises(NotImplementedError):
-        tgl.fit_univariate_local_twogroup_regression(
-            base_data,
-            offset=np.zeros(4),
-            offset_var=np.zeros(4),
-            mu_init=np.zeros(4),
-            var_init=np.ones(4),
-            prior_variance=1.0,
-            n_inner_iter=4,
-        )
+def test_sparse_matches_dense_univariate():
+    """Sparse BCOO kernel matches the dense kernel feature-by-feature."""
+    rng = np.random.default_rng(11)
+    n, p = 50, 7
+    Xd = rng.normal(size=(n, p))
+    Xd *= rng.binomial(1, 0.3, size=(n, p))  # ~70% zeros
+    llr = rng.normal(size=n) + 0.8 * Xd[:, 0]
+    offset = rng.normal(size=n) * 0.5
+    offset_var = np.abs(rng.normal(size=n)) * 0.2
+    mu0 = rng.normal(size=p) * 0.1
+    var0 = np.abs(rng.normal(size=p)) + 0.5
+
+    dense = tgl.fit_univariate_local_twogroup_regression(
+        tgl.prep_data(Xd, llr), offset, offset_var, mu0, var0,
+        prior_variance=1.3, n_inner_iter=8,
+    )
+    Xs = sparse.BCOO.fromdense(jnp.asarray(Xd))
+    sp = tgl.fit_univariate_local_twogroup_regression(
+        tgl.prep_data(Xs, llr), offset, offset_var, mu0, var0,
+        prior_variance=1.3, n_inner_iter=8,
+    )
+    for d, s in zip(dense, sp):  # mu, var, feature_log_evidence
+        np.testing.assert_allclose(np.asarray(s), np.asarray(d), rtol=1e-6, atol=1e-6)
+
+
+def test_sparse_end_to_end_fit():
+    """Full two-group fit runs with a sparse BCOO design and recovers the set."""
+    rng = np.random.default_rng(12)
+    n, p = 40, 6
+    X = np.zeros((n, p))
+    X[:10, 0] = 1.0
+    X[10:20, 1] = 1.0
+    X[20:30, 2] = 1.0
+    bhat = rng.normal(size=n)
+    bhat[:10] += 3.0
+    se = np.ones(n)
+
+    tg_data = tg.prep_data(X, bhat=bhat, se=se)
+    base_data = tgl.prep_data(sparse.BCOO.fromdense(jnp.asarray(X)), np.zeros(n))
+    base_state = tgl.initialize_state(
+        base_data, L=2,
+        family_state_kwargs={"estimate_prior_variance": False, "n_inner_iter": 8},
+    )
+    init = tg.initialize_state(
+        tg_data, inner_state=base_state,
+        f0=PointMass(0.0), f1=Normal(loc=0.0, scale=1.0, estimate_loc=True),
+    )
+    schedule = tg.local_default_schedule(tgl.default_schedule())
+    fit = fit_ibss(tg_data, init, schedule, max_iter=30)
+
+    pip = np.asarray(fit.pip)
+    assert np.all(np.isfinite(pip))
+    assert int(np.argmax(pip)) == 0
+    assert pip[0] > 0.8
 
 
 # --- end-to-end ---------------------------------------------------------------

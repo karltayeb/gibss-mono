@@ -15,7 +15,12 @@ to a fixed number of inner iterations. The per-covariate ``ez`` is a local
 computational device, recomputed on the fly inside the inner loop and never
 materialized as an ``n x p`` array.
 
-Dense ``X`` only in v1; sparse (BCOO) raises ``NotImplementedError``.
+Both dense and sparse (BCOO) ``X`` are supported. The sparse path mirrors the
+``localjj`` segment-sum + null-correction trick (no matmul, so it avoids the
+BCOO transpose-matmul hang): for a single feature the rows where ``x_ij == 0``
+reduce to the shared null contribution, so the per-feature evidence is
+``null_total + segment_sum(term_nz - null_term_nz)`` and the M-step aggregates
+over nonzero entries only.
 """
 
 from __future__ import annotations
@@ -81,30 +86,37 @@ def initialize_state(
 
 
 @jax.jit
-def _twogroup_jj_objective(llr, eta, e_eta_sq):
+def _twogroup_jj_terms(llr, eta, e_eta_sq):
     """
-    Inner two-group ELBO contribution at a given (expected) linear predictor,
-    excluding the gaussian KL on the slope:
+    Per-observation inner two-group ELBO contribution (no sum, no gaussian KL):
 
-        sum_i ez_i*llr_i                                   (data term)
-      + sum_i H[ez_i]                                      (entropy)
-      + sum_i (ez_i-0.5)*eta_i - lambda(xi)*(E[eta^2]-xi^2)
+        ez_i*llr_i                                         (data term)
+      + H[ez_i]                                            (entropy)
+      + (ez_i-0.5)*eta_i - lambda(xi)*(E[eta^2]-xi^2)
               - logaddexp(0,xi) + 0.5*xi                   (JJ bound)
 
     with ez = sigmoid(llr + eta) and xi = sqrt(E[eta^2]). The constant
-    ``sum_i log f0_i`` is dropped (shared across features and the null).
+    ``log f0_i`` is dropped (shared across features and the null). Returning the
+    per-row terms lets the sparse path reuse the same algebra over nonzero
+    entries.
     """
     ez = jax.nn.sigmoid(llr + eta)
     xi = jnp.sqrt(jnp.maximum(e_eta_sq, 1e-12))
-    data_term = jnp.sum(ez * llr)
-    entropy = -jnp.sum(xlogy(ez, ez) + xlogy(1.0 - ez, 1.0 - ez))
-    jj = jnp.sum(
-        (ez - 0.5) * eta
+    return (
+        ez * llr
+        - xlogy(ez, ez)
+        - xlogy(1.0 - ez, 1.0 - ez)
+        + (ez - 0.5) * eta
         - _lambda_xi(xi) * (e_eta_sq - jnp.square(xi))
         - jnp.logaddexp(0.0, xi)
         + 0.5 * xi
     )
-    return data_term + entropy + jj
+
+
+@jax.jit
+def _twogroup_jj_objective(llr, eta, e_eta_sq):
+    """Sum of :func:`_twogroup_jj_terms` over observations."""
+    return jnp.sum(_twogroup_jj_terms(llr, eta, e_eta_sq))
 
 
 @partial(jax.jit, static_argnames=("n_inner_iter",))
@@ -145,6 +157,69 @@ def _fit_univariate_local_twogroup_jj_dense(
     )
 
 
+@partial(jax.jit, static_argnames=("n_inner_iter",))
+def _fit_univariate_local_twogroup_jj_sparse(
+    mu_init, var_init, X, llr, offset, offset_var, prior_variance, n_inner_iter
+):
+    p = X.shape[1]
+    rows = X.indices[:, 0]
+    cols = X.indices[:, 1]
+    vals = X.data
+    offset_nz = offset[rows]
+    offset_var_nz = offset_var[rows]
+    llr_nz = llr[rows]
+    vals_sq = vals**2
+
+    def body(_, st):
+        mu, var = st
+        mu_nz = mu[cols]
+        var_nz = var[cols]
+        eta_nz = offset_nz + vals * mu_nz
+        ez_nz = jax.nn.sigmoid(llr_nz + eta_nz)  # local E-step, nonzero rows only
+        xi_sq = (
+            offset_nz**2
+            + vals_sq * var_nz
+            + 2.0 * offset_nz * vals * mu_nz
+            + vals_sq * mu_nz**2
+            + offset_var_nz
+        )
+        xi = jnp.sqrt(jnp.maximum(xi_sq, 1e-12))
+        tau = 2.0 * _lambda_xi(xi)
+        sum_x2 = jax.ops.segment_sum(tau * vals_sq, cols, num_segments=p)
+        sum_xr = jax.ops.segment_sum(
+            vals * (ez_nz - 0.5 - tau * offset_nz), cols, num_segments=p
+        )
+        new_var = 1.0 / (1.0 / prior_variance + sum_x2)  # M-step q(b)
+        new_mu = new_var * sum_xr
+        return (new_mu, new_var)
+
+    mu, var = jax.lax.fori_loop(0, n_inner_iter, body, (mu_init, var_init))
+
+    # Feature log-evidence via null + nonzero-row correction (zero rows of each
+    # feature reduce to the shared null term, exactly as in the dense sum).
+    mu_nz = mu[cols]
+    var_nz = var[cols]
+    eta_nz = offset_nz + vals * mu_nz
+    e_eta_sq_nz = (
+        vals_sq * (mu_nz**2 + var_nz)
+        + 2.0 * vals * mu_nz * offset_nz
+        + offset_nz**2
+        + offset_var_nz
+    )
+    terms_nz = _twogroup_jj_terms(llr_nz, eta_nz, e_eta_sq_nz)
+    null_terms_nz = _twogroup_jj_terms(
+        llr_nz, offset_nz, offset_nz**2 + offset_var_nz
+    )
+    null_total = _twogroup_jj_objective(llr, offset, offset**2 + offset_var)
+    feature_obj = null_total + jax.ops.segment_sum(
+        terms_nz - null_terms_nz, cols, num_segments=p
+    )
+    kl_gauss = 0.5 * (
+        jnp.log(prior_variance / var) + (var + mu**2) / prior_variance - 1.0
+    )
+    return mu, var, feature_obj - kl_gauss
+
+
 def fit_univariate_local_twogroup_regression(
     data,
     offset: np.ndarray,
@@ -156,15 +231,22 @@ def fit_univariate_local_twogroup_regression(
 ):
     """Per-feature fused-EM local two-group update. ``data.y`` carries ``llr``."""
     X = data.X
-    if _is_bcoo(X):
-        raise NotImplementedError(
-            "twogrouplocaljj supports dense X only (sparse BCOO is a follow-up)."
-        )
     llr = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     offset_var = jnp.asarray(offset_var)
     mu_init = jnp.asarray(mu_init)
     var_init = jnp.asarray(var_init)
+    if _is_bcoo(X):
+        return _fit_univariate_local_twogroup_jj_sparse(
+            mu_init,
+            var_init,
+            X,
+            llr,
+            offset,
+            offset_var,
+            prior_variance,
+            int(n_inner_iter),
+        )
     return _fit_univariate_local_twogroup_jj_dense(
         mu_init,
         var_init,
