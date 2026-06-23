@@ -177,6 +177,39 @@ def test_chebyshev_matches_exact_single_update():
     np.testing.assert_allclose(np.asarray(effect.b0), np.asarray(exact.b0), rtol=0, atol=1e-7)
 
 
+def test_chebyshev_newton_matches_exact_background_newton():
+    # cheb + newton node intercepts == exact-background + newton (both exact profile)
+    rng = np.random.default_rng(8)
+    n, p = 600, 30
+    Xd = rng.normal(size=(n, p)) * rng.binomial(1, 0.3, size=(n, p))
+    Xd[:, 4] = (rng.random(n) < 0.3).astype(float)  # strong feature, wide grid
+    eta = -1.0 + 3.0 * Xd[:, 4]
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
+    Xs = sparse.BCOO.fromdense(jnp.asarray(Xd))
+    data = lp.prep_data(Xs, y)
+    offset = rng.normal(size=n) * 0.3
+    b0i = np.full(p, float(lp._profile_null_intercept(jnp.asarray(y), jnp.asarray(offset))))
+    bi = np.zeros(p)
+    pv = 1.0
+
+    # exact background, newton nodes
+    ex = lp._fit_sparse(
+        lp._build_sparse_context(Xs), jnp.asarray(y), jnp.asarray(offset),
+        jnp.asarray(b0i), jnp.asarray(bi), pv, 11, "newton", 4, p,
+    )
+    # chebyshev background, newton nodes
+    ld = lp._make_ld(y, offset)
+    c_hat, W = lp._seed_origin_width(y, offset, 2.0)
+    panels = lp.cb.cheb_init(ld, c_hat, W, 12, 16, seed_points=b0i)
+    eff, _, _ = lp._fit_profile_ser_cheb(
+        data, offset, b0i, bi, pv, 11, panels, ld, lp._build_sparse_context(Xs), 16,
+        node_intercept_mode="newton", n_intercept_newton=4,
+    )
+    np.testing.assert_allclose(np.asarray(eff.feature_log_evidence),
+                               np.asarray(ex[2]), rtol=0, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(eff.mu), np.asarray(ex[0]), rtol=0, atol=1e-6)
+
+
 def test_chebyshev_engine_matches_exact():
     # Full GIBSS run: chebyshev background reproduces the exact background.
     rng = np.random.default_rng(23)

@@ -482,7 +482,7 @@ def _sparse_map_2d_cheb(
 
 def _sparse_feature_cheb(
     rows, cols, vals, y, offset, prior_variance, b0_init, b_init,
-    nodes, log_weights, panels, p,
+    nodes, log_weights, panels, mode, n_newton, p,
 ):
     b0_hat, b_hat, H00, H0b, Hbb = _sparse_map_2d_cheb(
         rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p, panels
@@ -490,13 +490,42 @@ def _sparse_feature_cheb(
     h = jnp.maximum(Hbb - H0b * H0b / H00, 1e-8)
     sd = jnp.sqrt(1.0 / h)
     b_k = b_hat[:, None] + jnp.sqrt(2.0) * sd[:, None] * nodes[None, :]  # (p, m)
+    # Cox-Reid linear node intercepts
     b0_k = b0_hat[:, None] - (H0b / H00)[:, None] * (b_k - b_hat[:, None])
 
-    # realized intercept extremes (pre-clip) drive panel extension
+    # realized intercept extremes (from the linear span) drive panel extension
     grid_min = jnp.minimum(jnp.min(b0_k), jnp.min(b0_hat))
     grid_max = jnp.maximum(jnp.max(b0_k), jnp.max(b0_hat))
 
     lo, hi = cb._band(panels)
+
+    if mode == "newton":
+        # exact profiled intercept per node via Newton on b0 at fixed b_k;
+        # background from the surrogate (O(N)), support via segment_sum (O(nnz*m)).
+        o_r = offset[rows]
+        b_nz = b_k[cols]
+
+        def nbody(state):
+            b0g, it = state
+            b0c = jnp.clip(b0g, lo, hi)
+            g_bg = cb.cheb_grad(panels, b0c)  # l_d'(c) = sum(y - sigmoid(o+c))
+            h_bg = -cb.cheb_hess(panels, b0c)  # sum w0 over all rows
+            c_nz = b0c[cols]
+            eta = o_r[:, None] + c_nz + vals[:, None] * b_nz
+            eta0 = o_r[:, None] + c_nz
+            prob = jax.nn.sigmoid(eta)
+            prob0 = jax.nn.sigmoid(eta0)
+            grad = g_bg + segment_sum(prob0 - prob, cols, num_segments=p)
+            curv = h_bg + segment_sum(
+                prob * (1.0 - prob) - prob0 * (1.0 - prob0), cols, num_segments=p
+            )
+            step = grad / jnp.maximum(curv, 1e-8)
+            return jnp.clip(b0g + step, lo, hi), it + 1
+
+        b0_k, _ = jax.lax.while_loop(
+            lambda s: s[1] < n_newton, nbody, (jnp.clip(b0_k, lo, hi), 0)
+        )
+
     b0_kc = jnp.clip(b0_k, lo, hi)
     l_d = cb.cheb_val(panels, b0_kc)  # (p, m)
 
@@ -526,22 +555,24 @@ def _sparse_feature_cheb(
             grid_min, grid_max)
 
 
-@partial(jax.jit, static_argnames=("quadrature_order", "p"))
+@partial(jax.jit, static_argnames=("quadrature_order", "mode", "n_newton", "p"))
 def _fit_sparse_cheb(
-    ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order, panels, p
+    ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order,
+    panels, mode, n_newton, p,
 ):
     nodes_np, log_weights_np = _hermgauss_rule(quadrature_order)
     nodes = jnp.asarray(nodes_np, dtype=jnp.asarray(offset).dtype)
     log_weights = jnp.asarray(log_weights_np, dtype=jnp.asarray(offset).dtype)
     return _sparse_feature_cheb(
         ctx.rows, ctx.cols, ctx.vals, y, offset, prior_variance, b0_init, b_init,
-        nodes, log_weights, panels, p,
+        nodes, log_weights, panels, mode, n_newton, p,
     )
 
 
 def _fit_profile_ser_cheb(
     data, offset, b0_init, b_init, prior_variance, quadrature_order,
     panels, ld_fn, sparse_context, max_panels,
+    node_intercept_mode="linear", n_intercept_newton=3,
 ):
     """Chebyshev-surrogate SER update with the miss/ensure loop. Returns (effect, panels)."""
     ctx = sparse_context if sparse_context is not None else _build_sparse_context(data.X)
@@ -554,7 +585,8 @@ def _fit_profile_ser_cheb(
     n_build = 0
     for _ in range(max_panels + 1):
         out = _fit_sparse_cheb(
-            ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order, panels, p
+            ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order,
+            panels, node_intercept_mode, n_intercept_newton, p,
         )
         grid_min = float(out[7])
         grid_max = float(out[8])
@@ -739,7 +771,7 @@ def update_effect_index_step(data, l, state):
         new_effect, panels, n_build = _fit_profile_ser_cheb(
             data, offset, effect.b0, effect.mu, effect.prior_variance,
             fs.quadrature_order, fs.surrogate, ld_fn, fs.sparse_context,
-            fs.cheb_max_panels,
+            fs.cheb_max_panels, fs.node_intercept_mode, fs.n_intercept_newton,
         )
         diag = dict(fs.cheb_diagnostics)
         diag["panels_built"] = diag.get("panels_built", 0) + n_build
