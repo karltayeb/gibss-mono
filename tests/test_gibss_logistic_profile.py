@@ -177,6 +177,35 @@ def test_chebyshev_matches_exact_single_update():
     np.testing.assert_allclose(np.asarray(effect.b0), np.asarray(exact.b0), rtol=0, atol=1e-7)
 
 
+def test_default_config_is_chebyshev_newton_exact_profile():
+    # Defaults (no kwargs) on sparse X == cheb background + newton nodes == exact profile.
+    rng = np.random.default_rng(17)
+    n, p = 600, 25
+    Xd = rng.normal(size=(n, p)) * rng.binomial(1, 0.3, size=(n, p))
+    Xd[:, 6] = (rng.random(n) < 0.3).astype(float)
+    eta = -1.0 + 2.5 * Xd[:, 6]
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
+    Xs = sparse.BCOO.fromdense(jnp.asarray(Xd))
+    data = lp.prep_data(Xs, y)
+
+    fs = lp.initialize_state(data, L=1).family_state
+    assert fs.background_mode == "chebyshev"
+    assert fs.cheb_node_intercept_mode == "newton"
+
+    st = lp.initialize_state(data, L=1)  # pure defaults
+    st = fit_ibss(data, st, lp.default_schedule(), max_iter=8)
+    alpha_default = np.asarray(st.single_effects[0].alpha)
+
+    # ground truth: exact background + newton nodes
+    ref = lp.initialize_state(
+        data, L=1,
+        family_state_kwargs={"background_mode": "exact", "node_intercept_mode": "newton"},
+    )
+    ref = fit_ibss(data, ref, lp.default_schedule(), max_iter=8)
+    alpha_ref = np.asarray(ref.single_effects[0].alpha)
+    np.testing.assert_allclose(alpha_default, alpha_ref, atol=1e-5)
+
+
 def test_chebyshev_newton_matches_exact_background_newton():
     # cheb + newton node intercepts == exact-background + newton (both exact profile)
     rng = np.random.default_rng(8)
@@ -221,7 +250,11 @@ def test_chebyshev_engine_matches_exact():
     data = lp.prep_data(Xs, y)
 
     def run(mode):
-        st = lp.initialize_state(data, L=2, family_state_kwargs={"background_mode": mode})
+        # force linear nodes in both arms to isolate the background approximation
+        st = lp.initialize_state(
+            data, L=2,
+            family_state_kwargs={"background_mode": mode, "cheb_node_intercept_mode": "linear"},
+        )
         st = fit_ibss(data, st, lp.default_schedule(), max_iter=10)
         return st
 

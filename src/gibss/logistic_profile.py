@@ -95,11 +95,18 @@ class ProfileFamilyState:
     sparse_context: Any = None
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
-    # Chebyshev-surrogate background (sparse path); "exact" keeps the naive O(n*p).
-    background_mode: str = "exact"  # "exact" | "chebyshev"
+    # Background for the sparse path. Default "chebyshev": O(N) surrogate background,
+    # feasible at scale, machine-precision vs the exact O(n*p) sum. Auto-falls back
+    # to the exact dense path for non-BCOO X. "exact" forces the naive background.
+    background_mode: str = "chebyshev"  # "chebyshev" | "exact"
     cheb_degree: int = 12  # N per panel
     cheb_panel_width: float = 2.0  # panel width in null-SE units
     cheb_max_panels: int = 8  # K_max (static capacity)
+    # Node intercepts under the chebyshev background: "newton" is cheap there
+    # (O(N + nnz*m)/step) and gives the exact profile, so it is the default.
+    # The exact/dense path keeps node_intercept_mode ("linear") since Newton there
+    # is the expensive O(n*p*m) recompute.
+    cheb_node_intercept_mode: str = "newton"  # "newton" | "linear"
     surrogate: Any = None  # ChebPanels for the effect currently being updated
     cheb_diagnostics: dict = field(default_factory=dict)
 
@@ -771,7 +778,7 @@ def update_effect_index_step(data, l, state):
         new_effect, panels, n_build = _fit_profile_ser_cheb(
             data, offset, effect.b0, effect.mu, effect.prior_variance,
             fs.quadrature_order, fs.surrogate, ld_fn, fs.sparse_context,
-            fs.cheb_max_panels, fs.node_intercept_mode, fs.n_intercept_newton,
+            fs.cheb_max_panels, fs.cheb_node_intercept_mode, fs.n_intercept_newton,
         )
         diag = dict(fs.cheb_diagnostics)
         diag["panels_built"] = diag.get("panels_built", 0) + n_build
