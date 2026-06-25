@@ -60,11 +60,14 @@ class Logistic:
 
     eps: float = 1e-6
 
-    def working(self, eta: Any, y: Any) -> tuple[Any, Any]:
+    def mean_and_weight(self, eta: Any) -> tuple[Any, Any]:
         mu = jnp.clip(jax.nn.sigmoid(eta), self.eps, 1.0 - self.eps)
-        muprime = jnp.maximum(mu * (1.0 - mu), self.eps)  # = V(mu)
-        w = muprime  # mu'^2 / V = mu' for the canonical logit
-        z = eta + (y - mu) / muprime
+        w = jnp.maximum(mu * (1.0 - mu), self.eps)  # mu'^2/V = mu' for canonical logit
+        return mu, w
+
+    def working(self, eta: Any, y: Any) -> tuple[Any, Any]:
+        mu, w = self.mean_and_weight(eta)
+        z = eta + (y - mu) / w
         return z, w
 
 
@@ -218,13 +221,21 @@ def update_working_data_step(data, state):
     return replace(state, family_state=replace(fs, y_work=y_work, v_work=v_work))
 
 
-def estimate_intercept_step(data, state):
+def update_intercept_step(data, state):
+    """Outer intercept Newton step on the current eta, BEFORE recomputing weights.
+
+    b0 += sum(y - mu) / sum(w), with mu, w at eta = glm_offset + b0 + total_message.
+    Placing this ahead of update_working_data means the working response/weights
+    reflect the new intercept this sweep (no lag).
+    """
     fs = state.family_state
     if not fs.estimate_intercept:
         return state
-    wd = _working_data(data, fs)
-    new_intercept = linear.estimate_intercept(wd, state)  # weighted mean of working residual
-    return replace(state, family_state=replace(fs, intercept=new_intercept))
+    eta = jnp.asarray(fs.glm_offset) + fs.intercept + jnp.asarray(state.total_message.mean)
+    mu, w = fs.glm.mean_and_weight(eta)
+    score = jnp.sum(jnp.asarray(data.y) - mu)
+    curv = jnp.maximum(jnp.sum(w), 1e-8)
+    return replace(state, family_state=replace(fs, intercept=fs.intercept + float(score / curv)))
 
 
 def update_effect_index_step(data, l, state):
@@ -298,8 +309,13 @@ def to_numpy_state_step(data, state):
 
 def default_schedule() -> Schedule:
     return Schedule(
-        before_sweep=(snapshot_state_step, update_working_data_step, update_centering_step),
-        before_effect_update=(estimate_intercept_step,),
+        # intercept -> recompute weights -> center -> fit effects (no lag)
+        before_sweep=(
+            snapshot_state_step,
+            update_intercept_step,
+            update_working_data_step,
+            update_centering_step,
+        ),
         effect_update=(
             subtract_message_index_step,
             update_effect_index_step,
