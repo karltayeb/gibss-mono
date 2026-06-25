@@ -46,7 +46,11 @@ def test_irls_single_feature_matches_map():
     st = fit_ibss(data, st, irls.default_schedule(), max_iter=100)
     ref = fit_univariate_logistic_regression(x, y, np.zeros(n), prior_variance=1.0)
     np.testing.assert_allclose(float(st.single_effects[0].mu[0]), float(ref.effect), atol=1e-3)
-    np.testing.assert_allclose(float(st.family_state.intercept), float(ref.intercept), atol=1e-3)
+    # centered parameterization: eta = b0 + beta(x - c); convert to uncentered intercept
+    e = st.single_effects[0]
+    coef = np.asarray(e.alpha * e.mu)
+    uncentered_b0 = float(st.family_state.intercept) - float(np.sum(coef * np.asarray(st.family_state.cbar)))
+    np.testing.assert_allclose(uncentered_b0, float(ref.intercept), atol=1e-3)
 
 
 def test_irls_agrees_with_quadrature_ranking():
@@ -80,6 +84,47 @@ def test_irls_offset_invariance_of_recovery():
     st = irls.initialize_state(data, L=1, glm_offset=jnp.asarray(offset))
     st = fit_ibss(data, st, irls.default_schedule(), max_iter=50)
     assert int(np.argmax(np.asarray(st.single_effects[0].alpha))) == 5
+
+
+def test_centered_and_uncentered_recover_same_signal():
+    # centering changes the per-feature design (orthogonalizes vs the intercept),
+    # so noise-feature estimates differ; but both recover the same signal feature
+    # and agree on its effect.
+    rng = np.random.default_rng(5)
+    n, p = 600, 20
+    X, y = _sim(rng, n, p, 8, signal=2.0)
+    Xs = sparse.BCOO.fromdense(jnp.asarray(X))
+
+    def run(center):
+        data = irls.prep_data(Xs, y)
+        st = irls.initialize_state(data, L=1, family_state_kwargs={"center": center})
+        return fit_ibss(data, st, irls.default_schedule(), max_iter=100)
+
+    c = run(True)
+    u = run(False)
+    assert int(np.argmax(np.asarray(c.single_effects[0].alpha))) == 8
+    assert int(np.argmax(np.asarray(u.single_effects[0].alpha))) == 8
+    # signal-feature effect agrees (it is ~orthogonal to the intercept either way)
+    np.testing.assert_allclose(float(c.single_effects[0].mu[8]),
+                               float(u.single_effects[0].mu[8]), rtol=1e-3)
+
+
+def test_centered_sparse_matches_dense():
+    rng = np.random.default_rng(6)
+    n, p = 400, 15
+    X, y = _sim(rng, n, p, 3, signal=2.0, sparsity=0.3)
+
+    def run(Xmat):
+        data = irls.prep_data(Xmat, y)
+        st = irls.initialize_state(data, L=1)
+        return fit_ibss(data, st, irls.default_schedule(), max_iter=100)
+
+    dense = run(jnp.asarray(X))
+    sp = run(sparse.BCOO.fromdense(jnp.asarray(X)))
+    np.testing.assert_allclose(np.asarray(dense.single_effects[0].mu),
+                               np.asarray(sp.single_effects[0].mu), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(dense.single_effects[0].alpha),
+                               np.asarray(sp.single_effects[0].alpha), rtol=1e-5, atol=1e-6)
 
 
 def test_irls_multi_effect():
