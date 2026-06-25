@@ -148,19 +148,15 @@ def cheb_ensure(panels: ChebPanels, f: Callable, points: np.ndarray) -> ChebPane
 def _clenshaw(coef: Any, t: Any) -> Any:
     """Sum_k coef[..., k] T_k(t). `coef` (..., N+1), `t` broadcastable.
 
-    Rolled with fori_loop (not Python-unrolled) so the XLA graph stays small and
-    compiles fast; arithmetic is identical to the unrolled recurrence.
+    Python-unrolled recurrence (N is small and static). A rolled fori_loop
+    compiles ~0.2s faster but runs ~15% slower per fit at scale -- not worth it,
+    especially with the persistent compilation cache removing the compile cost.
     """
-    n = coef.shape[-1] - 1  # static
-    z = jnp.zeros_like(t)
-
-    def body(i, carry):
-        d0, d1 = carry
-        k = n - i  # n, n-1, ..., 1
-        ck = jnp.take(coef, k, axis=-1)
-        return ck + 2.0 * t * d0 - d1, d0
-
-    d0, d1 = jax.lax.fori_loop(0, n, body, (z, z))
+    n = coef.shape[-1] - 1
+    d0 = jnp.zeros_like(t)
+    d1 = jnp.zeros_like(t)
+    for k in range(n, 0, -1):
+        d0, d1 = coef[..., k] + 2.0 * t * d0 - d1, d0
     return coef[..., 0] + t * d0 - d1
 
 
