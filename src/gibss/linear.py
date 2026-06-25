@@ -51,20 +51,35 @@ class LinearData:
     X: Any
     y: Any
     X_sq: Any
+    # Per-observation error variance v_i (Var(y_i) = residual_variance * v_i).
+    # None / ones => homoskedastic. Precision weight is tau_i = 1/(sigma^2 v_i).
+    obs_variance: Any = None
 
 
 def _logsumexp(x):
     return float(jax.nn.logsumexp(jnp.asarray(x)))
 
 
-def prep_data(X, y) -> LinearData:
+def prep_data(X, y, obs_variance=None) -> LinearData:
     if is_bcoo(X):
         X_sq = squared_bcoo(X)
     else:
         X = jnp.asarray(X)
         X_sq = jnp.square(X)
     y = jnp.asarray(y)
-    return LinearData(X=X, y=y, X_sq=X_sq)
+    if obs_variance is None:
+        obs_variance = jnp.ones_like(y)
+    else:
+        obs_variance = jnp.asarray(obs_variance)
+    return LinearData(X=X, y=y, X_sq=X_sq, obs_variance=obs_variance)
+
+
+def _obs_variance(data) -> np.ndarray:
+    """Per-observation variance v_i (ones if unset)."""
+    v = getattr(data, "obs_variance", None)
+    if v is None:
+        return np.ones(np.asarray(data.y).shape[0])
+    return np.asarray(v)
 
 
 def fit_univariate_linear_regression(data, tau, offset, prior_variance):
@@ -161,9 +176,7 @@ def fit_linear_ser(data, tau, offset, prior_variance) -> BaseSERState:
 
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
-    tau = np.full(
-        data.y.shape[0], 1.0 / state.family_state.residual_variance
-    )
+    tau = 1.0 / (state.family_state.residual_variance * _obs_variance(data))
     new_effect = fit_linear_ser(
         data,
         tau,
@@ -201,7 +214,8 @@ def update_residual_variance_step(data, state):
     residual = (
         data.y - state.family_state.intercept - state.total_message.mean
     )
-    expected_rss = np.sum(np.square(residual) + state.total_message.var)
+    v = _obs_variance(data)
+    expected_rss = np.sum((np.square(residual) + state.total_message.var) / v)
     new_residual_variance = max(
         expected_rss / data.y.shape[0],
         state.family_state.min_residual_variance,
@@ -213,7 +227,9 @@ def update_residual_variance_step(data, state):
 
 
 def estimate_intercept(data, state) -> float:
-    return float(np.mean(data.y - state.total_message.mean))
+    w = 1.0 / _obs_variance(data)
+    resid = np.asarray(data.y) - np.asarray(state.total_message.mean)
+    return float(np.sum(w * resid) / np.sum(w))
 
 
 def estimate_intercept_step(data, state):
@@ -227,12 +243,14 @@ def estimate_intercept_step(data, state):
 def compute_elbo(data, state) -> float:
     family_state = state.family_state
     residual = data.y - family_state.intercept - state.total_message.mean
-    expected_rss = np.sum(np.square(residual) + state.total_message.var)
+    v = _obs_variance(data)
+    weighted_rss = np.sum((np.square(residual) + state.total_message.var) / v)
     n = data.y.shape[0]
     residual_variance = float(family_state.residual_variance)
+    # log det of the diagonal covariance: sum_i log(2 pi sigma^2 v_i)
     expected_ll = (
-        -0.5 * n * np.log(2.0 * np.pi * residual_variance)
-        - 0.5 * expected_rss / residual_variance
+        -0.5 * (n * np.log(2.0 * np.pi * residual_variance) + np.sum(np.log(v)))
+        - 0.5 * weighted_rss / residual_variance
     )
     total_kl = sum(float(effect.kl) for effect in state.single_effects)
     return float(expected_ll - total_kl)
