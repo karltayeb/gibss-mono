@@ -40,6 +40,44 @@ class GlobalJJFamilyState:
     elbo_history: list[float] = field(default_factory=lambda: [-np.inf])
     xi: Any = 0.0
     X_sq: Any = None
+    # Weighted column centering (tau-weighted), orthogonalizing intercept/features.
+    # Opt-in (globaljj has a reference-parity contract); reparameterizes the
+    # intercept, so results differ from the non-centered default.
+    center: bool = False
+    cbar: Any = None  # (tau @ X)/sum(tau), shape (p,)
+    weight_sum: float = 0.0  # W = sum(tau)
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalJJCenteredEffect(BaseSERState):
+    """Effect whose contribution to eta is sum_j coef_j (x_j - cbar_j).
+
+    The message carries the correct centered mean AND variance (the JJ xi-update
+    and ELBO both use total_message.var, so the second moment must be exact).
+    """
+
+    cbar: Any = None
+
+    def message(self, data) -> Message:
+        c = self.cbar
+        coef = self.alpha * self.mu
+        coef2 = self.alpha * (self.mu**2 + self.var)
+        mean = data.X @ coef - jnp.sum(coef * c)
+        # E[m_i^2] = sum_j coef2_j (x_ij - c_j)^2
+        sm = (
+            data.X_sq @ coef2
+            - 2.0 * (data.X @ (coef2 * c))
+            + jnp.sum(coef2 * c**2)
+        )
+        var = jnp.maximum(sm - jnp.square(mean), 0.0)
+        return Message(mean=mean, var=var)
+
+
+def _weighted_colmeans(X, tau):
+    """cbar_j = (tau @ X)_j / sum(tau), W = sum(tau). Sparse-preserving."""
+    W = jnp.sum(tau)
+    S1 = tau @ X if is_bcoo(X) else jnp.sum(tau[:, None] * X, axis=0)
+    return S1 / W, W
 
 
 @jax.jit
@@ -69,10 +107,11 @@ def _jj_bound_null_log_likelihood(y, offset, xi, offset_var=None):
 @jax.jit
 def _fit_univariate_global_jj_regression_sparse(X, X_sq, y, xi, offset, prior_variance):
     tau = 2.0 * _lambda_xi(xi)
-    weighted_x2 = X_sq.transpose() @ tau
+    # vec-mat (not X.T @ vec): transpose-matmul hangs on BCOO.
+    weighted_x2 = tau @ X_sq
     precision = (1.0 / prior_variance) + weighted_x2
     var = 1.0 / precision
-    mu = var * (X.transpose() @ (y - 0.5 - tau * offset))
+    mu = var * ((y - 0.5 - tau * offset) @ X)
 
     gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
@@ -87,6 +126,34 @@ def _fit_univariate_global_jj_regression_dense(X, X_sq, y, xi, offset, prior_var
     var = 1.0 / precision
     mu = var * jnp.sum((y - 0.5 - tau * offset)[:, None] * X, axis=0)
 
+    gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
+    null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
+    return mu, var, null_ll + gaussian_kl_bf
+
+
+@jax.jit
+def _fit_univariate_centered_sparse(X, X_sq, y, xi, offset, prior_variance, cbar, W):
+    tau = 2.0 * _lambda_xi(xi)
+    S2 = tau @ X_sq
+    weighted_x2 = jnp.maximum(S2 - W * cbar**2, 0.0)
+    precision = (1.0 / prior_variance) + weighted_x2
+    var = 1.0 / precision
+    r = y - 0.5 - tau * offset
+    mu = var * ((r @ X) - cbar * jnp.sum(r))
+    gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
+    null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
+    return mu, var, null_ll + gaussian_kl_bf
+
+
+@jax.jit
+def _fit_univariate_centered_dense(X, X_sq, y, xi, offset, prior_variance, cbar, W):
+    tau = 2.0 * _lambda_xi(xi)
+    S2 = jnp.sum(tau[:, None] * X_sq, axis=0)
+    weighted_x2 = jnp.maximum(S2 - W * cbar**2, 0.0)
+    precision = (1.0 / prior_variance) + weighted_x2
+    var = 1.0 / precision
+    r = y - 0.5 - tau * offset
+    mu = var * (jnp.sum(r[:, None] * X, axis=0) - cbar * jnp.sum(r))
     gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
     return mu, var, null_ll + gaussian_kl_bf
@@ -161,17 +228,30 @@ def update_xi(data, state) -> np.ndarray:
 
 
 def update_xi_step(data, state):
+    fs = state.family_state
     new_xi = update_xi(data, state)
-    family_state = replace(state.family_state, xi=new_xi)
+    if fs.center:
+        tau = 2.0 * _lambda_xi(new_xi)
+        cbar, W = _weighted_colmeans(data.X, tau)
+        family_state = replace(fs, xi=new_xi, cbar=cbar, weight_sum=W)
+    else:
+        family_state = replace(fs, xi=new_xi)
     return replace(state, family_state=family_state)
 
 
-def fit_global_jj_ser(data, y, xi, offset, prior_variance) -> BaseSERState:
+def fit_global_jj_ser(
+    data, y, xi, offset, prior_variance, cbar=None, weight_sum=0.0, center=False
+) -> BaseSERState:
     X = data.X
     X_sq = data.X_sq
     p = X.shape[1]
 
-    if is_bcoo(X):
+    if center:
+        fit = _fit_univariate_centered_sparse if is_bcoo(X) else _fit_univariate_centered_dense
+        mu, var, feature_log_evidence = fit(
+            X, X_sq, y, xi, offset, prior_variance, cbar, weight_sum
+        )
+    elif is_bcoo(X):
         mu, var, feature_log_evidence = _fit_univariate_global_jj_regression_sparse(
             X, X_sq, y, xi, offset, prior_variance
         )
@@ -183,12 +263,9 @@ def fit_global_jj_ser(data, y, xi, offset, prior_variance) -> BaseSERState:
     alpha, marginal_log_likelihood, kl = _fit_global_jj_ser_stats(
         mu, var, feature_log_evidence, prior_variance, p
     )
-
-    # We still need a null_ll for the BaseSERState to match interfaces,
-    # though it's technically encoded in the feature_log_evidence now.
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
 
-    return BaseSERState(
+    fields = dict(
         mu=mu,
         var=var,
         alpha=alpha,
@@ -199,17 +276,24 @@ def fit_global_jj_ser(data, y, xi, offset, prior_variance) -> BaseSERState:
         null_log_likelihood=float(null_ll),
         kl=float(kl),
     )
+    if center:
+        return GlobalJJCenteredEffect(**fields, cbar=cbar)
+    return BaseSERState(**fields)
 
 
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
-    offset = state.family_state.intercept + state.total_message.mean
+    fs = state.family_state
+    offset = fs.intercept + state.total_message.mean
     new_effect = fit_global_jj_ser(
         data,
         data.y,
-        state.family_state.xi,
+        fs.xi,
         offset,
         effect.prior_variance,
+        cbar=fs.cbar,
+        weight_sum=fs.weight_sum,
+        center=fs.center,
     )
     return replace_effect_in_gibss_state(state, l, new_effect)
 
@@ -280,7 +364,9 @@ def to_numpy_state(
             else (np.asarray(state.total_message.var),)
         ),
     )
-    family_state = replace(state.family_state, xi=np.asarray(state.family_state.xi))
+    fs = state.family_state
+    cbar = None if fs.cbar is None else np.asarray(fs.cbar)
+    family_state = replace(fs, xi=np.asarray(fs.xi), cbar=cbar)
     return replace(
         state,
         single_effects=single_effects,
