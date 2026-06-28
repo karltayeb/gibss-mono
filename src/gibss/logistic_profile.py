@@ -739,7 +739,9 @@ def initialize_state(
     X = data.X
     p = X.shape[1]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)
-    kwargs["quadrature_order"] = quadrature_order
+    # explicit parameter is the default; family_state_kwargs wins. sparse_context
+    # is genuinely derived from data.
+    kwargs.setdefault("quadrature_order", quadrature_order)
     kwargs["sparse_context"] = _build_sparse_context(X) if _is_bcoo(X) else None
     family_state = ProfileFamilyState(**kwargs)
     n = X.shape[0]

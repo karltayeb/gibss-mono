@@ -393,9 +393,9 @@ def initialize_state(
     X = data.X
     p = X.shape[1]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)
-    # These fields are derived from initializer inputs/data; user kwargs are
-    # silently overridden here for now.
-    kwargs["quadrature_order"] = quadrature_order
+    # quadrature_order: the explicit parameter is the default; a value passed via
+    # family_state_kwargs wins. sparse_context is genuinely derived from data.
+    kwargs.setdefault("quadrature_order", quadrature_order)
     kwargs["sparse_context"] = _build_sparse_quadrature_context(X) if _is_bcoo(X) else None
     family_state = QuadratureFamilyState(**kwargs)
     zero_message = MeanMessage(jnp.zeros(X.shape[0]))
