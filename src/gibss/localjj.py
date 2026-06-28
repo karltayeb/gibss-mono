@@ -251,7 +251,10 @@ def fit_local_jj_ser_centered(
     X = data.X
     if _is_bcoo(X):
         raise NotImplementedError(
-            "centered localjj is dense-only for now (per-feature profiled bound is O(n*p))."
+            "centered localjj is dense-only for now: per-feature intercept profiling "
+            "makes m, b0, and the bound O(n*p) (the zero-row tau depends on b0_j). "
+            "Sparse path needs a Chebyshev surrogate over b0_j -- see "
+            "docs/superpowers/plans/2026-06-28-localjj-centered-sparse-chebyshev.md"
         )
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
