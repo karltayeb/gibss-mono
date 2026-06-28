@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import linear
+from ._centering import weighted_centering
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -142,9 +143,8 @@ def _fit_centered_ser(data, tau, offset, prior_variance, cbar, W) -> IRLSCentere
         S2 = jnp.sum(tau[:, None] * X_sq, axis=0)
         T = jnp.sum(r[:, None] * X, axis=0)
     R = jnp.sum(r)
-    weighted_x2 = jnp.maximum(S2 - W * cbar**2, 0.0)  # weighted variance of centered col
-    var = 1.0 / (1.0 / prior_variance + weighted_x2)
-    mu = var * (T - cbar * R)
+    # profiled intercept via weighted centering (Laplace / centered variance)
+    mu, var = weighted_centering(cbar, W, S2, T, R, prior_variance)
     log_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
     null_ll = linear.linear_null_log_likelihood(data, tau, offset)
     feature_log_evidence = null_ll + log_bf

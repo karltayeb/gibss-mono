@@ -7,6 +7,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ._centering import weighted_centering
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -135,11 +136,8 @@ def _fit_univariate_global_jj_regression_dense(X, X_sq, y, xi, offset, prior_var
 def _fit_univariate_centered_sparse(X, X_sq, y, xi, offset, prior_variance, cbar, W):
     tau = 2.0 * _lambda_xi(xi)
     S2 = tau @ X_sq
-    weighted_x2 = jnp.maximum(S2 - W * cbar**2, 0.0)
-    precision = (1.0 / prior_variance) + weighted_x2
-    var = 1.0 / precision
     r = y - 0.5 - tau * offset
-    mu = var * ((r @ X) - cbar * jnp.sum(r))
+    mu, var = weighted_centering(cbar, W, S2, r @ X, jnp.sum(r), prior_variance)
     gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
     return mu, var, null_ll + gaussian_kl_bf
@@ -149,11 +147,9 @@ def _fit_univariate_centered_sparse(X, X_sq, y, xi, offset, prior_variance, cbar
 def _fit_univariate_centered_dense(X, X_sq, y, xi, offset, prior_variance, cbar, W):
     tau = 2.0 * _lambda_xi(xi)
     S2 = jnp.sum(tau[:, None] * X_sq, axis=0)
-    weighted_x2 = jnp.maximum(S2 - W * cbar**2, 0.0)
-    precision = (1.0 / prior_variance) + weighted_x2
-    var = 1.0 / precision
     r = y - 0.5 - tau * offset
-    mu = var * (jnp.sum(r[:, None] * X, axis=0) - cbar * jnp.sum(r))
+    T = jnp.sum(r[:, None] * X, axis=0)
+    mu, var = weighted_centering(cbar, W, S2, T, jnp.sum(r), prior_variance)
     gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
     return mu, var, null_ll + gaussian_kl_bf

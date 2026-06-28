@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
+from ._centering import weighted_centering
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -223,11 +224,10 @@ def _fit_univariate_local_jj_centered_dense(
         W = jnp.sum(tau)
         c = jnp.sum(tau * x) / W
         sx2 = jnp.sum(tau * x2)
-        x2c = sx2 - W * c**2
         r = y - 0.5 - tau * offset
-        m = (jnp.sum(x * r) - c * jnp.sum(r)) / (1.0 / pv + x2c)
-        b0 = jnp.sum(r) / W - m * c
-        v = 1.0 / (1.0 / pv + sx2)
+        R = jnp.sum(r)
+        m, v = weighted_centering(c, W, sx2, jnp.sum(x * r), R, pv, conditional_variance=True)
+        b0 = R / W - m * c
         # tight bound at eta = offset + b0 + m*x with optimal xi (xi^2 = E[eta^2])
         eta = offset + b0 + m * x
         Eeta2n = eta**2 + v * x2 + offset_var
