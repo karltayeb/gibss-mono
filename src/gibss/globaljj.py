@@ -381,6 +381,10 @@ def to_numpy_state_step(data, state):
 
 
 def default_schedule() -> Schedule:
+    # xi is the optimal variational param given (q, b0): refresh it after EVERY
+    # change so it is never stale. The before-update follows the intercept (b0)
+    # change; the after-update follows the effect (q) change -- both needed, not
+    # redundant. (cbar is recomputed inside update_xi, so centering tracks too.)
     return Schedule(
         before_effect_update=(estimate_intercept_step, update_xi_step),
         effect_update=(
