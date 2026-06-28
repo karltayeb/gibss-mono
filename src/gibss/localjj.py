@@ -13,6 +13,7 @@ from ._centering import weighted_centering
 from ._jj import (
     lambda_xi as _lambda_xi,
     jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
+    jj_profiled_null_log_likelihood as _jj_profiled_null_log_likelihood,
 )
 from .engine import (
     BaseSERState,
@@ -245,9 +246,10 @@ def fit_local_jj_ser_centered(
         jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi))
         + 0.5 * jnp.sum(alpha * (jnp.log(prior_variance / var) + (var + mu**2) / prior_variance - 1.0))
     )
-    # null bound at the (profiled-null) offset for reference
-    xi_null = jnp.sqrt(jnp.maximum(offset**2 + offset_var, 1e-12))
-    null_ll = _jj_bound_null_log_likelihood(y, offset, xi_null, offset_var=offset_var)
+    # the centered effect profiles a per-feature intercept, so the null must too
+    # (offset-shift invariance) -- otherwise the feature is credited for the
+    # intercept fit and the BF inflates.
+    null_ll = _jj_profiled_null_log_likelihood(y, offset, offset_var)
     return LocalJJCenteredEffect(
         mu=mu, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
         prior_variance=float(prior_variance),

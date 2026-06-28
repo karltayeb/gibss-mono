@@ -51,6 +51,28 @@ def test_centered_univariate_matches_joint_jj_optimum():
     np.testing.assert_allclose(v_k, v_b, rtol=1e-2)
 
 
+def test_centered_bf_not_inflated():
+    # the centered effect profiles a per-feature intercept, so the null must too;
+    # the SER logBF must stay near exact (was wildly inflated before the fix).
+    import gibss.logistic_quadrature as q
+    from gibss.engine import fit_ibss as _fit
+    rng = np.random.default_rng(0)
+    n, p = 1000, 50
+    X = rng.normal(size=(n, p))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + 1.5 * X[:, 7])))).astype(float)
+    Xj, yj = jnp.asarray(X), jnp.asarray(y)
+
+    dq = q.prep_data(Xj, yj)
+    exact = float(np.asarray(_fit(dq, q.initialize_state(dq, L=1, quadrature_order=15),
+                                  q.default_schedule(), max_iter=50).ser_log_bayes_factor)[0])
+    data = lj.prep_data(Xj, yj)
+    st = _fit(data, lj.initialize_state(data, L=1, family_state_kwargs={"center": True}),
+              lj.default_schedule(), max_iter=50)
+    g = float(np.asarray(st.ser_log_bayes_factor)[0])
+    assert g <= exact + 1.0  # profiled variational: not inflated, ~<= exact
+    np.testing.assert_allclose(g, exact, atol=4.0)
+
+
 def test_centered_recovers_signal():
     rng = np.random.default_rng(1)
     n, p = 500, 20

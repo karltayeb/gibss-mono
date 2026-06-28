@@ -13,6 +13,7 @@ Bayes factor.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import jax
@@ -64,9 +65,34 @@ def jj_null_log_likelihood(y, offset, offset_var=None) -> Any:
     return jj_bound_null_log_likelihood(y, offset, xi, offset_var)
 
 
+@partial(jax.jit, static_argnames=("n_iter",))
+def jj_profiled_null_log_likelihood(y, offset, offset_var=None, n_iter: int = 25) -> Any:
+    """Intercept-PROFILED JJ null: max over (b0, xi) of the bound at eta = offset + b0.
+
+    Required when the effect model profiles a per-feature intercept (e.g. centered
+    localjj): the BF must profile the intercept in BOTH numerator and denominator
+    (offset-shift invariance). Using the plain null (no intercept) credits the
+    feature for the intercept fit and inflates the BF.
+    """
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    ov = jnp.zeros_like(offset) if offset_var is None else jnp.asarray(offset_var)
+
+    def body(state):
+        b0, it = state
+        xi = jnp.sqrt(jnp.maximum((offset + b0) ** 2 + ov, 1e-12))
+        tau = 2.0 * lambda_xi(xi)
+        return jnp.sum(y - 0.5 - tau * offset) / jnp.sum(tau), it + 1
+
+    b0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
+    eta = offset + b0
+    return jj_bound_null_log_likelihood(y, eta, null_tuned_xi(eta, ov), ov)
+
+
 __all__ = [
     "lambda_xi",
     "jj_bound_null_log_likelihood",
     "null_tuned_xi",
     "jj_null_log_likelihood",
+    "jj_profiled_null_log_likelihood",
 ]
