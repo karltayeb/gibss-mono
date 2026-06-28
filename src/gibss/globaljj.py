@@ -8,6 +8,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from ._centering import weighted_centering
+from ._jj import (
+    lambda_xi as _lambda_xi,
+    jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
+    jj_null_log_likelihood as _jj_null_log_likelihood,
+)
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -79,30 +84,6 @@ def _weighted_colmeans(X, tau):
     W = jnp.sum(tau)
     S1 = tau @ X if is_bcoo(X) else jnp.sum(tau[:, None] * X, axis=0)
     return S1 / W, W
-
-
-@jax.jit
-def _lambda_xi(xi):
-    xi = jnp.abs(jnp.asarray(xi))
-    small = xi < 1e-6
-    taylor = 0.125 - (xi**2) / 192.0
-    safe_xi = jnp.where(small, 1.0, xi)
-    stable = jnp.tanh(safe_xi / 2.0) / (4.0 * safe_xi)
-    return jnp.where(small, taylor, stable)
-
-
-@jax.jit
-def _jj_bound_null_log_likelihood(y, offset, xi, offset_var=None):
-    eta_sq = jnp.square(offset)
-    if offset_var is not None:
-        eta_sq = eta_sq + offset_var
-    l_xi = _lambda_xi(xi)
-    return jnp.sum(
-        (y - 0.5) * offset
-        - l_xi * (eta_sq - jnp.square(xi))
-        - jnp.logaddexp(0.0, xi)
-        + 0.5 * xi
-    )
 
 
 @jax.jit
@@ -236,7 +217,8 @@ def update_xi_step(data, state):
 
 
 def fit_global_jj_ser(
-    data, y, xi, offset, prior_variance, cbar=None, weight_sum=0.0, center=False
+    data, y, xi, offset, prior_variance, cbar=None, weight_sum=0.0, center=False,
+    offset_var=None,
 ) -> BaseSERState:
     X = data.X
     X_sq = data.X_sq
@@ -259,7 +241,9 @@ def fit_global_jj_ser(
     alpha, marginal_log_likelihood, kl = _fit_global_jj_ser_stats(
         mu, var, feature_log_evidence, prior_variance, p
     )
-    null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
+    # BF denominator: score the null at the NULL-tuned xi (tight), not the global
+    # xi (loose at the null -> inflates the BF). Method-independent; matches localjj.
+    null_ll = _jj_null_log_likelihood(y, offset, offset_var)
 
     fields = dict(
         mu=mu,
@@ -290,6 +274,7 @@ def update_effect_index_step(data, l, state):
         cbar=fs.cbar,
         weight_sum=fs.weight_sum,
         center=fs.center,
+        offset_var=state.total_message.var,
     )
     return replace_effect_in_gibss_state(state, l, new_effect)
 

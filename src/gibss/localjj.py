@@ -10,6 +10,10 @@ import numpy as np
 from jax.experimental import sparse
 
 from ._centering import weighted_centering
+from ._jj import (
+    lambda_xi as _lambda_xi,
+    jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
+)
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -57,37 +61,6 @@ class LocalJJFamilyState:
 @dataclass(frozen=True, slots=True)
 class LocalJJCenteredEffect(BaseSERState):
     b0: Any = None  # per-feature profiled intercept (warm-started; not propagated)
-
-
-@jax.jit
-def _lambda_xi(xi: jnp.ndarray) -> jnp.ndarray:
-    """Stable Jaakkola-Jordan lambda(xi) with small-xi handling."""
-    xi = jnp.abs(xi)
-    small = xi < 1e-6
-    taylor = 0.125 - (xi**2) / 192.0
-    safe_xi = jnp.where(small, 1.0, xi)
-    stable = jnp.tanh(safe_xi / 2.0) / (4.0 * safe_xi)
-    return jnp.where(small, taylor, stable)
-
-
-@jax.jit
-def _jj_bound_null_log_likelihood(
-    y: jnp.ndarray,
-    offset: jnp.ndarray,
-    xi: jnp.ndarray,
-    offset_var: jnp.ndarray | None = None,
-) -> jnp.ndarray:
-    """JJ bound null log likelihood for a fixed offset and xi."""
-    eta_sq = jnp.square(offset)
-    if offset_var is not None:
-        eta_sq = eta_sq + offset_var
-    l_xi = _lambda_xi(xi)
-    return jnp.sum(
-        (y - 0.5) * offset
-        - l_xi * (eta_sq - jnp.square(xi))
-        - jnp.logaddexp(0.0, xi)
-        + 0.5 * xi
-    )
 
 
 @jax.jit
