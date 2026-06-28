@@ -46,6 +46,16 @@ class LocalJJFamilyState:
     elbo_history: list[float] = field(default_factory=lambda: [-np.inf])
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
+    # Per-feature profiled intercept via weighted column centering, parameterization
+    # (b): profiled (centered) mean + conditional (uncentered) variance. Each feature
+    # owns its intercept (offset = leave-one-out message only); validated monotone &
+    # joint-optimal at the univariate level. Dense bound is O(n*p) (sparse: TODO).
+    center: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LocalJJCenteredEffect(BaseSERState):
+    b0: Any = None  # per-feature profiled intercept (warm-started; not propagated)
 
 
 @jax.jit
@@ -192,6 +202,85 @@ def _fit_univariate_local_jj_regression_dense(
     return jax.vmap(single_feature_update, in_axes=(1, 1, 1, 1))(X, X_sq, tau, xi)
 
 
+@jax.jit
+def _fit_univariate_local_jj_centered_dense(
+    mu_init, var_init, b0_init, X, y, offset, offset_var, prior_variance, X_sq
+):
+    """Per-feature JJ with profiled intercept, parameterization (b).
+
+    Mean uses the centered (profiled) denominator; variance uses the conditional
+    (uncentered) denominator; each feature owns its intercept b0_j.
+    """
+    pv = prior_variance
+
+    def feat(x, x2, mu0, var0, b00):
+        # xi from the warm per-feature predictor eta = offset + b0 + mu*x
+        Em = offset + b00 + mu0 * x
+        Eeta2 = Em**2 + var0 * x2 + offset_var
+        xi = jnp.sqrt(jnp.maximum(Eeta2, 1e-12))
+        tau = 2.0 * _lambda_xi(xi)
+        # parameterization (b): profiled mean, conditional variance
+        W = jnp.sum(tau)
+        c = jnp.sum(tau * x) / W
+        sx2 = jnp.sum(tau * x2)
+        x2c = sx2 - W * c**2
+        r = y - 0.5 - tau * offset
+        m = (jnp.sum(x * r) - c * jnp.sum(r)) / (1.0 / pv + x2c)
+        b0 = jnp.sum(r) / W - m * c
+        v = 1.0 / (1.0 / pv + sx2)
+        # tight bound at eta = offset + b0 + m*x with optimal xi (xi^2 = E[eta^2])
+        eta = offset + b0 + m * x
+        Eeta2n = eta**2 + v * x2 + offset_var
+        xib = jnp.sqrt(jnp.maximum(Eeta2n, 1e-12))
+        bound = jnp.sum(
+            (y - 0.5) * eta
+            - _lambda_xi(xib) * (Eeta2n - xib**2)
+            - jnp.logaddexp(0.0, xib)
+            + 0.5 * xib
+        )
+        kl = 0.5 * (jnp.log(pv / v) + (v + m**2) / pv - 1.0)
+        return m, v, b0, bound - kl
+
+    return jax.vmap(feat, in_axes=(1, 1, 0, 0, 0))(X, X_sq, mu_init, var_init, b0_init)
+
+
+def fit_local_jj_ser_centered(
+    data, offset, mu_init, var_init, b0_init, prior_variance, offset_var
+) -> LocalJJCenteredEffect:
+    """SER wrapper for the profiled-intercept (centered) per-feature JJ update."""
+    X = data.X
+    if _is_bcoo(X):
+        raise NotImplementedError(
+            "centered localjj is dense-only for now (per-feature profiled bound is O(n*p))."
+        )
+    y = jnp.asarray(data.y)
+    offset = jnp.asarray(offset)
+    offset_var = jnp.asarray(offset_var)
+    mu, var, b0, feature_log_evidence = _fit_univariate_local_jj_centered_dense(
+        jnp.asarray(mu_init), jnp.asarray(var_init), jnp.asarray(b0_init),
+        X, y, offset, offset_var, prior_variance, data.X_sq,
+    )
+    p = X.shape[1]
+    log_norm = jax.nn.logsumexp(feature_log_evidence)
+    alpha = jnp.exp(feature_log_evidence - log_norm)
+    alpha = alpha / jnp.sum(alpha)
+    log_pi = -jnp.log(float(p))
+    kl = float(
+        jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi))
+        + 0.5 * jnp.sum(alpha * (jnp.log(prior_variance / var) + (var + mu**2) / prior_variance - 1.0))
+    )
+    # null bound at the (profiled-null) offset for reference
+    xi_null = jnp.sqrt(jnp.maximum(offset**2 + offset_var, 1e-12))
+    null_ll = _jj_bound_null_log_likelihood(y, offset, xi_null, offset_var=offset_var)
+    return LocalJJCenteredEffect(
+        mu=mu, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
+        prior_variance=float(prior_variance),
+        feature_log_evidence=feature_log_evidence,
+        marginal_log_likelihood=float(log_norm - jnp.log(float(p))),
+        null_log_likelihood=float(null_ll), kl=kl, b0=b0,
+    )
+
+
 def fit_univariate_local_jj_regression(
     data: LocalJJData,
     offset: np.ndarray,
@@ -294,10 +383,21 @@ def initialize_state(
         **({} if family_state_kwargs is None else dict(family_state_kwargs))
     )
     zero_message = Message(jnp.zeros(X.shape[0]), jnp.zeros(X.shape[0]))
+    if family_state.center:
+        effects = [_empty_centered_effect(p) for _ in range(L)]
+    else:
+        effects = [_empty_effect(p, 1.0) for _ in range(L)]
     return GIBSSState(
-        single_effects=[_empty_effect(p, 1.0) for _ in range(L)],
+        single_effects=effects,
         total_message=zero_message,
         family_state=family_state,
+    )
+
+
+def _empty_centered_effect(p: int) -> LocalJJCenteredEffect:
+    base = _empty_effect(p, 1.0)
+    return LocalJJCenteredEffect(
+        **{f: getattr(base, f) for f in base.__dataclass_fields__}, b0=np.zeros(p)
     )
 
 
@@ -350,8 +450,8 @@ def estimate_intercept_step(
     state: GIBSSState[LocalJJFamilyState, Message],
 ) -> GIBSSState[LocalJJFamilyState, Message]:
     """Schedule wrapper for estimate_intercept()."""
-    if not state.family_state.estimate_intercept:
-        return state
+    if state.family_state.center or not state.family_state.estimate_intercept:
+        return state  # centered path profiles a per-feature intercept instead
     new_intercept = estimate_intercept(data, state)
     family_state = replace(state.family_state, intercept=new_intercept)
     return replace(state, family_state=family_state)
@@ -371,8 +471,21 @@ def update_effect_index_step(
     - warm starts from effect.mu and effect.var
     """
     effect = state.single_effects[l]
-    offset = state.family_state.intercept + jnp.asarray(state.total_message.mean)
+    fs = state.family_state
     offset_var = jnp.asarray(state.total_message.var)
+    if fs.center:
+        # per-feature profiled intercept: offset = leave-one-out message only
+        new_effect = fit_local_jj_ser_centered(
+            data,
+            jnp.asarray(state.total_message.mean),
+            effect.mu,
+            effect.var,
+            effect.b0,
+            effect.prior_variance,
+            offset_var=offset_var,
+        )
+        return replace_effect_in_gibss_state(state, l, new_effect)
+    offset = fs.intercept + jnp.asarray(state.total_message.mean)
     new_effect = fit_local_jj_ser(
         data,
         offset,
