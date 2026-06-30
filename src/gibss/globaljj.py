@@ -12,6 +12,7 @@ from ._jj import (
     lambda_xi as _lambda_xi,
     jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
     jj_null_log_likelihood as _jj_null_log_likelihood,
+    jj_profiled_null_log_likelihood as _jj_profiled_null_log_likelihood,
 )
 from .engine import (
     BaseSERState,
@@ -241,9 +242,10 @@ def fit_global_jj_ser(
     alpha, marginal_log_likelihood, kl = _fit_global_jj_ser_stats(
         mu, var, feature_log_evidence, prior_variance, p
     )
-    # BF denominator: score the null at the NULL-tuned xi (tight), not the global
-    # xi (loose at the null -> inflates the BF). Method-independent; matches localjj.
-    null_ll = _jj_null_log_likelihood(y, offset, offset_var)
+    # BF denominator: score the null at its own optimal (profiled) intercept and
+    # null-tuned xi, not the shared full-model intercept folded into `offset`
+    # (that under-scores the null -> inflates the BF). Method-independent.
+    null_ll = _jj_profiled_null_log_likelihood(y, offset, offset_var)
 
     fields = dict(
         mu=mu,

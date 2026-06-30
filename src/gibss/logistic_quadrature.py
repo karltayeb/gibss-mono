@@ -71,6 +71,28 @@ def _logistic_loglik(eta: Any, y: Any) -> Any:
     return jnp.sum(jnp.asarray(y) * eta - jnp.logaddexp(0.0, eta))
 
 
+@partial(jax.jit, static_argnames=("n_iter",))
+def _profiled_logistic_null(y: Any, offset: Any, n_iter: int = 50) -> Any:
+    """max_{b0} loglik(offset + b0, y): the intercept-PROFILED null.
+
+    The BF denominator must score the null (b=0) at its own optimal intercept,
+    not the shared full-model intercept folded into `offset` (that under-scores
+    the null and inflates the BF). Newton on b0.
+    """
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+
+    def body(state):
+        b0, it = state
+        prob = jax.nn.sigmoid(offset + b0)
+        grad = jnp.sum(y - prob)
+        hess = jnp.maximum(jnp.sum(prob * (1.0 - prob)), 1e-8)
+        return b0 + jnp.clip(grad / hess, -4.0, 4.0), it + 1
+
+    b0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
+    return _logistic_loglik(offset + b0, y)
+
+
 def _normal_logpdf(beta: Any, prior_variance: float) -> Any:
     beta = jnp.asarray(beta)
     return -0.5 * (beta**2 / prior_variance + jnp.log(2.0 * jnp.pi * prior_variance))
@@ -366,7 +388,7 @@ def fit_quadrature_ser(
     log_pi = -jnp.log(float(p))
     kl_cat = float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi)))
     kl = kl_cat + float(jnp.sum(alpha * coefficient_kl))
-    null_ll = _logistic_loglik(offset, jnp.asarray(data.y))
+    null_ll = _profiled_logistic_null(jnp.asarray(data.y), offset)
     return QuadratureEffect(
         mu=mu,
         var=var,

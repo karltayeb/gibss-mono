@@ -303,11 +303,9 @@ def _fit_local_jj_ser_stats(
     kl = jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi)) + 0.5 * jnp.sum(
         alpha * (jnp.log(prior_variance / var) + (var + mu**2) / prior_variance - 1.0)
     )
-    xi_null_sq = jnp.square(offset)
-    if offset_var is not None:
-        xi_null_sq = xi_null_sq + offset_var
-    xi_null = jnp.sqrt(jnp.maximum(xi_null_sq, 1e-12))
-    null_ll = _jj_bound_null_log_likelihood(y, offset, xi_null, offset_var=offset_var)
+    # null at its own profiled intercept (not the shared full-model intercept in
+    # `offset`), consistent with the centered path -> no BF inflation.
+    null_ll = _jj_profiled_null_log_likelihood(y, offset, offset_var)
     return alpha, marginal_log_likelihood, null_ll, kl
 
 
