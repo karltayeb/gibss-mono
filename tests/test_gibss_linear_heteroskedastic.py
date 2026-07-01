@@ -31,7 +31,7 @@ def test_weighted_univariate_matches_wls():
     x = rng.normal(size=n)
     v = np.abs(rng.normal(size=n)) + 0.2  # known per-obs variance
     y = 0.8 * x + rng.normal(size=n) * np.sqrt(v)
-    data = lin.prep_data(x[:, None], y, obs_variance=v)
+    data = lin.prep_data(x[:, None], y, obs_variance=v, center=False)
     sigma2, pv = 1.3, 2.0
     tau = 1.0 / (sigma2 * v)
     mu, var, _ = lin.fit_univariate_linear_regression(data, tau, np.zeros(n), pv)

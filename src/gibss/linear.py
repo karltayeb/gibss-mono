@@ -54,24 +54,64 @@ class LinearData:
     # Per-observation error variance v_i (Var(y_i) = residual_variance * v_i).
     # None / ones => homoskedastic. Precision weight is tau_i = 1/(sigma^2 v_i).
     obs_variance: Any = None
+    # Pre-centering (unweighted column means), applied ONCE up front. This is a
+    # fixed reparameterization -- distinct from the per-iteration *weighted*
+    # centering (family_state `center`). For dense X the columns are centered
+    # eagerly and this stays None. For sparse (BCOO) X we keep X sparse and store
+    # the means here so methods can center implicitly (X@coef - <coef,cbar>, etc.).
+    column_center: Any = None
 
 
 def _logsumexp(x):
     return float(jax.nn.logsumexp(jnp.asarray(x)))
 
 
-def prep_data(X, y, obs_variance=None) -> LinearData:
+def _column_means(X) -> Any:
+    """Unweighted column means. Sparse-safe: ones @ X (never X.T @ .)."""
+    n = X.shape[0]
     if is_bcoo(X):
+        return (jnp.ones(n) @ X) / n
+    return jnp.mean(X, axis=0)
+
+
+def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData:
+    """Prepare data for the SER engines.
+
+    Pre-centering (default for dense X): center each column by its unweighted
+    mean, once. This decouples the shared intercept from the features so the
+    intercept is not dragged to the top variable's operating point (the
+    "winner-take-all" that over-shrinks credible sets under imbalanced designs).
+    It is a fixed reparameterization, distinct from the per-iteration *weighted*
+    centering (family_state `center`).
+
+    center=None (default): on for dense, off for sparse (BCOO pre-centering is not
+    yet implemented; densifying is avoided to protect large sparse designs).
+    center=True forces it (raises on BCOO for now); center=False leaves X untouched.
+    """
+    if center is None:
+        center = not is_bcoo(X)
+    column_center = None
+    if is_bcoo(X):
+        if center:
+            raise NotImplementedError(
+                "pre-centering (center=True) is not yet supported for sparse BCOO "
+                "input -- pass center=False (sparse implicit centering is the next "
+                "increment). Densifying is avoided here to protect large sparse designs."
+            )
         X_sq = squared_bcoo(X)
     else:
         X = jnp.asarray(X)
+        if center:
+            X = X - _column_means(X)  # eager
         X_sq = jnp.square(X)
     y = jnp.asarray(y)
     if obs_variance is None:
         obs_variance = jnp.ones_like(y)
     else:
         obs_variance = jnp.asarray(obs_variance)
-    return LinearData(X=X, y=y, X_sq=X_sq, obs_variance=obs_variance)
+    return LinearData(
+        X=X, y=y, X_sq=X_sq, obs_variance=obs_variance, column_center=column_center
+    )
 
 
 def _obs_variance(data) -> np.ndarray:

@@ -47,7 +47,7 @@ def test_dense_sparse_parity():
     bi = rng.normal(size=p) * 0.1
     pv = 1.2
     dense = lp.fit_univariate_profile_regression(
-        lp.prep_data(Xd, y), offset, b0i, bi, pv, quadrature_order=11
+        lp.prep_data(Xd, y, center=False), offset, b0i, bi, pv, quadrature_order=11
     )
     Xs = sparse.BCOO.fromdense(jnp.asarray(Xd))
     sp = lp.fit_univariate_profile_regression(

@@ -91,7 +91,7 @@ def test_logsumexp_matches_naive_and_is_stable():
 def test_prep_data_materializes_squared_design():
     X = np.array([[1.0, -2.0], [3.0, 0.5]])
     y = np.array([0.0, 1.0])
-    data = prep_data(X, y)
+    data = prep_data(X, y, center=False)
     np.testing.assert_array_equal(data.X, X)
     np.testing.assert_array_equal(data.y, y)
     np.testing.assert_array_equal(data.X_sq, X**2)

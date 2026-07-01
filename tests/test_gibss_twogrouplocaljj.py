@@ -214,7 +214,7 @@ def test_sparse_matches_dense_univariate():
     var0 = np.abs(rng.normal(size=p)) + 0.5
 
     dense = tgl.fit_univariate_local_twogroup_regression(
-        tgl.prep_data(Xd, llr), offset, offset_var, mu0, var0,
+        tgl.prep_data(Xd, llr, center=False), offset, offset_var, mu0, var0,
         prior_variance=1.3, n_inner_iter=8,
     )
     Xs = sparse.BCOO.fromdense(jnp.asarray(Xd))

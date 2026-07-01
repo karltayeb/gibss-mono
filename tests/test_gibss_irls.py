@@ -39,7 +39,7 @@ def test_irls_single_feature_matches_map():
     x = rng.normal(size=n)
     eta = -0.3 + 1.2 * x
     y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
-    data = irls.prep_data(x[:, None], y)
+    data = irls.prep_data(x[:, None], y, center=False)
     st = irls.initialize_state(
         data, L=1, family_state_kwargs={"estimate_prior_variance": False}
     )

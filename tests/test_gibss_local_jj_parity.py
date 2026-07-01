@@ -14,7 +14,7 @@ def test_local_jj_gibss_tracks_reference_on_stable_fixture():
     prob = 1.0 / (1.0 + np.exp(-logits))
     y = rng.binomial(1, prob, size=n).astype(float)
 
-    data = prep_data(X, y)
+    data = prep_data(X, y, center=False)
     gibss_state = fit_ibss(
         data,
         init_state=initialize_state(

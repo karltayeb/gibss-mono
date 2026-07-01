@@ -29,7 +29,7 @@ def _make_sparse_binary_case(
 def test_localjj_sparse_fit_matches_dense():
     X, y = _make_sparse_binary_case(seed=1)
     Xs = sparse.BCOO.fromdense(jnp.asarray(X))
-    dense_data = prep_data(X, y)
+    dense_data = prep_data(X, y, center=False)
     sparse_data = prep_data(Xs, y)
 
     dense_state = fit_ibss(

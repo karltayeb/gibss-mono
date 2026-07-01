@@ -12,7 +12,7 @@ def test_linear_gibss_tracks_reference_on_stable_fixture():
     beta = np.array([2.5, -1.5, 1.0] + [0.0] * (p - 3))
     y = 0.75 + X @ beta + rng.normal(scale=0.5, size=n)
 
-    data = prep_data(X, y)
+    data = prep_data(X, y, center=False)
     gibss_state = fit_ibss(
         data,
         init_state=initialize_state(

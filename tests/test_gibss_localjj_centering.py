@@ -32,7 +32,7 @@ def test_centered_univariate_matches_joint_jj_optimum():
     x = rng.normal(size=n) + 0.8  # nonzero mean -> centering matters
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.3 + 1.1 * x)))).astype(float)
     pv = 1.0  # matches the engine's empty-effect default prior_variance
-    data = lj.prep_data(x[:, None], y)
+    data = lj.prep_data(x[:, None], y, center=False)
     st = lj.initialize_state(
         data, L=1, family_state_kwargs={"center": True, "estimate_prior_variance": False}
     )
