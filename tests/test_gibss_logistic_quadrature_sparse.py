@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
-from gibss.engine import MeanMessage, fit_ibss
+from gibss.engine import Message, fit_ibss
 from gibss.logistic_quadrature import (
     default_schedule,
     initialize_state,
@@ -57,7 +57,10 @@ def test_quadrature_sparse_fit_matches_dense():
         atol=1e-5,
     )
 
-def test_quadrature_sparse_output_uses_mean_message():
+def test_quadrature_sparse_output_uses_message_with_var():
+    # quadrature carries Message(mean, var); the var channel is populated (the
+    # effect's posterior contribution) so the offset-integrated path can use it.
+    # With integrate_offset=False (default) the var is carried but unused.
     X, y = _make_sparse_binary_case(seed=6)
     Xs = sparse.BCOO.fromdense(jnp.asarray(X))
     data = prep_data(Xs, y)
@@ -69,6 +72,7 @@ def test_quadrature_sparse_output_uses_mean_message():
         max_iter=2,
     )
 
-    assert isinstance(state.total_message, MeanMessage)
-    np.testing.assert_allclose(state.total_message.var, 0.0)
+    assert isinstance(state.total_message, Message)
+    assert np.all(np.isfinite(np.asarray(state.total_message.var)))
+    assert np.all(np.asarray(state.total_message.var) >= 0.0)
     assert np.all(np.isfinite(state.single_effects[0].alpha))

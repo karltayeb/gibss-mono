@@ -11,10 +11,11 @@ from jax.experimental import sparse
 from numpy.polynomial.hermite import hermgauss
 
 from .operators import as_operator
-from .ser_ops import quadrature_ser
+from .ser_ops import quadrature_ser, _smooth_A_only, _smooth_cumulant
 from .engine import (
     BaseSERState,
     GIBSSState,
+    Message,
     MeanMessage,
     Schedule,
     add_message_index_step,
@@ -43,9 +44,9 @@ class QuadratureEffect(BaseSERState):
     mode: np.ndarray
     hessian: np.ndarray
 
-    def message(self, data) -> MeanMessage:
-        mean = data.X @ (self.alpha * self.mu)
-        return MeanMessage(mean=mean)
+    # message: inherit BaseSERState.message -> Message(mean, var). The per-row var
+    # is the effect's contribution to the offset uncertainty; the total-message var
+    # is what the offset-integrated quadrature convolves over (integrate_offset).
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,11 @@ class QuadratureFamilyState:
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
     quadrature_order: int = 15
+    # offset integration: convolve the logistic cumulant over the leave-one-out
+    # message variance N(mean, var) instead of conditioning on the mean only.
+    integrate_offset: bool = False
+    offset_smooth: str = "taylor2"  # "taylor2" | "gh" | "none"
+    offset_order: int = 5           # GH-over-offset nodes when offset_smooth="gh"
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
 
@@ -72,26 +78,30 @@ def _logistic_loglik(eta: Any, y: Any) -> Any:
     return jnp.sum(jnp.asarray(y) * eta - jnp.logaddexp(0.0, eta))
 
 
-@partial(jax.jit, static_argnames=("n_iter",))
-def _profiled_logistic_null(y: Any, offset: Any, n_iter: int = 50) -> Any:
+@partial(jax.jit, static_argnames=("n_iter", "smooth", "order_o"))
+def _profiled_logistic_null(y: Any, offset: Any, n_iter: int = 50, offset_var=None,
+                            smooth: str = "taylor2", order_o: int = 5) -> Any:
     """max_{b0} loglik(offset + b0, y): the intercept-PROFILED null.
 
     The BF denominator must score the null (b=0) at its own optimal intercept,
     not the shared full-model intercept folded into `offset` (that under-scores
-    the null and inflates the BF). Newton on b0.
+    the null and inflates the BF). Newton on b0. With `offset_var` the cumulant is
+    Gaussian-convolved over the random offset (same treatment as the alternative,
+    so the BF stays a like-for-like comparison under offset integration).
     """
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
+    ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
 
     def body(state):
         b0, it = state
-        prob = jax.nn.sigmoid(offset + b0)
-        grad = jnp.sum(y - prob)
-        hess = jnp.maximum(jnp.sum(prob * (1.0 - prob)), 1e-8)
+        _, s, w = _smooth_cumulant(offset + b0, ov, smooth, order_o)
+        grad = jnp.sum(y - s)
+        hess = jnp.maximum(jnp.sum(w), 1e-8)
         return b0 + jnp.clip(grad / hess, -4.0, 4.0), it + 1
 
     b0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
-    return _logistic_loglik(offset + b0, y)
+    return jnp.sum(y * (offset + b0) - _smooth_A_only(offset + b0, ov, smooth, order_o))
 
 
 def _normal_logpdf(beta: Any, prior_variance: float) -> Any:
@@ -106,9 +116,16 @@ def fit_univariate_quadrature_regression(
     mu_init: np.ndarray,
     prior_variance: float,
     quadrature_order: int = 15,
+    offset_var: np.ndarray | None = None,
+    smooth: str = "taylor2",
+    order_o: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Dense per-feature quadrature regression update.
+
+    With `offset_var` (per-row leave-one-out message variance) the per-feature
+    logistic cumulant is Gaussian-convolved over the random offset ({b}x{o} product
+    quadrature); `offset_var=None` is the mean-only quadrature.
 
     Returns:
         mu: posterior means, shape (p,)
@@ -120,13 +137,18 @@ def fit_univariate_quadrature_regression(
     """
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
+    ov = None if offset_var is None else jnp.asarray(offset_var)
     # operator-native per-column quadrature (dense/BCOO/low-rank in one path)
     mu, var, feature_log_bf, coefficient_kl = quadrature_ser(
-        as_operator(data.X), y, offset, prior_variance, order=quadrature_order
+        as_operator(data.X), y, offset, prior_variance, order=quadrature_order,
+        offset_var=ov, smooth=smooth, order_o=order_o,
     )
     # quadrature_ser's evidence is relative to the shared-intercept null (b=0 at
-    # offset); the SER wants the absolute marginal, so add it back.
-    feature_log_evidence = feature_log_bf + _logistic_loglik(offset, y)
+    # offset); the SER wants the absolute marginal, so add it back (offset-integrated
+    # so the b=0 baseline matches the convolved node evaluations).
+    ov_arr = 0.0 if ov is None else ov
+    null_ll = jnp.sum(y * offset - _smooth_A_only(offset, ov_arr, smooth, order_o))
+    feature_log_evidence = feature_log_bf + null_ll
     return mu, var, feature_log_evidence, coefficient_kl, mu, 1.0 / var  # mode/hessian: unused
 
 
@@ -136,11 +158,15 @@ def fit_quadrature_ser(
     mu_init: np.ndarray,
     prior_variance: float,
     quadrature_order: int = 15,
+    offset_var: np.ndarray | None = None,
+    smooth: str = "taylor2",
+    order_o: int = 5,
 ) -> QuadratureEffect:
     """Wrap the quadrature regression update into a full SER state."""
     mu, var, feature_log_evidence, coefficient_kl, mode, hessian = (
         fit_univariate_quadrature_regression(
-            data, offset, mu_init, prior_variance, quadrature_order
+            data, offset, mu_init, prior_variance, quadrature_order,
+            offset_var=offset_var, smooth=smooth, order_o=order_o,
         )
     )
     p = data.X.shape[1]
@@ -151,7 +177,9 @@ def fit_quadrature_ser(
     log_pi = -jnp.log(float(p))
     kl_cat = float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi)))
     kl = kl_cat + float(jnp.sum(alpha * coefficient_kl))
-    null_ll = _profiled_logistic_null(jnp.asarray(data.y), offset)
+    null_ll = _profiled_logistic_null(
+        jnp.asarray(data.y), offset, offset_var=offset_var, smooth=smooth, order_o=order_o
+    )
     return QuadratureEffect(
         mu=mu,
         var=var,
@@ -183,7 +211,9 @@ def initialize_state(
     # family_state_kwargs wins.
     kwargs.setdefault("quadrature_order", quadrature_order)
     family_state = QuadratureFamilyState(**kwargs)
-    zero_message = MeanMessage(jnp.zeros(X.shape[0]))
+    # Message carries per-row var so the offset-integrated path can convolve over
+    # the leave-one-out message variance (integrate_offset). var=0 -> mean-only.
+    zero_message = Message(jnp.zeros(X.shape[0]), jnp.zeros(X.shape[0]))
     init_effect = QuadratureEffect(
         mu=jnp.zeros(p),
         var=jnp.full(p, 1.0),
@@ -209,19 +239,24 @@ def estimate_intercept(
     data: QuadratureData,
     state: GIBSSState[QuadratureFamilyState, MeanMessage],
 ) -> float:
-    """Update the shared intercept for the quadrature family."""
-    intercept = jnp.asarray(state.family_state.intercept)
+    """Update the shared intercept for the quadrature family.
+
+    Under integrate_offset the shared linear predictor total_mean is itself random
+    (message variance), so the intercept MLE convolves the cumulant over it too --
+    keeping the intercept consistent with the offset-integrated per-feature fits."""
+    fs = state.family_state
+    intercept = jnp.asarray(fs.intercept)
     total_mean = jnp.asarray(state.total_message.mean)
+    ov = jnp.asarray(state.total_message.var) if fs.integrate_offset else 0.0
+    smooth, order_o = fs.offset_smooth, fs.offset_order
     y = jnp.asarray(data.y)
 
     def body_fun(state_):
         intercept, it = state_
-        eta = total_mean + intercept
-        prob = jax.nn.sigmoid(eta)
-        grad = jnp.sum(y - prob)
-        hess = -jnp.sum(prob * (1.0 - prob))
-        step = grad / jnp.minimum(hess, -1e-10)
-        step = jnp.clip(step, -2.0, 2.0)
+        _, s, w = _smooth_cumulant(total_mean + intercept, ov, smooth, order_o)
+        grad = jnp.sum(y - s)
+        hess = -jnp.maximum(jnp.sum(w), 1e-10)
+        step = jnp.clip(grad / hess, -2.0, 2.0)
         return intercept - step, it + 1
 
     return float(
@@ -255,13 +290,18 @@ def update_effect_index_step(
     - quadrature order stored in family_state
     """
     effect = state.single_effects[l]
-    offset = state.family_state.intercept + state.total_message.mean
+    fs = state.family_state
+    offset = fs.intercept + state.total_message.mean
+    offset_var = state.total_message.var if fs.integrate_offset else None
     new_effect = fit_quadrature_ser(
         data,
         offset,
         effect.mu,
         effect.prior_variance,
-        state.family_state.quadrature_order,
+        fs.quadrature_order,
+        offset_var=offset_var,
+        smooth=fs.offset_smooth,
+        order_o=fs.offset_order,
     )
     return replace_effect_in_gibss_state(state, l, new_effect)
 
@@ -286,7 +326,9 @@ def to_numpy_state(
         )
         for effect in state.single_effects
     ]
-    total_message = MeanMessage(np.asarray(state.total_message.mean))
+    total_message = Message(
+        np.asarray(state.total_message.mean), np.asarray(state.total_message.var)
+    )
     return replace(state, single_effects=single_effects, total_message=total_message)
 
 
