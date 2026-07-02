@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._jj import lambda_xi
+from ._jj import lambda_xi, jj_profiled_null_log_likelihood
 from .operators import DesignOperator, vandermonde
 
 __all__ = [
@@ -31,6 +31,7 @@ __all__ = [
     "quadrature_ser",
     "profile_ser",
     "localjj_ser",
+    "localjj_centered_ser",
 ]
 
 
@@ -127,23 +128,25 @@ def _null_intercept(offset, y, n_iter: int = 80):
     return c
 
 
-@partial(jax.jit, static_argnames=("n_iter",))
-def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50):
-    """Per-column JJ variational SER (shared intercept in `offset`). The JJ-MM
-    fixed-point with xi^2 = E[eta^2] (variational). Monotone -- always converges,
-    no Newton overshoot. Returns per-feature (m, v, feature_log_bf) rel. the
-    shared JJ null (b=0, xi=|offset|). Support-only reductions -> O(nnz)."""
+@partial(jax.jit, static_argnames=("n_iter", "variational"))
+def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50, variational: bool = True):
+    """Per-column JJ SER (shared intercept in `offset`). JJ-MM fixed-point:
+      variational=True : xi^2 = E[eta^2] = eta_mean^2 + x^2 v  (variational posterior)
+      variational=False: xi^2 = eta_mean^2                     (MAP: xi = |eta(m)|)
+    Monotone (MM) -- always converges, no Newton overshoot. Returns per-feature
+    (m, v, feature_log_bf) rel. the shared JJ null. Support-only -> O(nnz)."""
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
     x = op.entry_x
     y_e = op.broadcast_rows(y)
     off_e = op.broadcast_rows(offset)
     inv_pv = 1.0 / prior_variance
+    vfac = 1.0 if variational else 0.0  # drop x^2 v in xi -> MAP
 
     def body(state):
         m, v, it = state
         eta_mean = off_e + x * op.broadcast_cols(m)  # E[eta] per entry
-        xi = jnp.sqrt(jnp.maximum(eta_mean**2 + x**2 * op.broadcast_cols(v), 1e-12))
+        xi = jnp.sqrt(jnp.maximum(eta_mean**2 + vfac * x**2 * op.broadcast_cols(v), 1e-12))
         tau = 2.0 * lambda_xi(xi)
         v_new = 1.0 / (inv_pv + op.local_moment(2, tau))
         m_new = v_new * op.local_moment(1, y_e - 0.5 - tau * off_e)
@@ -155,7 +158,7 @@ def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50):
 
     # feature log-BF = ELBO - null (b=0, xi=|offset|). Support-only.
     eta_mean = off_e + x * op.broadcast_cols(m)
-    xi = jnp.sqrt(jnp.maximum(eta_mean**2 + x**2 * op.broadcast_cols(v), 1e-12))
+    xi = jnp.sqrt(jnp.maximum(eta_mean**2 + vfac * x**2 * op.broadcast_cols(v), 1e-12))
     xi0 = jnp.abs(off_e)
     xi_terms = op.local_moment(
         0, (-jax.nn.softplus(xi) + 0.5 * xi) - (-jax.nn.softplus(xi0) + 0.5 * xi0)
@@ -164,6 +167,81 @@ def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50):
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
     log_bf = lin + xi_terms - kl
     return m, v, log_bf
+
+
+def _jj_background(offset, b0, y):
+    """JJ row-background: all-rows sums at xi0=|offset+b0| (non-support has no x*b).
+    Returns Sum tau0, Sum tau0*offset, and Sum of the JJ bound terms. b0 any shape."""
+    eta0 = offset.reshape((-1,) + (1,) * b0.ndim) + b0[None, ...]
+    a = jnp.abs(eta0)
+    tau0 = 2.0 * lambda_xi(a)
+    yb = y.reshape((-1,) + (1,) * b0.ndim)
+    off = offset.reshape((-1,) + (1,) * b0.ndim)
+    BG_W = jnp.sum(tau0, 0)
+    BG_Toff = jnp.sum(tau0 * off, 0)
+    BG_bound = jnp.sum((yb - 0.5) * eta0 - jax.nn.softplus(a) + 0.5 * a, 0)
+    return BG_W, BG_Toff, BG_bound
+
+
+@partial(jax.jit, static_argnames=("n_iter", "variational"))
+def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 80, variational: bool = True):
+    """Per-column JJ SER with a PROFILED per-column intercept (= localjj center=True).
+    JJ xi-fixed-point (localjj_ser) + per-column re-centering (Schur with the JJ tau)
+    + the JJ intercept row-background (naive O(n*p); the l_d analog). Parameterization
+    (b): profiled mean, conditional variance. variational as in localjj_ser.
+    Returns per-feature (m, v, feature_log_bf) rel. the profiled JJ null."""
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    x = op.entry_x
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+    inv_pv = 1.0 / prior_variance
+    R0 = jnp.sum(y - 0.5)
+    vfac = 1.0 if variational else 0.0
+
+    def body(state):
+        m, v, b0, it = state
+        me, ve, b0e = op.broadcast_cols(m), op.broadcast_cols(v), op.broadcast_cols(b0)
+        eta_mean = off_e + b0e + x * me
+        xi = jnp.sqrt(jnp.maximum(eta_mean**2 + vfac * x**2 * ve, 1e-12))
+        tau = 2.0 * lambda_xi(xi)
+        xi0_s = jnp.abs(off_e + b0e)
+        tau0_s = 2.0 * lambda_xi(xi0_s)
+        BG_W, BG_Toff, _ = _jj_background(offset, b0, y)
+        W = BG_W + op.local_moment(0, tau - tau0_s)  # sum_all tau
+        S1 = op.local_moment(1, tau)  # support
+        S2 = op.local_moment(2, tau)
+        c = S1 / W
+        x2c = jnp.maximum(S2 - S1**2 / W, 0.0)
+        Ttau_off = BG_Toff + op.local_moment(0, (tau - tau0_s) * off_e)  # sum_all tau*offset
+        R = R0 - Ttau_off  # sum_all r,  r = (y-0.5) - tau*offset
+        Sxr = op.local_moment(1, y_e - 0.5) - op.local_moment(1, tau * off_e)  # sum_support x r
+        m_new = (Sxr - c * R) / (inv_pv + x2c)
+        v_new = 1.0 / (inv_pv + S2)
+        b0_new = R / W - m_new * c
+        return m_new, v_new, b0_new, it + 1
+
+    m, v, b0, _ = jax.lax.while_loop(
+        lambda s: s[3] < n_iter,
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.zeros(op.p), 0),
+    )
+
+    me, ve, b0e = op.broadcast_cols(m), op.broadcast_cols(v), op.broadcast_cols(b0)
+    eta_mean = off_e + b0e + x * me
+    xi = jnp.sqrt(jnp.maximum(eta_mean**2 + vfac * x**2 * ve, 1e-12))
+    xi0_s = jnp.abs(off_e + b0e)
+    _, _, BG_bound = _jj_background(offset, b0, y)
+    supp = op.local_moment(
+        0,
+        (y_e - 0.5) * x * me
+        + (-jax.nn.softplus(xi) + 0.5 * xi)
+        - (-jax.nn.softplus(xi0_s) + 0.5 * xi0_s),
+    )
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    elbo = BG_bound + supp - kl
+    null = jj_profiled_null_log_likelihood(y, offset)
+    return m, v, elbo - null
 
 
 def _intercept_background(offset, b0, y):
