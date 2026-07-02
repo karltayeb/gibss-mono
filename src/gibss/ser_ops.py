@@ -13,15 +13,27 @@ higher global moments with a per-feature Vandermonde in the effect `m` (see
 
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .operators import DesignOperator, vandermonde
 
-__all__ = ["global_gaussian_ser", "local_gaussian_ser", "local_irls"]
+__all__ = ["global_gaussian_ser", "local_gaussian_ser", "local_irls", "quadrature_ser"]
+
+
+@lru_cache(maxsize=None)
+def _gh_rule(order: int):
+    """Gauss-Hermite nodes + log-weights (weight exp(-x^2)). numpy (jit-safe cache)."""
+    nodes, weights = np.polynomial.hermite.hermgauss(order)
+    return nodes, np.log(weights)
+
+
+def _normal_logpdf(b, prior_variance):
+    return -0.5 * (b**2 / prior_variance + jnp.log(2.0 * jnp.pi * prior_variance))
 
 
 def global_gaussian_ser(
@@ -91,6 +103,46 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 30):
     )
     log_bf = dll - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * precision)
     return b, var, log_bf
+
+
+@partial(jax.jit, static_argnames=("order", "n_iter"))
+def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30):
+    """Per-column exact-ish logistic SER: local_irls mode + Gauss-Hermite tail.
+
+    = quadrature (shared intercept). Finds each feature's MAP + Laplace scale
+    (local_irls), lays GH nodes b_hat + sqrt(2) sigma * node around it, and
+    integrates the per-column logistic marginal. order=1 recovers the Laplace
+    (local_irls) evidence. Returns per-feature (mu, var, feature_log_bf), the
+    log-BF relative to the shared null (b=0), which is what alpha uses.
+    """
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    b_hat, var_lap, _ = local_irls(op, y, offset, prior_variance, n_iter)
+    sigma = jnp.sqrt(var_lap)
+
+    nodes_np, log_w_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    log_w = jnp.asarray(log_w_np)
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+    null_e = y_e * off_e - jax.nn.softplus(off_e)  # per-entry null loglik (b=0)
+
+    def node_term(node, lw):
+        b = b_hat + jnp.sqrt(2.0) * sigma * node  # (p,)
+        eta = off_e + op.column_linpred(b)
+        dll = op.local_moment(0, (y_e * eta - jax.nn.softplus(eta)) - null_e)  # (p,)
+        logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
+            jnp.sqrt(2.0) * sigma
+        )
+        return logint, b
+
+    logint, b_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p), (order, p)
+    log_norm = jax.nn.logsumexp(logint, axis=0)  # (p,)
+    feature_log_bf = log_norm  # marginal - shared null
+    pw = jnp.exp(logint - log_norm)  # (order, p) posterior weights
+    mu = jnp.sum(pw * b_nodes, axis=0)
+    var = jnp.sum(pw * b_nodes**2, axis=0) - mu**2
+    return mu, var, feature_log_bf
 
 
 def local_gaussian_ser(
