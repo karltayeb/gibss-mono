@@ -24,6 +24,7 @@ so no per-feature-weighted primitive is needed here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import comb
 from typing import Any
 
 import jax
@@ -35,6 +36,7 @@ __all__ = [
     "DenseOperator",
     "BCOOOperator",
     "LowRankOperator",
+    "CenteredOperator",
     "as_operator",
 ]
 
@@ -181,6 +183,65 @@ class LowRankOperator(DesignOperator):
 
     def tree_flatten(self):
         return (self.U, self.V), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclass(frozen=True)
+class CenteredOperator(DesignOperator):
+    """Column-centered view of any base operator: X_tilde = base - 1_n c^T.
+
+    Structure-agnostic: every primitive is the base's primitive plus a rank-1
+    (binomial for moment(k)) correction in the cached offsets `c`, so it wraps
+    Dense / BCOO / LowRank / Sum identically -- it only calls `base.moment`.
+
+    `c` is cached. Re-centering is a NEW instance from new weights (the base X is
+    shared, never rebuilt): pre-centering uses w=ones (unweighted mean); weighted
+    / profiling uses w=tau (the correction then collapses to the Schur complement).
+    """
+
+    base: DesignOperator
+    c: Any  # cached column offsets (p,)
+
+    @property
+    def shape(self):
+        return self.base.shape
+
+    def matvec(self, v):
+        return self.base.matvec(v) - jnp.sum(self.c * v)
+
+    def rmatvec(self, u):
+        return self.base.rmatvec(u) - self.c * jnp.sum(u)
+
+    def moment(self, k, w):
+        # sum_i (x_ij - c_j)^k w_i = sum_r C(k,r) (-c)^r base.moment(k-r, w)
+        total = jnp.zeros(self.shape[1])
+        for r in range(k + 1):
+            total = total + comb(k, r) * (-self.c) ** r * self.base.moment(k - r, w)
+        return total
+
+    def gram_matvec(self, v):
+        return self.rmatvec(self.matvec(v))  # centered gram, matrix-free
+
+    def recenter(self, w) -> "CenteredOperator":
+        """New centered view with offsets from weights `w` (base reused)."""
+        return CenteredOperator.from_weights(self.base, w)
+
+    @classmethod
+    def from_weights(cls, base: DesignOperator, w) -> "CenteredOperator":
+        w = jnp.asarray(w)
+        c = base.moment(1, w) / jnp.sum(w)
+        return cls(base, c)
+
+    @classmethod
+    def from_offsets(cls, base: DesignOperator, c) -> "CenteredOperator":
+        return cls(base, jnp.asarray(c))
+
+    def tree_flatten(self):
+        return (self.base, self.c), None
 
     @classmethod
     def tree_unflatten(cls, aux, children):
