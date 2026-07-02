@@ -73,6 +73,10 @@ class DesignOperator:
         """Lift a per-row (n,) vector into entry space."""
         raise NotImplementedError
 
+    def broadcast_cols(self, b: Any) -> Any:
+        """Lift a per-column (p,) vector into entry space (by the entry's column)."""
+        raise NotImplementedError
+
     def column_linpred(self, b: Any) -> Any:
         """Per-entry x_ij * b_j (the single-effect contribution, NOT summed over j)."""
         raise NotImplementedError
@@ -121,6 +125,9 @@ class DenseOperator(DesignOperator):
 
     def broadcast_rows(self, v):
         return v[:, None]
+
+    def broadcast_cols(self, b):
+        return b[None, :]
 
     def column_linpred(self, b):
         return self.X * b[None, :]
@@ -172,6 +179,9 @@ class BCOOOperator(DesignOperator):
 
     def broadcast_rows(self, v):
         return v[self.X.indices[:, 0]]
+
+    def broadcast_cols(self, b):
+        return b[self.X.indices[:, 1]]
 
     def column_linpred(self, b):
         return self.X.data * b[self.X.indices[:, 1]]

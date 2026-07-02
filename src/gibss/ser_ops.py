@@ -22,7 +22,13 @@ import numpy as np
 
 from .operators import DesignOperator, vandermonde
 
-__all__ = ["global_gaussian_ser", "local_gaussian_ser", "local_irls", "quadrature_ser"]
+__all__ = [
+    "global_gaussian_ser",
+    "local_gaussian_ser",
+    "local_irls",
+    "local_irls_centered",
+    "quadrature_ser",
+]
 
 
 @lru_cache(maxsize=None)
@@ -103,6 +109,80 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 30):
     )
     log_bf = dll - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * precision)
     return b, var, log_bf
+
+
+def _intercept_background(offset, b0, y):
+    """Row-background for the profiled intercept: sums over ALL rows at eta=offset+b0
+    (no x*b term), per column b0_j. Naive O(n*p) -- the dense l_d (Chebyshev later)."""
+    eta0 = offset[:, None] + b0[None, :]  # (n, p)
+    mu0 = jax.nn.sigmoid(eta0)
+    w0 = mu0 * (1.0 - mu0)
+    ll0 = y[:, None] * eta0 - jax.nn.softplus(eta0)
+    return jnp.sum(w0, 0), jnp.sum(y[:, None] - mu0, 0), jnp.sum(ll0, 0)  # BGw, BGg, BGll
+
+
+@partial(jax.jit, static_argnames=("n_iter",))
+def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 30):
+    """Per-column MAP with a PROFILED per-column intercept (b0_j, b_j) -- profile at
+    order 1. = local_irls + per-column re-centering (Schur) + the intercept
+    row-background. Returns per-feature (b, b0, var, laplace_log_bf)."""
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+    inv_pv = 1.0 / prior_variance
+
+    def newton(b, b0):
+        b0_e = op.broadcast_cols(b0)
+        eta = off_e + b0_e + op.column_linpred(b)  # support, full
+        mu = jax.nn.sigmoid(eta)
+        w = mu * (1.0 - mu)
+        eta0 = off_e + b0_e  # support, no x*b
+        mu0 = jax.nn.sigmoid(eta0)
+        w0 = mu0 * (1.0 - mu0)
+        BGw, BGg, _ = _intercept_background(offset, b0, y)
+        H00 = BGw + op.local_moment(0, w - w0)  # all rows
+        H0b = op.local_moment(1, w)  # support (x factor)
+        Hbb = op.local_moment(2, w) + inv_pv
+        g0 = BGg + op.local_moment(0, mu0 - mu)  # all rows
+        gb = op.local_moment(1, y_e - mu) - inv_pv * b  # support
+        return H00, H0b, Hbb, g0, gb
+
+    # profiled null intercept (b=0): 1-D Newton on b0 over all rows. Also the b0
+    # warm-start for the 2-D Newton -> robust to large offset shifts.
+    def null_body(state):
+        c, it = state
+        mu = jax.nn.sigmoid(offset + c)
+        g = jnp.sum(y - mu)
+        h = jnp.maximum(jnp.sum(mu * (1.0 - mu)), 1e-8)
+        return c + jnp.clip(g / h, -4.0, 4.0), it + 1  # clip: no overshoot on saturation
+
+    c0, _ = jax.lax.while_loop(lambda s: s[1] < 80, null_body, (0.0, 0))
+    ll_null = jnp.sum(y * (offset + c0) - jax.nn.softplus(offset + c0))  # scalar
+
+    def body(state):
+        b, b0, it = state
+        H00, H0b, Hbb, g0, gb = newton(b, b0)
+        det = H00 * Hbb - H0b**2
+        db0 = jnp.clip((Hbb * g0 - H0b * gb) / det, -4.0, 4.0)
+        db = jnp.clip((H00 * gb - H0b * g0) / det, -4.0, 4.0)
+        return b + db, b0 + db0, it + 1
+
+    b, b0, _ = jax.lax.while_loop(
+        lambda s: s[2] < n_iter, body, (jnp.zeros(op.p), jnp.full(op.p, c0), 0)
+    )
+
+    H00, H0b, Hbb, _, _ = newton(b, b0)
+    schur = Hbb - H0b**2 / H00  # profiled curvature (incl. prior)
+    var = 1.0 / schur
+    _, _, BGll = _intercept_background(offset, b0, y)
+    eta = off_e + op.broadcast_cols(b0) + op.column_linpred(b)
+    eta0 = off_e + op.broadcast_cols(b0)
+    ll_alt = BGll + op.local_moment(
+        0, (y_e * eta - jax.nn.softplus(eta)) - (y_e * eta0 - jax.nn.softplus(eta0))
+    )
+    log_bf = (ll_alt - ll_null) - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * schur)
+    return b, b0, var, log_bf
 
 
 @partial(jax.jit, static_argnames=("order", "n_iter"))
