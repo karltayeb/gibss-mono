@@ -8,7 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
-from ._centering import precenter_curvature
+from .operators import as_operator
+from .ser_ops import global_gaussian_ser
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -129,31 +130,15 @@ def _obs_variance(data) -> np.ndarray:
 
 
 def fit_univariate_linear_regression(data, tau, offset, prior_variance):
-    X = data.X
     y = data.y
     tau = jnp.asarray(tau)
     offset = jnp.asarray(offset)
-    X_sq = data.X_sq
-
-    if is_bcoo(X):
-        cbar = getattr(data, "column_center", None)
-        r = tau * (y - offset)
-        if cbar is not None:  # sparse pre-centering: implicit (x - cbar)
-            weighted_x2 = precenter_curvature(tau @ X_sq, tau @ X, jnp.sum(tau), cbar)
-            num = (r @ X) - jnp.sum(r) * cbar
-        else:
-            weighted_x2 = tau @ X_sq
-            num = r @ X
-        precision = (1.0 / prior_variance) + weighted_x2
-        var = 1.0 / precision
-        mu = var * num
-    else:
-        weighted_x2 = jnp.sum(tau[:, None] * X_sq, axis=0)
-        precision = (1.0 / prior_variance) + weighted_x2
-        var = 1.0 / precision
-        mu = var * jnp.sum(tau[:, None] * (y - offset)[:, None] * X, axis=0)
-
-    log_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
+    # One operator-native reduction covers dense/BCOO and (implicit) pre-centering.
+    op = as_operator(data.X)
+    r = tau * (y - offset)
+    mu, var, log_bf = global_gaussian_ser(
+        op, tau, r, prior_variance, cbar=getattr(data, "column_center", None)
+    )
     null_ll = linear_null_log_likelihood(data, tau, offset)
     return mu, var, null_ll + log_bf
 

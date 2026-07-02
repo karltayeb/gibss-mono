@@ -7,7 +7,9 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-from ._centering import weighted_centering, precenter_curvature
+from ._centering import weighted_centering
+from .operators import as_operator
+from .ser_ops import global_gaussian_ser
 from ._jj import (
     lambda_xi as _lambda_xi,
     jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
@@ -87,31 +89,15 @@ def _weighted_colmeans(X, tau):
     return S1 / W, W
 
 
-@jax.jit
-def _fit_univariate_global_jj_regression_sparse(X, X_sq, y, xi, offset, prior_variance, cbar):
+def _fit_univariate_global_jj_regression(op, y, xi, offset, prior_variance, cbar):
+    """Uncentered (or pre-centered) global-JJ SER via the design operator.
+
+    Covers dense and BCOO (and low-rank) in one path -- curvature moment(2, tau),
+    gradient rmatvec(r) -- with optional fixed pre-centering `cbar`.
+    """
     tau = 2.0 * _lambda_xi(xi)
-    # vec-mat (not X.T @ vec): transpose-matmul hangs on BCOO.
-    # cbar = pre-centering column means (zeros => uncentered), applied implicitly.
-    weighted_x2 = precenter_curvature(tau @ X_sq, tau @ X, jnp.sum(tau), cbar)
-    precision = (1.0 / prior_variance) + weighted_x2
-    var = 1.0 / precision
     r = y - 0.5 - tau * offset
-    mu = var * ((r @ X) - jnp.sum(r) * cbar)
-
-    gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
-    null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
-    return mu, var, null_ll + gaussian_kl_bf
-
-
-@jax.jit
-def _fit_univariate_global_jj_regression_dense(X, X_sq, y, xi, offset, prior_variance):
-    tau = 2.0 * _lambda_xi(xi)
-    weighted_x2 = jnp.sum(tau[:, None] * X_sq, axis=0)
-    precision = (1.0 / prior_variance) + weighted_x2
-    var = 1.0 / precision
-    mu = var * jnp.sum((y - 0.5 - tau * offset)[:, None] * X, axis=0)
-
-    gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
+    mu, var, gaussian_kl_bf = global_gaussian_ser(op, tau, r, prior_variance, cbar=cbar)
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
     return mu, var, null_ll + gaussian_kl_bf
 
@@ -232,15 +218,10 @@ def fit_global_jj_ser(
         mu, var, feature_log_evidence = fit(
             X, X_sq, y, xi, offset, prior_variance, cbar, weight_sum
         )
-    elif is_bcoo(X):
-        cc = getattr(data, "column_center", None)
-        cc = jnp.zeros(p) if cc is None else jnp.asarray(cc)
-        mu, var, feature_log_evidence = _fit_univariate_global_jj_regression_sparse(
-            X, X_sq, y, xi, offset, prior_variance, cc
-        )
     else:
-        mu, var, feature_log_evidence = _fit_univariate_global_jj_regression_dense(
-            X, X_sq, y, xi, offset, prior_variance
+        mu, var, feature_log_evidence = _fit_univariate_global_jj_regression(
+            as_operator(X), y, xi, offset, prior_variance,
+            getattr(data, "column_center", None),
         )
 
     alpha, marginal_log_likelihood, kl = _fit_global_jj_ser_stats(

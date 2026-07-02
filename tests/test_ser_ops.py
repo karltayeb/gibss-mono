@@ -6,7 +6,6 @@ from jax.experimental import sparse
 
 jax.config.update("jax_enable_x64", True)
 
-import gibss.globaljj as G
 import gibss.linear as lin
 from gibss._jj import lambda_xi
 from gibss.operators import BCOOOperator, DenseOperator, LowRankOperator
@@ -57,10 +56,11 @@ def test_global_ser_matches_globaljj_kernel(kind):
     op = _ops(Xd)[kind]
     mu, var, _ = global_gaussian_ser(op, tau, y - 0.5 - tau * offset, pv)
 
-    X_sq = jnp.square(jnp.asarray(Xd))
-    mu_ref, var_ref, _ = G._fit_univariate_global_jj_regression_dense(
-        jnp.asarray(Xd), X_sq, y, xi, offset, pv
-    )
+    # independent reference: the global-JJ per-feature curvature/gradient
+    Xn, tn = np.asarray(Xd), np.asarray(tau)
+    r = np.asarray(y - 0.5) - tn * np.asarray(offset)
+    var_ref = 1.0 / (1.0 / pv + (tn[:, None] * Xn**2).sum(0))
+    mu_ref = var_ref * (r[:, None] * Xn).sum(0)
     np.testing.assert_allclose(mu, mu_ref, atol=1e-9)
     np.testing.assert_allclose(var, var_ref, atol=1e-9)
 
