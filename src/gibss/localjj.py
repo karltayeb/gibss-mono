@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
-from ._centering import weighted_centering
+from ._centering import weighted_centering, precenter_curvature
 from ._jj import (
     lambda_xi as _lambda_xi,
     jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
@@ -28,6 +28,7 @@ from .engine import (
     check_skl_convergence_step,
 )
 from .linear import (
+    reject_sparse_precenter,
     prep_data,
     _empty_effect,
     _logsumexp,
@@ -353,6 +354,7 @@ def initialize_state(
     data: LocalJJData, L: int = 1, family_state_kwargs: dict | None = None
 ) -> GIBSSState[LocalJJFamilyState, Message]:
     """Initialize GIBSS state with empty effects and zero total message."""
+    reject_sparse_precenter(data)  # local-xi sparse pre-centering: follow-up
     X = data.X
     p = X.shape[1]
     family_state = LocalJJFamilyState(

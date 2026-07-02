@@ -7,7 +7,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-from ._centering import weighted_centering
+from ._centering import weighted_centering, precenter_curvature
 from ._jj import (
     lambda_xi as _lambda_xi,
     jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
@@ -88,13 +88,15 @@ def _weighted_colmeans(X, tau):
 
 
 @jax.jit
-def _fit_univariate_global_jj_regression_sparse(X, X_sq, y, xi, offset, prior_variance):
+def _fit_univariate_global_jj_regression_sparse(X, X_sq, y, xi, offset, prior_variance, cbar):
     tau = 2.0 * _lambda_xi(xi)
     # vec-mat (not X.T @ vec): transpose-matmul hangs on BCOO.
-    weighted_x2 = tau @ X_sq
+    # cbar = pre-centering column means (zeros => uncentered), applied implicitly.
+    weighted_x2 = precenter_curvature(tau @ X_sq, tau @ X, jnp.sum(tau), cbar)
     precision = (1.0 / prior_variance) + weighted_x2
     var = 1.0 / precision
-    mu = var * ((y - 0.5 - tau * offset) @ X)
+    r = y - 0.5 - tau * offset
+    mu = var * ((r @ X) - jnp.sum(r) * cbar)
 
     gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
@@ -231,8 +233,10 @@ def fit_global_jj_ser(
             X, X_sq, y, xi, offset, prior_variance, cbar, weight_sum
         )
     elif is_bcoo(X):
+        cc = getattr(data, "column_center", None)
+        cc = jnp.zeros(p) if cc is None else jnp.asarray(cc)
         mu, var, feature_log_evidence = _fit_univariate_global_jj_regression_sparse(
-            X, X_sq, y, xi, offset, prior_variance
+            X, X_sq, y, xi, offset, prior_variance, cc
         )
     else:
         mu, var, feature_log_evidence = _fit_univariate_global_jj_regression_dense(

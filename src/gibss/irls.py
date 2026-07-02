@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import linear
-from ._centering import weighted_centering
+from ._centering import weighted_centering, precenter_curvature
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -117,7 +117,10 @@ class IRLSCenteredEffect(BaseSERState):
 
 def _working_data(data, fs: IRLSFamilyState) -> LinearData:
     """Transient LinearData for the inner linear solver: working y + obs variance."""
-    return LinearData(X=data.X, y=fs.y_work, X_sq=data.X_sq, obs_variance=fs.v_work)
+    return LinearData(
+        X=data.X, y=fs.y_work, X_sq=data.X_sq, obs_variance=fs.v_work,
+        column_center=getattr(data, "column_center", None),
+    )
 
 
 def _weighted_colmeans(data, tau):

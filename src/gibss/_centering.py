@@ -41,8 +41,21 @@ import jax.numpy as jnp
 
 
 def centered_curvature(S2: Any, W: Any, c: Any) -> Any:
-    """x2c = sum_i tau_i (x_i - c)^2 = S2 - W c^2 (clamped >= 0)."""
+    """x2c = sum_i tau_i (x_i - c)^2 = S2 - W c^2 (clamped >= 0).
+
+    Valid only when `c` is the tau-WEIGHTED mean (S1 = W c). For a fixed
+    (unweighted, pre-centering) `c` use `precenter_curvature`.
+    """
     return jnp.maximum(S2 - W * c**2, 0.0)
+
+
+def precenter_curvature(S2: Any, S1: Any, W: Any, c: Any) -> Any:
+    """sum_i tau_i (x_i - c)^2 for a FIXED c = S2 - 2 c S1 + c^2 W (S1 = tau @ x).
+
+    Pre-centering: the column offset `c` is fixed (unweighted mean), not the
+    tau-weighted mean, so the S1 cross-term does not vanish.
+    """
+    return S2 - 2.0 * c * S1 + c**2 * W
 
 
 def weighted_centering(
@@ -66,4 +79,4 @@ def weighted_centering(
     return mu, var
 
 
-__all__ = ["weighted_centering", "centered_curvature"]
+__all__ = ["weighted_centering", "centered_curvature", "precenter_curvature"]

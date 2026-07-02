@@ -242,6 +242,16 @@ class BaseSERState:
             else:
                 X_sq = jnp.square(X)
         second_moment = X_sq @ coef_second_moment
+        # Sparse pre-centering: X is kept raw, columns centered implicitly by cbar.
+        # (Dense pre-centering bakes it into X, so column_center is None there.)
+        cbar = getattr(data, "column_center", None)
+        if cbar is not None:
+            mean = mean - jnp.sum(coef_mean * cbar)
+            second_moment = (
+                second_moment
+                - 2.0 * (X @ (coef_second_moment * cbar))
+                + jnp.sum(coef_second_moment * cbar**2)
+            )
         var = jnp.maximum(second_moment - jnp.square(mean), 0.0)
         return Message(mean=mean, var=var)
 

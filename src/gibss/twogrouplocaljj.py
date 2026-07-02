@@ -45,7 +45,7 @@ from .engine import (
     snapshot_state_step,
     subtract_message_index_step,
 )
-from .linear import _empty_effect, update_prior_variance_index_step
+from .linear import _empty_effect, reject_sparse_precenter, update_prior_variance_index_step
 from .localjj import (
     _estimate_intercept_jit,
     _is_bcoo,
@@ -72,6 +72,7 @@ def initialize_state(
     data, L: int = 1, family_state_kwargs: dict | None = None
 ) -> GIBSSState[TwoGroupLocalJJFamilyState, Message]:
     """Initialize GIBSS state with empty effects and zero total message."""
+    reject_sparse_precenter(data)  # node-based sparse pre-centering: follow-up
     X = data.X
     p = X.shape[1]
     family_state = TwoGroupLocalJJFamilyState(

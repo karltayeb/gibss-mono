@@ -23,6 +23,7 @@ from .engine import (
     check_alpha_skl_convergence_step,
 )
 from .linear import (
+    reject_sparse_precenter,
     prep_data,
     LinearData,
     update_prior_variance_index_step,
@@ -412,6 +413,7 @@ def initialize_state(
     family_state_kwargs: dict | None = None,
 ) -> GIBSSState[QuadratureFamilyState, MeanMessage]:
     """Initialize GIBSS state with empty quadrature effects and zero message."""
+    reject_sparse_precenter(data)  # node-based sparse pre-centering: follow-up
     X = data.X
     p = X.shape[1]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)

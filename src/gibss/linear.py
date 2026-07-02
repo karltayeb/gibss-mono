@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
+from ._centering import precenter_curvature
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -93,11 +94,7 @@ def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData
     column_center = None
     if is_bcoo(X):
         if center:
-            raise NotImplementedError(
-                "pre-centering (center=True) is not yet supported for sparse BCOO "
-                "input -- pass center=False (sparse implicit centering is the next "
-                "increment). Densifying is avoided here to protect large sparse designs."
-            )
+            column_center = _column_means(X)  # lazy: keep X sparse, center implicitly
         X_sq = squared_bcoo(X)
     else:
         X = jnp.asarray(X)
@@ -112,6 +109,15 @@ def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData
     return LinearData(
         X=X, y=y, X_sq=X_sq, obs_variance=obs_variance, column_center=column_center
     )
+
+
+def reject_sparse_precenter(data) -> None:
+    """Guard for methods that don't yet implement sparse implicit pre-centering."""
+    if getattr(data, "column_center", None) is not None:
+        raise NotImplementedError(
+            "sparse (BCOO) pre-centering is not yet implemented for this method; "
+            "pass center=False, or use a Gaussian family (linear/irls/globaljj/localjj)."
+        )
 
 
 def _obs_variance(data) -> np.ndarray:
@@ -130,10 +136,17 @@ def fit_univariate_linear_regression(data, tau, offset, prior_variance):
     X_sq = data.X_sq
 
     if is_bcoo(X):
-        weighted_x2 = tau @ X_sq
+        cbar = getattr(data, "column_center", None)
+        r = tau * (y - offset)
+        if cbar is not None:  # sparse pre-centering: implicit (x - cbar)
+            weighted_x2 = precenter_curvature(tau @ X_sq, tau @ X, jnp.sum(tau), cbar)
+            num = (r @ X) - jnp.sum(r) * cbar
+        else:
+            weighted_x2 = tau @ X_sq
+            num = r @ X
         precision = (1.0 / prior_variance) + weighted_x2
         var = 1.0 / precision
-        mu = var * ((tau * (y - offset)) @ X)
+        mu = var * num
     else:
         weighted_x2 = jnp.sum(tau[:, None] * X_sq, axis=0)
         precision = (1.0 / prior_variance) + weighted_x2

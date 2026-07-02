@@ -51,7 +51,7 @@ from .engine import (
     subtract_message_index_step,
 )
 from . import chebyshev as cb
-from .linear import LinearData, prep_data, update_prior_variance_index_step
+from .linear import LinearData, prep_data, reject_sparse_precenter, update_prior_variance_index_step
 from .logistic_quadrature import (
     _hermgauss_rule,
     _is_bcoo,
@@ -736,6 +736,7 @@ def initialize_state(
     quadrature_order: int = 15,
     family_state_kwargs: dict | None = None,
 ) -> GIBSSState[ProfileFamilyState, MeanMessage]:
+    reject_sparse_precenter(data)  # profile already profiles the intercept; pre-center is a no-op
     X = data.X
     p = X.shape[1]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)

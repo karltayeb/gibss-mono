@@ -76,13 +76,41 @@ def test_pre_centering_is_noop_for_profile():
     np.testing.assert_allclose(bf(True), bf(False), atol=1e-3)
 
 
-def test_bcoo_center_true_raises_but_default_off():
+def test_bcoo_default_off_node_methods_reject_sparse_center():
     rng = np.random.default_rng(2)
     Xs = sparse.BCOO.fromdense(jnp.asarray(rng.normal(size=(40, 5))))
     y = rng.binomial(1, 0.5, 40).astype(float)
-    # default (None) -> off for sparse, no raise
-    d = Q.prep_data(Xs, y)
-    assert d.column_center is None
-    # explicit center=True -> not yet supported
+    # default (None) -> off for sparse, no cbar stored
+    assert Q.prep_data(Xs, y).column_center is None
+    # explicit center=True -> prep stores cbar; node-based methods reject it at init
+    d = Q.prep_data(Xs, y, center=True)
+    assert d.column_center is not None
     with pytest.raises(NotImplementedError):
-        Q.prep_data(Xs, y, center=True)
+        Q.initialize_state(d, L=1)
+
+
+@pytest.mark.parametrize("mod_name", ["linear", "irls", "globaljj"])
+def test_gaussian_sparse_precenter_matches_dense(mod_name):
+    import importlib
+    mod = importlib.import_module(f"gibss.{mod_name}")
+    rng = np.random.default_rng(0)
+    n, p = 300, 40
+    X = rng.normal(size=(n, p)) * rng.binomial(1, 0.3, size=(n, p)) + 0.4
+    Xd = jnp.asarray(X)
+    Xs = sparse.BCOO.fromdense(Xd)
+    if mod_name == "linear":
+        y = jnp.asarray(rng.normal(size=n) + X[:, 3] * 1.5)
+    else:
+        y = jnp.asarray(rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + 1.5 * X[:, 3]))), size=n).astype(float))
+
+    def bf(Xin):
+        d = mod.prep_data(Xin, y, center=True)
+        st = fit_ibss(d, mod.initialize_state(d, L=2), mod.default_schedule(), max_iter=40)
+        e = st.single_effects[0]
+        return np.asarray(e.mu), np.asarray(e.alpha), float(np.asarray(st.ser_log_bayes_factor)[0])
+
+    md, ad, bd = bf(Xd)
+    ms, as_, bs = bf(Xs)
+    np.testing.assert_allclose(md, ms, atol=1e-9)
+    np.testing.assert_allclose(ad, as_, atol=1e-9)
+    np.testing.assert_allclose(bd, bs, atol=1e-8)
