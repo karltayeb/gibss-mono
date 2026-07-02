@@ -317,13 +317,18 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     return mu, var, feature_log_bf
 
 
-@partial(jax.jit, static_argnames=("order", "n_iter", "background"))
-def profile_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30, background: str = "exact"):
+@partial(jax.jit, static_argnames=("order", "n_iter", "background", "node_intercept", "node_newton"))
+def profile_ser(
+    op, y, offset, prior_variance, order: int = 15, n_iter: int = 30,
+    background: str = "exact", node_intercept: str = "linear", node_newton: int = 4,
+):
     """Per-column profiled-intercept SER: local_irls_centered mode + GH tail with
-    per-node intercept re-profiling (= profile). Node intercepts by the Cox-Reid
-    linear step b0_k = b0_hat - c*(b_k - b_hat), c = H0b/H00 (the re-centering
-    slope). `background`: 'exact' (O(n*p*order)) or 'chebyshev' (O(n*D + D*p*order)
-    surrogate of the intercept row-background). Returns (mu, var, feature_log_bf)."""
+    per-node intercept re-profiling (= profile).
+
+    node_intercept: 'linear' (Cox-Reid one step b0_k = b0_hat - c*(b_k - b_hat)) or
+    'newton' (fully profile b0 at each node -- a few Newton steps using the row-
+    background; more accurate in the tails, cheap under background='chebyshev').
+    background: 'exact' O(n*p*order) or 'chebyshev' O(n*D + D*p*order)."""
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
     b_hat, b0_hat, var_lap, _ = local_irls_centered(op, y, offset, prior_variance, n_iter)
@@ -347,13 +352,32 @@ def profile_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30
     nodes_np, log_w_np = _gh_rule(order)
     nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
     b_nodes = b_hat[None, :] + jnp.sqrt(2.0) * sigma[None, :] * nodes[:, None]  # (order, p)
-    b0_nodes = b0_hat[None, :] - c_slope[None, :] * (b_nodes - b_hat[None, :])
+    b0_nodes = b0_hat[None, :] - c_slope[None, :] * (b_nodes - b_hat[None, :])  # Cox-Reid
 
-    # intercept row-background at every node intercept -- built once
-    if background == "chebyshev":
-        _, _, BGll = _intercept_background_cheb(offset, b0_nodes, y)
-    else:
-        _, _, BGll = _intercept_background(offset, b0_nodes, y)  # (order, p)
+    def _row_bg(b0):
+        return (
+            _intercept_background_cheb(offset, b0, y)
+            if background == "chebyshev"
+            else _intercept_background(offset, b0, y)
+        )
+
+    def _supp_gw(b, b0):  # per-node support corrections to g0, H00
+        b0e = op.broadcast_cols(b0)
+        eta = off_e + b0e + op.column_linpred(b)
+        eta0 = off_e + b0e
+        mu, mu0 = jax.nn.sigmoid(eta), jax.nn.sigmoid(eta0)
+        sg = op.local_moment(0, mu0 - mu)
+        sw = op.local_moment(0, mu * (1.0 - mu) - mu0 * (1.0 - mu0))
+        return sg, sw
+
+    if node_intercept == "newton":
+        for _ in range(node_newton):  # fully profile b0 at each node
+            BGw, BGg, _ = _row_bg(b0_nodes)
+            sg, sw = jax.vmap(_supp_gw)(b_nodes, b0_nodes)
+            b0_nodes = b0_nodes + jnp.clip((BGg + sg) / (BGw + sw), -4.0, 4.0)
+
+    # intercept row-background at the (final) node intercepts
+    _, _, BGll = _row_bg(b0_nodes)  # (order, p)
 
     def node_supp(node, lw, b, b0, bgll):
         b0e = op.broadcast_cols(b0)

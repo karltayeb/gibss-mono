@@ -115,6 +115,76 @@ def test_chebyshev_background_matches_exact(kind):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-8)
 
 
+def _brute_profile_exact_col(x, y, offset, pv, order):
+    # 2-D mode (for node placement + scale)
+    b0, b = 0.0, 0.0
+    for _ in range(80):
+        eta = offset + b0 + x * b
+        mu = 1 / (1 + np.exp(-eta))
+        w = mu * (1 - mu)
+        r = y - mu
+        H00 = np.sum(w); H0b = w @ x; Hbb = (x**2) @ w + 1 / pv
+        det = H00 * Hbb - H0b**2
+        b0 += (Hbb * np.sum(r) - H0b * (x @ r - b / pv)) / det
+        b += (H00 * (x @ r - b / pv) - H0b * np.sum(r)) / det
+    sigma = 1 / np.sqrt(Hbb - H0b**2 / H00)
+
+    def prof_b0(bk, init):  # exact profiled intercept at b=bk
+        c = init
+        for _ in range(60):
+            mu = 1 / (1 + np.exp(-(offset + c + x * bk)))
+            c += np.sum(y - mu) / max(np.sum(mu * (1 - mu)), 1e-8)
+        return c
+
+    c0 = prof_b0(0.0, 0.0)
+    ll_null = np.sum(y * (offset + c0) - np.logaddexp(0, offset + c0))
+    nodes, weights = np.polynomial.hermite.hermgauss(order)
+    logint, bs = [], []
+    for nd, wt in zip(nodes, weights):
+        bk = b + np.sqrt(2) * sigma * nd
+        b0k = prof_b0(bk, b0)
+        etak = offset + b0k + x * bk
+        ll = np.sum(y * etak - np.logaddexp(0, etak))
+        lp = -0.5 * (bk**2 / pv + np.log(2 * np.pi * pv))
+        logint.append(np.log(wt) + nd**2 + (ll - ll_null) + lp + np.log(np.sqrt(2) * sigma))
+        bs.append(bk)
+    from scipy.special import logsumexp
+    logint = np.array(logint); bs = np.array(bs)
+    logbf = logsumexp(logint)
+    pw = np.exp(logint - logbf)
+    return np.sum(pw * bs), np.sum(pw * bs**2) - np.sum(pw * bs) ** 2, logbf
+
+
+@pytest.mark.parametrize("kind", ["dense", "bcoo"])
+def test_newton_node_intercept_matches_exact_profile(kind):
+    rng = np.random.default_rng(5)
+    n, p = 400, 8
+    Xd = rng.normal(size=(n, p)) + 0.3
+    offset = rng.normal(size=n) * 0.3
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.4 + 1.5 * Xd[:, 2]))), size=n).astype(float)
+    pv = 1.5
+    mu, var, lbf = profile_ser(
+        _ops(Xd)[kind], jnp.asarray(y), jnp.asarray(offset), pv, order=15, node_intercept="newton"
+    )
+    ref = np.array([_brute_profile_exact_col(Xd[:, j], y, offset, pv, 15) for j in range(p)])
+    np.testing.assert_allclose(np.asarray(mu), ref[:, 0], atol=1e-4)
+    np.testing.assert_allclose(np.asarray(var), ref[:, 1], atol=1e-4)
+    np.testing.assert_allclose(np.asarray(lbf), ref[:, 2], atol=1e-3)
+
+
+def test_newton_chebyshev_equals_exact_background():
+    rng = np.random.default_rng(6)
+    n, p = 500, 30
+    Xd = rng.normal(size=(n, p)) * rng.binomial(1, 0.3, size=(n, p)) + 0.3
+    offset = rng.normal(size=n) * 0.3
+    y = rng.binomial(1, 0.4, size=n).astype(float)
+    op = DenseOperator(jnp.asarray(Xd))
+    a = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, node_intercept="newton", background="exact")
+    b = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, node_intercept="newton", background="chebyshev")
+    for x, z in zip(a, b):
+        np.testing.assert_allclose(np.asarray(x), np.asarray(z), atol=1e-7)
+
+
 def test_profile_ser_offset_shift_invariance():
     rng = np.random.default_rng(3)
     n, p = 400, 10
