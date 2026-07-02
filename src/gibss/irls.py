@@ -28,6 +28,7 @@ import numpy as np
 from . import linear
 from .operators import as_operator, CenteredOperator
 from .ser_ops import global_gaussian_ser
+from .logistic_quadrature import _profiled_logistic_null
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -246,7 +247,26 @@ def update_effect_index_step(data, l, state):
         )
     else:
         new_effect = linear.fit_linear_ser(wd, tau, offset, effect.prior_variance)
+    # Report marginal/null on the LOGISTIC scale (the working-Gaussian null cancels
+    # in the BF, but as a standalone null it isn't the GLM null). Re-base the per-
+    # feature Laplace log_bf onto the EXACT profiled logistic null at the GLM
+    # leave-one-out predictor. BF is unchanged.
+    new_effect = _relogistic_null(new_effect, data, fs, state.total_message.mean)
     return replace_effect_in_gibss_state(state, l, new_effect)
+
+
+def _relogistic_null(effect, data, fs, message_mean):
+    p = np.asarray(effect.mu).shape[0]
+    log_bf = np.asarray(effect.feature_log_evidence) - float(effect.null_log_likelihood)
+    glm_eta = jnp.asarray(fs.glm_offset) + jnp.asarray(message_mean)  # b=0 GLM predictor
+    null_ll = float(_profiled_logistic_null(jnp.asarray(data.y), glm_eta))
+    fle = null_ll + log_bf
+    return replace(
+        effect,
+        feature_log_evidence=fle,
+        null_log_likelihood=null_ll,
+        marginal_log_likelihood=float(linear._logsumexp(fle) - np.log(p)),
+    )
 
 
 # ---------------------------------------------------------------------------
