@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from functools import lru_cache, partial
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
-from jax.ops import segment_sum
 from numpy.polynomial.hermite import hermgauss
 
 from .operators import as_operator
@@ -55,7 +54,6 @@ class QuadratureFamilyState:
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
     quadrature_order: int = 15
-    sparse_context: Any = None
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
 
@@ -100,238 +98,6 @@ def _normal_logpdf(beta: Any, prior_variance: float) -> Any:
     beta = jnp.asarray(beta)
     return -0.5 * (beta**2 / prior_variance + jnp.log(2.0 * jnp.pi * prior_variance))
 
-
-def _expected_loglik_quadrature(
-    y: np.ndarray,
-    mu: np.ndarray,
-    var: np.ndarray,
-    quadrature_order: int = 15,
-) -> np.ndarray:
-    """Compute E[log p(y | eta)] with eta ~ N(mu, var) via quadrature."""
-    nodes, log_weights = _hermgauss_rule(quadrature_order)
-    mu = jnp.asarray(mu)
-    var = jnp.asarray(var)
-    y = jnp.asarray(y)
-    points = (
-        mu[:, None]
-        + jnp.sqrt(jnp.maximum(2.0 * var[:, None], 1e-12))
-        * jnp.asarray(nodes)[None, :]
-    )
-    logliks = y[:, None] * points - jnp.logaddexp(0.0, points)
-    expected_loglik = (
-        jnp.sum(jnp.exp(jnp.asarray(log_weights))[None, :] * logliks, axis=1)
-        / jnp.sqrt(jnp.pi)
-    )
-    return jnp.sum(expected_loglik)
-
-
-def _quadrature_mode_1d(
-    x: np.ndarray,
-    y: np.ndarray,
-    offset: np.ndarray,
-    prior_variance: float,
-    beta_init: float,
-) -> tuple[Any, Any]:
-    """Return 1D posterior mode and local Hessian for a single feature."""
-    x = jnp.asarray(x)
-    y = jnp.asarray(y)
-    offset = jnp.asarray(offset)
-    beta = jnp.asarray(beta_init)
-
-    def cond_fun(state):
-        _, it, diff = state
-        return (it < 25) & (diff > 1e-7)
-
-    def body_fun(state):
-        beta, it, _ = state
-        eta = offset + x * beta
-        prob = jax.nn.sigmoid(eta)
-        resid = y - prob
-        weight = prob * (1.0 - prob)
-        grad = jnp.sum(x * resid) - beta / prior_variance
-        raw_hess = -jnp.sum(x**2 * weight) - 1.0 / prior_variance
-        curvature = jnp.maximum(-raw_hess, 1e-8)
-        step = jnp.clip(grad / curvature, -2.0, 2.0)
-        return beta + step, it + 1, jnp.abs(step)
-
-    mode, _, _ = jax.lax.while_loop(cond_fun, body_fun, (beta, 0, jnp.inf))
-    eta = offset + x * mode
-    prob = jax.nn.sigmoid(eta)
-    curvature = jnp.sum(x**2 * prob * (1.0 - prob)) + 1.0 / prior_variance
-    return mode, jnp.maximum(curvature, 1e-8)
-
-
-def _quadrature_feature_1d(
-    x: np.ndarray,
-    y: np.ndarray,
-    offset: np.ndarray,
-    prior_variance: float,
-    beta_init: float,
-    quadrature_order: int,
-) -> tuple[Any, Any, Any, Any, Any, Any]:
-    """
-    Compute per-feature quadrature quantities.
-
-    Returns:
-        mu: posterior mean
-        var: posterior variance
-        feature_log_evidence: marginal log evidence
-        coefficient_kl: per-feature Gaussian coefficient KL
-        mode: posterior mode
-        hessian: negative Hessian at the mode
-    """
-    mode, hessian = _quadrature_mode_1d(x, y, offset, prior_variance, beta_init)
-    nodes_np, log_weights_np = _hermgauss_rule(quadrature_order)
-    nodes = jnp.asarray(nodes_np, dtype=jnp.asarray(offset).dtype)
-    log_weights = jnp.asarray(log_weights_np, dtype=jnp.asarray(offset).dtype)
-    sd = jnp.sqrt(1.0 / hessian)
-    beta = mode + jnp.sqrt(2.0) * sd * nodes
-    loglik = jax.vmap(lambda b: _logistic_loglik(offset + x * b, y))(beta)
-    log_prior = _normal_logpdf(beta, prior_variance)
-    log_jacobian = jnp.log(jnp.sqrt(2.0) * sd + 1e-30)
-    log_quad_weight = log_weights + nodes**2 + loglik + log_prior + log_jacobian
-    feature_marginal_log_likelihood = jax.nn.logsumexp(log_quad_weight)
-    posterior_weight = jnp.exp(log_quad_weight - feature_marginal_log_likelihood)
-    mu = jnp.sum(posterior_weight * beta)
-    second_moment = jnp.sum(posterior_weight * beta**2)
-    var = jnp.maximum(second_moment - mu**2, 0.0)
-    coefficient_kl = jnp.sum(posterior_weight * loglik) - feature_marginal_log_likelihood
-    coefficient_kl = jnp.maximum(coefficient_kl, 0.0)
-    return (
-        mu,
-        var,
-        feature_marginal_log_likelihood,
-        coefficient_kl,
-        mode,
-        hessian,
-    )
-
-
-class SparseQuadratureContext(NamedTuple):
-    rows: Any
-    cols: Any
-    vals: Any
-
-
-def _build_sparse_quadrature_context(X: sparse.BCOO) -> SparseQuadratureContext:
-    if not _is_bcoo(X):
-        raise TypeError("_build_sparse_quadrature_context requires a BCOO matrix.")
-    return SparseQuadratureContext(rows=X.indices[:, 0], cols=X.indices[:, 1], vals=X.data)
-
-
-def _sparse_loglik_grid(beta_grid, rows, cols, vals, y, offset, base_loglik, p):
-    y_support = y[rows]
-    offset_support = offset[rows]
-    base_i = y_support * offset_support - jnp.logaddexp(0.0, offset_support)
-
-    def one_point(beta):
-        eta = offset_support + vals * beta[cols]
-        updated = y_support * eta - jnp.logaddexp(0.0, eta)
-        return base_loglik + segment_sum(updated - base_i, cols, num_segments=p)
-
-    return jax.vmap(one_point, in_axes=1, out_axes=1)(beta_grid)
-
-
-def _sparse_quadrature_mode_1d(rows, cols, vals, y, offset, prior_variance, beta_init, p):
-    def cond_fun(state):
-        _, it, diff = state
-        return (it < 25) & (jnp.max(diff) > 1e-7)
-
-    def body_fun(state):
-        beta, it, _ = state
-        y_support = y[rows]
-        offset_support = offset[rows]
-        eta = offset_support + vals * beta[cols]
-        prob = jax.nn.sigmoid(eta)
-        resid = y_support - prob
-        weight = prob * (1.0 - prob)
-        grad = segment_sum(vals * resid, cols, num_segments=p) - beta / prior_variance
-        curvature = segment_sum(vals**2 * weight, cols, num_segments=p) + 1.0 / prior_variance
-        curvature = jnp.maximum(curvature, 1e-8)
-        step = jnp.clip(grad / curvature, -2.0, 2.0)
-        return beta + step, it + 1, jnp.abs(step)
-
-    mode, _, _ = jax.lax.while_loop(
-        cond_fun, body_fun, (beta_init, 0, jnp.full_like(beta_init, jnp.inf))
-    )
-    eta = offset[rows] + vals * mode[cols]
-    prob = jax.nn.sigmoid(eta)
-    hessian = segment_sum(vals**2 * prob * (1.0 - prob), cols, num_segments=p) + 1.0 / prior_variance
-    return mode, jnp.maximum(hessian, 1e-8)
-
-
-def _sparse_quadrature_feature_1d(
-    rows,
-    cols,
-    vals,
-    y,
-    offset,
-    base_loglik,
-    prior_variance,
-    beta_init,
-    quadrature_order,
-    p,
-):
-    mode, hessian = _sparse_quadrature_mode_1d(
-        rows, cols, vals, y, offset, prior_variance, beta_init, p
-    )
-    nodes_np, log_weights_np = _hermgauss_rule(quadrature_order)
-    nodes = jnp.asarray(nodes_np, dtype=offset.dtype)
-    log_weights = jnp.asarray(log_weights_np, dtype=offset.dtype)
-    sd = jnp.sqrt(1.0 / hessian)
-    beta = mode[:, None] + jnp.sqrt(2.0) * sd[:, None] * nodes[None, :]
-    loglik = _sparse_loglik_grid(beta, rows, cols, vals, y, offset, base_loglik, p)
-    log_prior = _normal_logpdf(beta, prior_variance)
-    log_jacobian = jnp.log(jnp.sqrt(2.0) * sd[:, None] + 1e-30)
-    log_quad_weight = log_weights[None, :] + nodes[None, :] ** 2 + loglik + log_prior + log_jacobian
-    feature_marginal_log_likelihood = jax.nn.logsumexp(log_quad_weight, axis=1)
-    posterior_weight = jnp.exp(log_quad_weight - feature_marginal_log_likelihood[:, None])
-    mu = jnp.sum(posterior_weight * beta, axis=1)
-    second_moment = jnp.sum(posterior_weight * beta**2, axis=1)
-    var = jnp.maximum(second_moment - mu**2, 0.0)
-    coefficient_kl = jnp.sum(posterior_weight * loglik, axis=1) - feature_marginal_log_likelihood
-    coefficient_kl = jnp.maximum(coefficient_kl, 0.0)
-    return mu, var, feature_marginal_log_likelihood, coefficient_kl, mode, hessian
-
-
-@partial(jax.jit, static_argnames=("quadrature_order",))
-def _fit_dense_univariate_quadrature_regression(
-    X,
-    y,
-    offset,
-    mu_init,
-    prior_variance,
-    quadrature_order,
-):
-    return jax.vmap(
-        lambda x, m: _quadrature_feature_1d(x, y, offset, prior_variance, m, quadrature_order),
-        in_axes=(1, 0),
-    )(X, mu_init)
-
-
-@partial(jax.jit, static_argnames=("quadrature_order",))
-def _fit_sparse_univariate_quadrature_regression(
-    supports: SparseQuadratureContext,
-    y,
-    offset,
-    mu_init,
-    prior_variance,
-    quadrature_order,
-):
-    base_loglik = _logistic_loglik(offset, y)
-    p = mu_init.shape[0]
-    return _sparse_quadrature_feature_1d(
-        supports.rows,
-        supports.cols,
-        supports.vals,
-        y,
-        offset,
-        base_loglik,
-        prior_variance,
-        mu_init,
-        quadrature_order,
-        p,
-    )
 
 
 def fit_univariate_quadrature_regression(
@@ -414,9 +180,8 @@ def initialize_state(
     p = X.shape[1]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)
     # quadrature_order: the explicit parameter is the default; a value passed via
-    # family_state_kwargs wins. sparse_context is genuinely derived from data.
+    # family_state_kwargs wins.
     kwargs.setdefault("quadrature_order", quadrature_order)
-    kwargs["sparse_context"] = _build_sparse_quadrature_context(X) if _is_bcoo(X) else None
     family_state = QuadratureFamilyState(**kwargs)
     zero_message = MeanMessage(jnp.zeros(X.shape[0]))
     init_effect = QuadratureEffect(

@@ -2,9 +2,6 @@ import numpy as np
 
 from gibss.engine import MeanMessage
 from gibss.logistic_quadrature import (
-    _expected_loglik_quadrature,
-    _quadrature_feature_1d,
-    _quadrature_mode_1d,
     default_schedule,
     estimate_intercept_step,
     fit_quadrature_ser,
@@ -23,38 +20,6 @@ def _binary_data(seed: int = 0, n: int = 60, p: int = 5):
     prob = 1.0 / (1.0 + np.exp(-logits))
     y = rng.binomial(1, prob, size=n).astype(float)
     return prep_data(X, y)
-
-
-def test_expected_loglik_quadrature_is_finite():
-    y = np.array([0.0, 1.0, 1.0, 0.0])
-    mu = np.array([0.1, -0.5, 1.0, 0.3])
-    var = np.array([0.2, 0.1, 0.3, 0.4])
-    value = _expected_loglik_quadrature(y, mu, var, quadrature_order=9)
-    assert np.isfinite(value)
-
-
-def test_quadrature_mode_1d_returns_finite_mode_and_hessian():
-    data = _binary_data()
-    mode, hessian = _quadrature_mode_1d(
-        data.X[:, 0], data.y, np.zeros_like(data.y), prior_variance=1.5, beta_init=0.0
-    )
-    assert np.isfinite(mode)
-    assert np.isfinite(hessian)
-    assert hessian > 0.0
-
-
-def test_quadrature_feature_1d_returns_finite_outputs():
-    data = _binary_data()
-    outputs = _quadrature_feature_1d(
-        data.X[:, 0],
-        data.y,
-        np.zeros_like(data.y),
-        prior_variance=1.5,
-        beta_init=0.0,
-        quadrature_order=9,
-    )
-    for value in outputs:
-        assert np.isfinite(value)
 
 
 def test_fit_univariate_quadrature_regression_returns_finite_arrays():
@@ -115,7 +80,6 @@ def test_initialize_state_accepts_family_state_kwargs():
     assert state.family_state.estimate_prior_variance is False
     assert state.family_state.intercept == 0.6
     assert state.family_state.quadrature_order == 9
-    assert state.family_state.sparse_context is None
 
 
 def test_estimate_intercept_step_updates_only_intercept():
