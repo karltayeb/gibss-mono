@@ -28,6 +28,7 @@ __all__ = [
     "local_irls",
     "local_irls_centered",
     "quadrature_ser",
+    "profile_ser",
 ]
 
 
@@ -111,6 +112,19 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 30):
     return b, var, log_bf
 
 
+def _null_intercept(offset, y, n_iter: int = 80):
+    """Intercept-only logistic MLE (b=0): clipped 1-D Newton over all rows."""
+    def body(state):
+        c, it = state
+        mu = jax.nn.sigmoid(offset + c)
+        g = jnp.sum(y - mu)
+        h = jnp.maximum(jnp.sum(mu * (1.0 - mu)), 1e-8)
+        return c + jnp.clip(g / h, -4.0, 4.0), it + 1
+
+    c, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
+    return c
+
+
 def _intercept_background(offset, b0, y):
     """Row-background for the profiled intercept: sums over ALL rows at eta=offset+b0
     (no x*b term), per column b0_j. Naive O(n*p) -- the dense l_d (Chebyshev later)."""
@@ -148,16 +162,9 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 30):
         gb = op.local_moment(1, y_e - mu) - inv_pv * b  # support
         return H00, H0b, Hbb, g0, gb
 
-    # profiled null intercept (b=0): 1-D Newton on b0 over all rows. Also the b0
-    # warm-start for the 2-D Newton -> robust to large offset shifts.
-    def null_body(state):
-        c, it = state
-        mu = jax.nn.sigmoid(offset + c)
-        g = jnp.sum(y - mu)
-        h = jnp.maximum(jnp.sum(mu * (1.0 - mu)), 1e-8)
-        return c + jnp.clip(g / h, -4.0, 4.0), it + 1  # clip: no overshoot on saturation
-
-    c0, _ = jax.lax.while_loop(lambda s: s[1] < 80, null_body, (0.0, 0))
+    # profiled null intercept (b=0); also the b0 warm-start for the 2-D Newton
+    # -> robust to large offset shifts.
+    c0 = _null_intercept(offset, y)
     ll_null = jnp.sum(y * (offset + c0) - jax.nn.softplus(offset + c0))  # scalar
 
     def body(state):
@@ -223,6 +230,60 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     mu = jnp.sum(pw * b_nodes, axis=0)
     var = jnp.sum(pw * b_nodes**2, axis=0) - mu**2
     return mu, var, feature_log_bf
+
+
+@partial(jax.jit, static_argnames=("order", "n_iter"))
+def profile_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30):
+    """Per-column profiled-intercept SER: local_irls_centered mode + GH tail with
+    per-node intercept re-profiling (= profile). Node intercepts by the Cox-Reid
+    linear step b0_k = b0_hat - c*(b_k - b_hat), c = H0b/H00 (the re-centering
+    slope). Returns per-feature (mu, var, feature_log_bf) rel. the profiled null."""
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    b_hat, b0_hat, var_lap, _ = local_irls_centered(op, y, offset, prior_variance, n_iter)
+    sigma = jnp.sqrt(var_lap)
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+
+    # re-centering slope c = H0b/H00 at the mode
+    b0e = op.broadcast_cols(b0_hat)
+    eta = off_e + b0e + op.column_linpred(b_hat)
+    w = jax.nn.sigmoid(eta) * (1.0 - jax.nn.sigmoid(eta))
+    w0 = jax.nn.sigmoid(off_e + b0e) * (1.0 - jax.nn.sigmoid(off_e + b0e))
+    BGw, _, _ = _intercept_background(offset, b0_hat, y)
+    H00 = BGw + op.local_moment(0, w - w0)
+    H0b = op.local_moment(1, w)
+    c_slope = H0b / H00
+
+    # profiled null (b=0)
+    c0 = _null_intercept(offset, y)
+    ll_null = jnp.sum(y * (offset + c0) - jax.nn.softplus(offset + c0))
+
+    nodes_np, log_w_np = _gh_rule(order)
+    nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
+
+    def node_term(node, lw):
+        b = b_hat + jnp.sqrt(2.0) * sigma * node
+        b0 = b0_hat - c_slope * (b - b_hat)  # Cox-Reid node intercept
+        _, _, BGll = _intercept_background(offset, b0, y)  # row background loglik
+        b0e = op.broadcast_cols(b0)
+        eta = off_e + b0e + op.column_linpred(b)
+        eta0 = off_e + b0e
+        supp = op.local_moment(
+            0, (y_e * eta - jax.nn.softplus(eta)) - (y_e * eta0 - jax.nn.softplus(eta0))
+        )
+        ll_star = BGll + supp  # profiled loglik at (b0_k, b_k)
+        logint = lw + node**2 + (ll_star - ll_null) + _normal_logpdf(b, prior_variance) + jnp.log(
+            jnp.sqrt(2.0) * sigma
+        )
+        return logint, b
+
+    logint, b_nodes = jax.vmap(node_term)(nodes, log_w)
+    log_norm = jax.nn.logsumexp(logint, axis=0)
+    pw = jnp.exp(logint - log_norm)
+    mu = jnp.sum(pw * b_nodes, axis=0)
+    var = jnp.sum(pw * b_nodes**2, axis=0) - mu**2
+    return mu, var, log_norm
 
 
 def local_gaussian_ser(
