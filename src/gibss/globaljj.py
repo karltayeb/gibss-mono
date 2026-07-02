@@ -7,8 +7,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-from ._centering import weighted_centering
-from .operators import as_operator
+from .operators import as_operator, CenteredOperator
 from .ser_ops import global_gaussian_ser
 from ._jj import (
     lambda_xi as _lambda_xi,
@@ -102,29 +101,6 @@ def _fit_univariate_global_jj_regression(op, y, xi, offset, prior_variance, cbar
     return mu, var, null_ll + gaussian_kl_bf
 
 
-@jax.jit
-def _fit_univariate_centered_sparse(X, X_sq, y, xi, offset, prior_variance, cbar, W):
-    tau = 2.0 * _lambda_xi(xi)
-    S2 = tau @ X_sq
-    r = y - 0.5 - tau * offset
-    mu, var = weighted_centering(cbar, W, S2, r @ X, jnp.sum(r), prior_variance)
-    gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
-    null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
-    return mu, var, null_ll + gaussian_kl_bf
-
-
-@jax.jit
-def _fit_univariate_centered_dense(X, X_sq, y, xi, offset, prior_variance, cbar, W):
-    tau = 2.0 * _lambda_xi(xi)
-    S2 = jnp.sum(tau[:, None] * X_sq, axis=0)
-    r = y - 0.5 - tau * offset
-    T = jnp.sum(r[:, None] * X, axis=0)
-    mu, var = weighted_centering(cbar, W, S2, T, jnp.sum(r), prior_variance)
-    gaussian_kl_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
-    null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
-    return mu, var, null_ll + gaussian_kl_bf
-
-
 def initialize_state(
     data,
     L: int = 1,
@@ -213,16 +189,17 @@ def fit_global_jj_ser(
     X_sq = data.X_sq
     p = X.shape[1]
 
+    op = as_operator(X)
     if center:
-        fit = _fit_univariate_centered_sparse if is_bcoo(X) else _fit_univariate_centered_dense
-        mu, var, feature_log_evidence = fit(
-            X, X_sq, y, xi, offset, prior_variance, cbar, weight_sum
-        )
+        # weighted centering = a CenteredOperator at the tau-weighted mean `cbar`
+        # (already recomputed per xi in update_xi_step); pre-centering is off here.
+        op = CenteredOperator.from_offsets(op, cbar)
+        cc = None
     else:
-        mu, var, feature_log_evidence = _fit_univariate_global_jj_regression(
-            as_operator(X), y, xi, offset, prior_variance,
-            getattr(data, "column_center", None),
-        )
+        cc = getattr(data, "column_center", None)
+    mu, var, feature_log_evidence = _fit_univariate_global_jj_regression(
+        op, y, xi, offset, prior_variance, cc
+    )
 
     alpha, marginal_log_likelihood, kl = _fit_global_jj_ser_stats(
         mu, var, feature_log_evidence, prior_variance, p

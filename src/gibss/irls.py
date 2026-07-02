@@ -26,7 +26,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import linear
-from ._centering import weighted_centering, precenter_curvature
+from .operators import as_operator, CenteredOperator
+from .ser_ops import global_gaussian_ser
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -135,20 +136,12 @@ def _fit_centered_ser(data, tau, offset, prior_variance, cbar, W) -> IRLSCentere
     """Weighted linear SER with implicit weighted column centering."""
     X = data.X
     y = data.y
-    X_sq = data.X_sq
     tau = jnp.asarray(tau)
     offset = jnp.asarray(offset)
     r = tau * (y - offset)
-    if is_bcoo(X):
-        S2 = tau @ X_sq
-        T = r @ X
-    else:
-        S2 = jnp.sum(tau[:, None] * X_sq, axis=0)
-        T = jnp.sum(r[:, None] * X, axis=0)
-    R = jnp.sum(r)
-    # profiled intercept via weighted centering (Laplace / centered variance)
-    mu, var = weighted_centering(cbar, W, S2, T, R, prior_variance)
-    log_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
+    # weighted centering = a CenteredOperator at the tau-weighted mean `cbar`.
+    op = CenteredOperator.from_offsets(as_operator(X), cbar)
+    mu, var, log_bf = global_gaussian_ser(op, tau, r, prior_variance)
     null_ll = linear.linear_null_log_likelihood(data, tau, offset)
     feature_log_evidence = null_ll + log_bf
 
