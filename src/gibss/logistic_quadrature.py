@@ -11,6 +11,8 @@ from jax.experimental import sparse
 from jax.ops import segment_sum
 from numpy.polynomial.hermite import hermgauss
 
+from .operators import as_operator
+from .ser_ops import quadrature_ser
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -350,22 +352,16 @@ def fit_univariate_quadrature_regression(
         mode: posterior modes, shape (p,)
         hessian: local Hessians, shape (p,)
     """
-    X = data.X
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
-    mu_init = jnp.asarray(mu_init)
-    if _is_bcoo(X):
-        context = (
-            data.family_state.sparse_context
-            if hasattr(data, "family_state") and getattr(data, "family_state") is not None
-            else _build_sparse_quadrature_context(X)
-        )
-        return _fit_sparse_univariate_quadrature_regression(
-            context, y, offset, mu_init, prior_variance, quadrature_order
-        )
-    return _fit_dense_univariate_quadrature_regression(
-        X, y, offset, mu_init, prior_variance, quadrature_order
+    # operator-native per-column quadrature (dense/BCOO/low-rank in one path)
+    mu, var, feature_log_bf, coefficient_kl = quadrature_ser(
+        as_operator(data.X), y, offset, prior_variance, order=quadrature_order
     )
+    # quadrature_ser's evidence is relative to the shared-intercept null (b=0 at
+    # offset); the SER wants the absolute marginal, so add it back.
+    feature_log_evidence = feature_log_bf + _logistic_loglik(offset, y)
+    return mu, var, feature_log_evidence, coefficient_kl, mu, 1.0 / var  # mode/hessian: unused
 
 
 def fit_quadrature_ser(

@@ -384,15 +384,15 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
         logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
             jnp.sqrt(2.0) * sigma
         )
-        return logint, b
+        return logint, b, dll
 
-    logint, b_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p), (order, p)
-    log_norm = jax.nn.logsumexp(logint, axis=0)  # (p,)
-    feature_log_bf = log_norm  # marginal - shared null
+    logint, b_nodes, dll_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p) x3
+    log_norm = jax.nn.logsumexp(logint, axis=0)  # (p,)  marginal - shared null
     pw = jnp.exp(logint - log_norm)  # (order, p) posterior weights
     mu = jnp.sum(pw * b_nodes, axis=0)
     var = jnp.sum(pw * b_nodes**2, axis=0) - mu**2
-    return mu, var, feature_log_bf
+    coefficient_kl = jnp.sum(pw * dll_nodes, axis=0) - log_norm  # E_q[loglik] - log marginal
+    return mu, var, log_norm, coefficient_kl
 
 
 @partial(jax.jit, static_argnames=("order", "n_iter", "background", "node_intercept", "node_newton"))

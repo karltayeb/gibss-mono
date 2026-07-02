@@ -48,7 +48,7 @@ def test_quadrature_ser_matches_brute(kind):
     offset = rng.normal(size=n) * 0.3
     y = rng.binomial(1, 1 / (1 + np.exp(-(offset + 1.4 * Xd[:, 2]))), size=n).astype(float)
     pv = 1.5
-    mu, var, lbf = quadrature_ser(_ops(Xd)[kind], jnp.asarray(y), jnp.asarray(offset), pv, order=25)
+    mu, var, lbf, _ = quadrature_ser(_ops(Xd)[kind], jnp.asarray(y), jnp.asarray(offset), pv, order=25)
     ref = np.array([_brute_quad_col(Xd[:, j], y, offset, pv) for j in range(p)])
     np.testing.assert_allclose(np.asarray(mu), ref[:, 0], atol=1e-4)
     np.testing.assert_allclose(np.asarray(var), ref[:, 1], atol=1e-4)
@@ -76,5 +76,5 @@ def test_order1_recovers_laplace():
     y = rng.binomial(1, 1 / (1 + np.exp(-(offset + Xd[:, 1]))), size=n).astype(float)
     op = DenseOperator(jnp.asarray(Xd))
     _, _, lbf_lap = local_irls(op, jnp.asarray(y), jnp.asarray(offset), 1.0)
-    _, _, lbf_q1 = quadrature_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=1)
+    _, _, lbf_q1, _ = quadrature_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=1)
     np.testing.assert_allclose(np.asarray(lbf_q1), np.asarray(lbf_lap), atol=1e-9)
