@@ -168,12 +168,56 @@ def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50):
 
 def _intercept_background(offset, b0, y):
     """Row-background for the profiled intercept: sums over ALL rows at eta=offset+b0
-    (no x*b term), per column b0_j. Naive O(n*p) -- the dense l_d (Chebyshev later)."""
-    eta0 = offset[:, None] + b0[None, :]  # (n, p)
+    (no x*b term), per column b0_j. Naive O(n*p) -- the dense l_d. b0 any shape."""
+    # broadcast offset (n,) against b0 (arbitrary shape) -> (n, *b0.shape)
+    eta0 = offset.reshape((-1,) + (1,) * b0.ndim) + b0[None, ...]
     mu0 = jax.nn.sigmoid(eta0)
-    w0 = mu0 * (1.0 - mu0)
-    ll0 = y[:, None] * eta0 - jax.nn.softplus(eta0)
-    return jnp.sum(w0, 0), jnp.sum(y[:, None] - mu0, 0), jnp.sum(ll0, 0)  # BGw, BGg, BGll
+    yb = y.reshape((-1,) + (1,) * b0.ndim)
+    return (
+        jnp.sum(mu0 * (1.0 - mu0), 0),
+        jnp.sum(yb - mu0, 0),
+        jnp.sum(yb * eta0 - jax.nn.softplus(eta0), 0),
+    )  # BGw, BGg, BGll
+
+
+@lru_cache(maxsize=None)
+def _cheb_fit_matrix(degree: int):
+    """CGL nodes on [-1,1] and the inverse-Vandermonde (samples->Chebyshev coeffs)."""
+    k = np.arange(degree + 1)
+    x = np.cos(np.pi * k / degree)  # Chebyshev-Gauss-Lobatto nodes
+    V = np.cos(np.outer(np.arccos(x), np.arange(degree + 1)))  # V[k,j]=T_j(x_k)
+    return x, np.linalg.inv(V)  # exact interpolant on CGL nodes
+
+
+def _clenshaw(coeffs, t):
+    """sum_j coeffs[j] T_j(t) at t (any shape). coeffs (D+1,) static length."""
+    b1 = jnp.zeros_like(t)
+    b2 = jnp.zeros_like(t)
+    for k in range(coeffs.shape[0] - 1, 0, -1):
+        b0 = coeffs[k] + 2.0 * t * b1 - b2
+        b2, b1 = b1, b0
+    return coeffs[0] + t * b1 - b2
+
+
+@partial(jax.jit, static_argnames=("degree",))
+def _intercept_background_cheb(offset, b0, y, degree: int = 40):
+    """Chebyshev surrogate of the row-background: build one 1-D fit of L_f(c)=
+    sum_i f(offset_i+c) over the range of b0 (O(n*D)), eval at b0 (O(D*|b0|)).
+    Same BGw/BGg/BGll as _intercept_background, O(n*D + D*p) instead of O(n*p)."""
+    xnodes_np, P_np = _cheb_fit_matrix(degree)
+    xnodes = jnp.asarray(xnodes_np)
+    P = jnp.asarray(P_np)
+    c_lo = jnp.min(b0) - 0.5
+    c_hi = jnp.max(b0) + 0.5
+    c_nodes = 0.5 * (c_hi + c_lo) + 0.5 * (c_hi - c_lo) * xnodes  # (D+1,)
+    eta = offset[:, None] + c_nodes[None, :]  # (n, D+1)
+    mu = jax.nn.sigmoid(eta)
+    Sw = jnp.sum(mu * (1.0 - mu), 0)  # (D+1,)
+    Sg = jnp.sum(y[:, None] - mu, 0)
+    Sll = jnp.sum(y[:, None] * eta - jax.nn.softplus(eta), 0)
+    aw, ag, all_ = P @ Sw, P @ Sg, P @ Sll
+    t = (2.0 * b0 - (c_hi + c_lo)) / (c_hi - c_lo)  # map to [-1,1]
+    return _clenshaw(aw, t), _clenshaw(ag, t), _clenshaw(all_, t)
 
 
 @partial(jax.jit, static_argnames=("n_iter",))
@@ -273,12 +317,13 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     return mu, var, feature_log_bf
 
 
-@partial(jax.jit, static_argnames=("order", "n_iter"))
-def profile_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30):
+@partial(jax.jit, static_argnames=("order", "n_iter", "background"))
+def profile_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30, background: str = "exact"):
     """Per-column profiled-intercept SER: local_irls_centered mode + GH tail with
     per-node intercept re-profiling (= profile). Node intercepts by the Cox-Reid
     linear step b0_k = b0_hat - c*(b_k - b_hat), c = H0b/H00 (the re-centering
-    slope). Returns per-feature (mu, var, feature_log_bf) rel. the profiled null."""
+    slope). `background`: 'exact' (O(n*p*order)) or 'chebyshev' (O(n*D + D*p*order)
+    surrogate of the intercept row-background). Returns (mu, var, feature_log_bf)."""
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
     b_hat, b0_hat, var_lap, _ = local_irls_centered(op, y, offset, prior_variance, n_iter)
@@ -288,38 +333,41 @@ def profile_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30
 
     # re-centering slope c = H0b/H00 at the mode
     b0e = op.broadcast_cols(b0_hat)
-    eta = off_e + b0e + op.column_linpred(b_hat)
-    w = jax.nn.sigmoid(eta) * (1.0 - jax.nn.sigmoid(eta))
-    w0 = jax.nn.sigmoid(off_e + b0e) * (1.0 - jax.nn.sigmoid(off_e + b0e))
+    w = jax.nn.sigmoid(off_e + b0e + op.column_linpred(b_hat))
+    w = w * (1.0 - w)
+    w0 = jax.nn.sigmoid(off_e + b0e)
+    w0 = w0 * (1.0 - w0)
     BGw, _, _ = _intercept_background(offset, b0_hat, y)
     H00 = BGw + op.local_moment(0, w - w0)
-    H0b = op.local_moment(1, w)
-    c_slope = H0b / H00
+    c_slope = op.local_moment(1, w) / H00
 
-    # profiled null (b=0)
     c0 = _null_intercept(offset, y)
     ll_null = jnp.sum(y * (offset + c0) - jax.nn.softplus(offset + c0))
 
     nodes_np, log_w_np = _gh_rule(order)
     nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
+    b_nodes = b_hat[None, :] + jnp.sqrt(2.0) * sigma[None, :] * nodes[:, None]  # (order, p)
+    b0_nodes = b0_hat[None, :] - c_slope[None, :] * (b_nodes - b_hat[None, :])
 
-    def node_term(node, lw):
-        b = b_hat + jnp.sqrt(2.0) * sigma * node
-        b0 = b0_hat - c_slope * (b - b_hat)  # Cox-Reid node intercept
-        _, _, BGll = _intercept_background(offset, b0, y)  # row background loglik
+    # intercept row-background at every node intercept -- built once
+    if background == "chebyshev":
+        _, _, BGll = _intercept_background_cheb(offset, b0_nodes, y)
+    else:
+        _, _, BGll = _intercept_background(offset, b0_nodes, y)  # (order, p)
+
+    def node_supp(node, lw, b, b0, bgll):
         b0e = op.broadcast_cols(b0)
         eta = off_e + b0e + op.column_linpred(b)
         eta0 = off_e + b0e
         supp = op.local_moment(
             0, (y_e * eta - jax.nn.softplus(eta)) - (y_e * eta0 - jax.nn.softplus(eta0))
         )
-        ll_star = BGll + supp  # profiled loglik at (b0_k, b_k)
-        logint = lw + node**2 + (ll_star - ll_null) + _normal_logpdf(b, prior_variance) + jnp.log(
+        ll_star = bgll + supp
+        return lw + node**2 + (ll_star - ll_null) + _normal_logpdf(b, prior_variance) + jnp.log(
             jnp.sqrt(2.0) * sigma
         )
-        return logint, b
 
-    logint, b_nodes = jax.vmap(node_term)(nodes, log_w)
+    logint = jax.vmap(node_supp)(nodes, log_w, b_nodes, b0_nodes, BGll)  # (order, p)
     log_norm = jax.nn.logsumexp(logint, axis=0)
     pw = jnp.exp(logint - log_norm)
     mu = jnp.sum(pw * b_nodes, axis=0)

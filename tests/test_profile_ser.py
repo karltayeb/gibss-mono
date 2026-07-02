@@ -100,6 +100,21 @@ def test_profile_ser_dense_equals_bcoo():
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-7)
 
 
+@pytest.mark.parametrize("kind", ["dense", "bcoo"])
+def test_chebyshev_background_matches_exact(kind):
+    # the Chebyshev row-background surrogate matches the naive O(n*p) one
+    rng = np.random.default_rng(4)
+    n, p = 600, 40
+    Xd = rng.normal(size=(n, p)) * rng.binomial(1, 0.3, size=(n, p)) + 0.3
+    offset = rng.normal(size=n) * 0.3
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.4 + 1.2 * Xd[:, 5]))), size=n).astype(float)
+    op = _ops(Xd)[kind]
+    ex = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=15, background="exact")
+    ch = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=15, background="chebyshev")
+    for a, b in zip(ex, ch):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-8)
+
+
 def test_profile_ser_offset_shift_invariance():
     rng = np.random.default_rng(3)
     n, p = 400, 10
