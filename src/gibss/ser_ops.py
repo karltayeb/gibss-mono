@@ -75,7 +75,7 @@ def global_gaussian_ser(
 
 
 @partial(jax.jit, static_argnames=("n_iter",))
-def local_irls(op, y, offset, prior_variance, n_iter: int = 30):
+def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-8):
     """Per-column univariate logistic MAP (shared intercept in `offset`) + Laplace.
 
     The minimal per-column ("univariate") kernel: a vectorized Newton over all
@@ -93,14 +93,18 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 30):
     inv_pv = 1.0 / prior_variance
 
     def body(state):
-        b, it = state
+        b, _, it = state
         eta = off_e + op.column_linpred(b)
         mu = jax.nn.sigmoid(eta)
         grad = op.local_moment(1, y_e - mu) - inv_pv * b
         curv = op.local_moment(2, mu * (1.0 - mu)) + inv_pv
-        return b + grad / curv, it + 1
+        step = grad / curv
+        return b + step, jnp.max(jnp.abs(step)), it + 1
 
-    b, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (jnp.zeros(op.p), 0))
+    b, _, _ = jax.lax.while_loop(
+        lambda s: (s[2] < n_iter) & (s[1] > tol), body, (jnp.zeros(op.p), jnp.inf, 0)
+    )
+    b = jnp.where(jnp.isfinite(b), b, 0.0)  # non-finite feature -> null effect
 
     eta = off_e + op.column_linpred(b)
     mu = jax.nn.sigmoid(eta)
@@ -129,7 +133,7 @@ def _null_intercept(offset, y, n_iter: int = 80):
 
 
 @partial(jax.jit, static_argnames=("n_iter", "variational"))
-def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50, variational: bool = True):
+def localjj_ser(op, y, offset, prior_variance, n_iter: int = 100, variational: bool = True, tol: float = 1e-8):
     """Per-column JJ SER (shared intercept in `offset`). JJ-MM fixed-point:
       variational=True : xi^2 = E[eta^2] = eta_mean^2 + x^2 v  (variational posterior)
       variational=False: xi^2 = eta_mean^2                     (MAP: xi = |eta(m)|)
@@ -144,17 +148,21 @@ def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50, variational: bo
     vfac = 1.0 if variational else 0.0  # drop x^2 v in xi -> MAP
 
     def body(state):
-        m, v, it = state
+        m, v, _, it = state
         eta_mean = off_e + x * op.broadcast_cols(m)  # E[eta] per entry
         xi = jnp.sqrt(jnp.maximum(eta_mean**2 + vfac * x**2 * op.broadcast_cols(v), 1e-12))
         tau = 2.0 * lambda_xi(xi)
         v_new = 1.0 / (inv_pv + op.local_moment(2, tau))
         m_new = v_new * op.local_moment(1, y_e - 0.5 - tau * off_e)
-        return m_new, v_new, it + 1
+        return m_new, v_new, jnp.max(jnp.abs(m_new - m)), it + 1
 
-    m, v, _ = jax.lax.while_loop(
-        lambda s: s[2] < n_iter, body, (jnp.zeros(op.p), jnp.full(op.p, prior_variance), 0)
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
     )
+    m = jnp.where(jnp.isfinite(m), m, 0.0)
+    v = jnp.where(jnp.isfinite(v), v, prior_variance)
 
     # feature log-BF = ELBO - null (b=0, xi=|offset|). Support-only.
     eta_mean = off_e + x * op.broadcast_cols(m)
@@ -184,7 +192,7 @@ def _jj_background(offset, b0, y):
 
 
 @partial(jax.jit, static_argnames=("n_iter", "variational"))
-def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 80, variational: bool = True):
+def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 150, variational: bool = True, tol: float = 1e-8):
     """Per-column JJ SER with a PROFILED per-column intercept (= localjj center=True).
     JJ xi-fixed-point (localjj_ser) + per-column re-centering (Schur with the JJ tau)
     + the JJ intercept row-background (naive O(n*p); the l_d analog). Parameterization
@@ -200,7 +208,7 @@ def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 80, variat
     vfac = 1.0 if variational else 0.0
 
     def body(state):
-        m, v, b0, it = state
+        m, v, b0, _, it = state
         me, ve, b0e = op.broadcast_cols(m), op.broadcast_cols(v), op.broadcast_cols(b0)
         eta_mean = off_e + b0e + x * me
         xi = jnp.sqrt(jnp.maximum(eta_mean**2 + vfac * x**2 * ve, 1e-12))
@@ -219,13 +227,18 @@ def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 80, variat
         m_new = (Sxr - c * R) / (inv_pv + x2c)
         v_new = 1.0 / (inv_pv + S2)
         b0_new = R / W - m_new * c
-        return m_new, v_new, b0_new, it + 1
+        resid = jnp.maximum(jnp.max(jnp.abs(m_new - m)), jnp.max(jnp.abs(b0_new - b0)))
+        return m_new, v_new, b0_new, resid, it + 1
 
-    m, v, b0, _ = jax.lax.while_loop(
-        lambda s: s[3] < n_iter,
+    m, v, b0, _, _ = jax.lax.while_loop(
+        lambda s: (s[4] < n_iter) & (s[3] > tol),
         body,
-        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.zeros(op.p), 0),
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.zeros(op.p), jnp.inf, 0),
     )
+    ok = jnp.isfinite(m) & jnp.isfinite(b0)  # non-finite feature -> null (m=0, b0=null)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+    b0 = jnp.where(ok, b0, _null_intercept(offset, y))
 
     me, ve, b0e = op.broadcast_cols(m), op.broadcast_cols(v), op.broadcast_cols(b0)
     eta_mean = off_e + b0e + x * me
@@ -299,7 +312,7 @@ def _intercept_background_cheb(offset, b0, y, degree: int = 40):
 
 
 @partial(jax.jit, static_argnames=("n_iter",))
-def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 30):
+def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-8):
     """Per-column MAP with a PROFILED per-column intercept (b0_j, b_j) -- profile at
     order 1. = local_irls + per-column re-centering (Schur) + the intercept
     row-background. Returns per-feature (b, b0, var, laplace_log_bf)."""
@@ -331,16 +344,22 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 30):
     ll_null = jnp.sum(y * (offset + c0) - jax.nn.softplus(offset + c0))  # scalar
 
     def body(state):
-        b, b0, it = state
+        b, b0, _, it = state
         H00, H0b, Hbb, g0, gb = newton(b, b0)
         det = H00 * Hbb - H0b**2
         db0 = jnp.clip((Hbb * g0 - H0b * gb) / det, -4.0, 4.0)
         db = jnp.clip((H00 * gb - H0b * g0) / det, -4.0, 4.0)
-        return b + db, b0 + db0, it + 1
+        resid = jnp.maximum(jnp.max(jnp.abs(db)), jnp.max(jnp.abs(db0)))
+        return b + db, b0 + db0, resid, it + 1
 
-    b, b0, _ = jax.lax.while_loop(
-        lambda s: s[2] < n_iter, body, (jnp.zeros(op.p), jnp.full(op.p, c0), 0)
+    b, b0, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, c0), jnp.inf, 0),
     )
+    ok = jnp.isfinite(b) & jnp.isfinite(b0)  # non-finite feature -> null (b=0, b0=null)
+    b = jnp.where(ok, b, 0.0)
+    b0 = jnp.where(ok, b0, c0)
 
     H00, H0b, Hbb, _, _ = newton(b, b0)
     schur = Hbb - H0b**2 / H00  # profiled curvature (incl. prior)
