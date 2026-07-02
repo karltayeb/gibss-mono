@@ -58,6 +58,25 @@ class DesignOperator:
     def gram_matvec(self, v: Any) -> Any:  # X^T X v (matrix-free default)
         return self.rmatvec(self.matvec(v))
 
+    # --- per-column ("local") interface: entry-bearing operators only ---------
+    # `moment` above weights by a per-ROW w (shared across columns). The
+    # per-column SER methods (local_irls / quadrature / profile / localjj) fit
+    # each feature alone, so their weights are per-ENTRY. These three expose that
+    # (entry-space linear predictor + a per-entry-weighted reduction); structured
+    # / implicit operators (low-rank, FFT, kernel) don't implement them.
+
+    def local_moment(self, k: int, W: Any) -> Any:
+        """sum_i x_ij^k W_ij with a per-ENTRY weight W (n,p dense / nnz sparse)."""
+        raise NotImplementedError
+
+    def broadcast_rows(self, v: Any) -> Any:
+        """Lift a per-row (n,) vector into entry space."""
+        raise NotImplementedError
+
+    def column_linpred(self, b: Any) -> Any:
+        """Per-entry x_ij * b_j (the single-effect contribution, NOT summed over j)."""
+        raise NotImplementedError
+
     @property
     def n(self) -> int:
         return self.shape[0]
@@ -97,6 +116,15 @@ class DenseOperator(DesignOperator):
             return self.gram @ v
         return self.rmatvec(self.matvec(v))
 
+    def local_moment(self, k, W):
+        return jnp.sum((self.X**k) * W, axis=0)
+
+    def broadcast_rows(self, v):
+        return v[:, None]
+
+    def column_linpred(self, b):
+        return self.X * b[None, :]
+
     def with_gram(self) -> "DenseOperator":
         return DenseOperator(self.X, self.X.T @ self.X)
 
@@ -135,6 +163,18 @@ class BCOOOperator(DesignOperator):
 
     def rmatvec(self, u):
         return self.moment(1, u)
+
+    def local_moment(self, k, W):
+        cols = self.X.indices[:, 1]
+        return jax.ops.segment_sum(
+            W * self.X.data**k, cols, num_segments=self.X.shape[1]
+        )
+
+    def broadcast_rows(self, v):
+        return v[self.X.indices[:, 0]]
+
+    def column_linpred(self, b):
+        return self.X.data * b[self.X.indices[:, 1]]
 
     def tree_flatten(self):
         return (self.X,), None

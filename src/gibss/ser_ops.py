@@ -13,13 +13,15 @@ higher global moments with a per-feature Vandermonde in the effect `m` (see
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 
 from .operators import DesignOperator, vandermonde
 
-__all__ = ["global_gaussian_ser", "local_gaussian_ser"]
+__all__ = ["global_gaussian_ser", "local_gaussian_ser", "local_irls"]
 
 
 def global_gaussian_ser(
@@ -48,6 +50,47 @@ def global_gaussian_ser(
     mu = var * num
     log_bf = 0.5 * (jnp.log(var / prior_variance) + mu**2 / var)
     return mu, var, log_bf
+
+
+@partial(jax.jit, static_argnames=("n_iter",))
+def local_irls(op, y, offset, prior_variance, n_iter: int = 30):
+    """Per-column univariate logistic MAP (shared intercept in `offset`) + Laplace.
+
+    The minimal per-column ("univariate") kernel: a vectorized Newton over all
+    columns using `local_moment` (per-entry weights). Each feature is fit ALONE
+    (offset + x_j b_j), so on BCOO the grad/curvature (both carry an x factor)
+    are pure support reductions -- no dense background. quadrature = this + a GH
+    tail; profile = the (b0,b) version; localjj = a JJ-MM mode-find instead.
+
+    Returns per-feature (mode, var, laplace_log_bf).
+    """
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+    inv_pv = 1.0 / prior_variance
+
+    def body(state):
+        b, it = state
+        eta = off_e + op.column_linpred(b)
+        mu = jax.nn.sigmoid(eta)
+        grad = op.local_moment(1, y_e - mu) - inv_pv * b
+        curv = op.local_moment(2, mu * (1.0 - mu)) + inv_pv
+        return b + grad / curv, it + 1
+
+    b, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (jnp.zeros(op.p), 0))
+
+    eta = off_e + op.column_linpred(b)
+    mu = jax.nn.sigmoid(eta)
+    precision = op.local_moment(2, mu * (1.0 - mu)) + inv_pv
+    var = 1.0 / precision
+    # data loglik difference vs b=0 (support-only; off-support terms cancel)
+    dll = op.local_moment(
+        0,
+        (y_e * eta - jax.nn.softplus(eta)) - (y_e * off_e - jax.nn.softplus(off_e)),
+    )
+    log_bf = dll - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * precision)
+    return b, var, log_bf
 
 
 def local_gaussian_ser(
