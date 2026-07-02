@@ -82,6 +82,11 @@ class DesignOperator:
         raise NotImplementedError
 
     @property
+    def entry_x(self) -> Any:
+        """The x values in entry space (dense (n,p) / sparse (nnz,)). Entry-bearing."""
+        raise NotImplementedError
+
+    @property
     def n(self) -> int:
         return self.shape[0]
 
@@ -131,6 +136,10 @@ class DenseOperator(DesignOperator):
 
     def column_linpred(self, b):
         return self.X * b[None, :]
+
+    @property
+    def entry_x(self):
+        return self.X
 
     def with_gram(self) -> "DenseOperator":
         return DenseOperator(self.X, self.X.T @ self.X)
@@ -185,6 +194,10 @@ class BCOOOperator(DesignOperator):
 
     def column_linpred(self, b):
         return self.X.data * b[self.X.indices[:, 1]]
+
+    @property
+    def entry_x(self):
+        return self.X.data
 
     def tree_flatten(self):
         return (self.X,), None

@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ._jj import lambda_xi
 from .operators import DesignOperator, vandermonde
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "local_irls_centered",
     "quadrature_ser",
     "profile_ser",
+    "localjj_ser",
 ]
 
 
@@ -123,6 +125,45 @@ def _null_intercept(offset, y, n_iter: int = 80):
 
     c, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
     return c
+
+
+@partial(jax.jit, static_argnames=("n_iter",))
+def localjj_ser(op, y, offset, prior_variance, n_iter: int = 50):
+    """Per-column JJ variational SER (shared intercept in `offset`). The JJ-MM
+    fixed-point with xi^2 = E[eta^2] (variational). Monotone -- always converges,
+    no Newton overshoot. Returns per-feature (m, v, feature_log_bf) rel. the
+    shared JJ null (b=0, xi=|offset|). Support-only reductions -> O(nnz)."""
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    x = op.entry_x
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+    inv_pv = 1.0 / prior_variance
+
+    def body(state):
+        m, v, it = state
+        eta_mean = off_e + x * op.broadcast_cols(m)  # E[eta] per entry
+        xi = jnp.sqrt(jnp.maximum(eta_mean**2 + x**2 * op.broadcast_cols(v), 1e-12))
+        tau = 2.0 * lambda_xi(xi)
+        v_new = 1.0 / (inv_pv + op.local_moment(2, tau))
+        m_new = v_new * op.local_moment(1, y_e - 0.5 - tau * off_e)
+        return m_new, v_new, it + 1
+
+    m, v, _ = jax.lax.while_loop(
+        lambda s: s[2] < n_iter, body, (jnp.zeros(op.p), jnp.full(op.p, prior_variance), 0)
+    )
+
+    # feature log-BF = ELBO - null (b=0, xi=|offset|). Support-only.
+    eta_mean = off_e + x * op.broadcast_cols(m)
+    xi = jnp.sqrt(jnp.maximum(eta_mean**2 + x**2 * op.broadcast_cols(v), 1e-12))
+    xi0 = jnp.abs(off_e)
+    xi_terms = op.local_moment(
+        0, (-jax.nn.softplus(xi) + 0.5 * xi) - (-jax.nn.softplus(xi0) + 0.5 * xi0)
+    )
+    lin = m * op.local_moment(1, y_e - 0.5)
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    log_bf = lin + xi_terms - kl
+    return m, v, log_bf
 
 
 def _intercept_background(offset, b0, y):
