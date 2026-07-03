@@ -54,15 +54,35 @@ Poisson:    loglik = y*eta - exp(eta), grad = y - exp(eta), weight = exp(eta).
   does not fit `terms(eta, aux)` cleanly -> out of scope, note it.
 
 ## Milestones
-1. `response.py`: ResponseModel + Bernoulli/TwoGroupMarginal/Poisson; validate grad/
-   weight vs finite-diff, loglik vs brute marginal.
-2. Generic per-column kernel (`glm_ser`) consuming a response; Bernoulli reproduces
-   `local_irls`/`quadrature_ser` exactly.
-3. Two-group SER = kernel + TwoGroupMarginal; validate vs current twogroup fixture.
-4. Wire the twogroup module onto it; retire the EM kernels.
-5. Poisson SER as a generality check.
-6. Simplify + fold logistic_localtaylor onto the generic kernel if clean.
+1. [done] `response.py`: ResponseModel + Bernoulli/TwoGroupMarginal/Poisson; grad ==
+   d loglik/deta (finite diff), loglik vs brute marginal. (`test_response.py`)
+2. [done] Generic per-column kernel `response_ser.glm_ser` consuming a response;
+   Bernoulli reproduces `quadrature_ser` exactly (atol 1e-12).
+3. [done] Two-group SER = kernel + TwoGroupMarginal; matches brute per-feature logBF.
+4. [done] `twogroup_marginal.py` wires it into the full engine loop. Recovers the
+   enrichment feature at PIP ~1.0, sharper than the EM path (`test_twogroup_marginal`).
+5. [done] `glm.py`: generic GLM-SER engine family parameterized by a ResponseModel.
+   Logistic = GLM(Bernoulli), Poisson = GLM(Poisson), one code path (`test_glm.py`).
+   The glm_ser -> BaseSERState adapter is shared (`response_ser.build_ser_state`).
+6. [open] Offset/variance integration in glm_ser (GH-over-o), then fold
+   `logistic_localtaylor` onto it. Retire the EM `twogrouplocaljj`/localjj path once
+   the marginal is the default. Not done -- localtaylor still carries the per-row-var
+   message that glm_ser doesn't yet.
+
+## The intercept degeneracy (two-group marginal) -- the one real subtlety
+The marginal loglik `softplus(eta+llr) - softplus(eta) -> llr` as `eta -> +inf`, so at
+`b = 0` the intercept-only objective is *maximized at b0 -> +inf* whenever `sum llr > 0`
+(the "everything enriched" solution; f1 absorbs all obs). The interior value is only a
+local max. So a direct marginal Newton on b0 alone runs off.
+Resolution is pure ordering, not a penalty: update b0 *after* the SER effects each
+sweep (`default_schedule` puts it in `after_sweep`), so `b` has already structured
+`eta` and pins b0 to its interior fixed point. The step is `update_intercept_step`
+(not `estimate_intercept_step`) so the `twogroup` wrapper -- which drives an inner
+`estimate_intercept_step` *before* the effects -- leaves it alone. The EM path never
+hit this because its intercept is a logistic MLE on a soft label Ez in (0,1), which is
+finite by construction; the price EM pays is a diffuse Ez and much softer PIPs.
 
 ## Definition of done
-Simple, human-readable: one per-column kernel, a tiny ResponseModel per family, the
-two-group SER with no EM, matching the current twogroup on alpha/PIP, suite green.
+Simple, human-readable: one per-column kernel (`glm_ser`), a tiny ResponseModel per
+family, the two-group SER with no EM matching/beating the EM twogroup on PIP, generic
+GLM family for logistic/Poisson, suite green. [reached for milestones 1-5]
