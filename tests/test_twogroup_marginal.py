@@ -6,11 +6,8 @@ guard the full engine loop: enrichment recovery, the intercept-degeneracy fix, a
 that the exact marginal is at least as sharp as the EM path.
 """
 
-import jax
 import numpy as np
 import pytest
-
-jax.config.update("jax_enable_x64", True)
 
 from gibss import localjj, twogroup
 from gibss import twogroup_marginal as TM

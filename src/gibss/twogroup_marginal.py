@@ -39,7 +39,7 @@ from .engine import (
     subtract_message_index_step,
     to_numpy_state_step,
 )
-from .linear import LinearData, prep_data, update_prior_variance_index_step
+from .linear import prep_data, update_prior_variance_index_step
 from .operators import as_operator
 from .response import TwoGroupMarginal
 from .response_ser import build_ser_state, glm_ser

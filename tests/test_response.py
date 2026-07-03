@@ -1,12 +1,9 @@
 """ResponseModel derivatives + the response-generic SER kernel."""
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import sparse
-
-jax.config.update("jax_enable_x64", True)
 
 from gibss.operators import BCOOOperator, DenseOperator
 from gibss.response import Bernoulli, Gaussian, Poisson, TwoGroupMarginal

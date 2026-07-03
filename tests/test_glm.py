@@ -6,11 +6,8 @@ path. The kernel-level equivalences (glm_ser == quadrature_ser for Bernoulli, Po
 vs brute) live in test_response; here we guard the engine wiring and recovery.
 """
 
-import jax
 import numpy as np
 import pytest
-
-jax.config.update("jax_enable_x64", True)
 
 from gibss import glm
 from gibss import logistic_localtaylor as LT
