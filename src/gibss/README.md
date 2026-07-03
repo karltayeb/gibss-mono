@@ -101,7 +101,7 @@ state = fit_ibss(
 
 Other logistic families use same engine pattern:
 - [`globaljj.py`](./globaljj.py) uses a global JJ bound.
-- [`logistic_quadrature.py`](./logistic_quadrature.py) uses quadrature-based updates.
+- [`logistic_localtaylor.py`](./logistic_localtaylor.py) uses quadrature-based updates.
 
 ### Cox
 
@@ -224,7 +224,7 @@ cox.initialize_state(
 
 Some fields are initializer-owned and should not be treated as user-controlled:
 - `globaljj.initialize_state(...)` derives `xi` and `X_sq`
-- `logistic_quadrature.initialize_state(...)` derives `quadrature_order` and `sparse_context`
+- `logistic_localtaylor.initialize_state(...)` derives `quadrature_order` and `sparse_context`
 
 For `twogroup`, configure the inner family state before wrapping, because `twogroup.initialize_state(...)` does not construct the inner family state itself.
 
@@ -337,7 +337,7 @@ The default schedules in each family module show those extra pieces.
 - Use `linear` for Gaussian outcomes.
 - Use `cox` for survival outcomes.
 - Use `localjj` as simplest logistic starting point.
-- Use `globaljj` or `logistic_quadrature` when you specifically want those approximations.
+- Use `globaljj` or `logistic_localtaylor` when you specifically want those approximations.
 - Use `twogroup` when you want a two-group wrapper around an existing base model.
 
 ## Common pitfalls

@@ -6,7 +6,7 @@ from jax.experimental import sparse
 jax.config.update("jax_enable_x64", True)
 
 import gibss.irls as irls
-import gibss.logistic_quadrature as quad
+import gibss.logistic_localtaylor as quad
 from gibss.engine import fit_ibss
 from gibss_reference.univariate_logistic import fit_univariate_logistic_regression
 

@@ -32,6 +32,7 @@ __all__ = [
     "profile_ser",
     "localjj_ser",
     "localjj_centered_ser",
+    "profiled_logistic_null",
 ]
 
 
@@ -91,6 +92,32 @@ def _smooth_cumulant(eta, ov, offset_integration="taylor"):
 def _smooth_A_only(eta, ov, offset_integration="taylor"):
     """Just the convolved cumulant `A~` (for loglik/background terms)."""
     return _smooth_cumulant(eta, ov, offset_integration)[0]
+
+
+@partial(jax.jit, static_argnames=("n_iter", "offset_integration"))
+def profiled_logistic_null(y, offset, n_iter: int = 50, offset_var=None,
+                           offset_integration="taylor"):
+    """max_{b0} loglik(offset + b0, y): the intercept-PROFILED logistic null.
+
+    The BF denominator scores the null (b=0) at its own optimal intercept, not the
+    shared full-model intercept folded into `offset` (that inflates the BF). Newton
+    on b0. With `offset_var` the cumulant is offset-integrated (same treatment as the
+    alternative, so the BF stays a like-for-like comparison)."""
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    if offset_var is None:
+        offset_integration = "none"
+    ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
+
+    def body(state):
+        b0, it = state
+        _, s, w = _smooth_cumulant(offset + b0, ov, offset_integration)
+        grad = jnp.sum(y - s)
+        hess = jnp.maximum(jnp.sum(w), 1e-8)
+        return b0 + jnp.clip(grad / hess, -4.0, 4.0), it + 1
+
+    b0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
+    return jnp.sum(y * (offset + b0) - _smooth_A_only(offset + b0, ov, offset_integration))
 
 
 def global_gaussian_ser(

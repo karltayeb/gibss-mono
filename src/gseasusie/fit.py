@@ -15,7 +15,7 @@ import gibss.engine
 import gibss.distributions
 import gibss.linear
 import gibss.localjj
-import gibss.logistic_quadrature
+import gibss.logistic_localtaylor
 import gibss.cox
 import gibss.twogroup
 import gibss.twogrouplocaljj
@@ -513,8 +513,8 @@ def fit_gsea_susie_logistic(
         )
         schedule = gibss.localjj.default_schedule()
     elif variant == "quadrature":
-        data = gibss.logistic_quadrature.prep_data(X_sparse, y_jax)
-        init_state = gibss.logistic_quadrature.initialize_state(
+        data = gibss.logistic_localtaylor.prep_data(X_sparse, y_jax)
+        init_state = gibss.logistic_localtaylor.initialize_state(
             data,
             L=l_model,
             family_state_kwargs={
@@ -522,7 +522,7 @@ def fit_gsea_susie_logistic(
                 **family_kwargs,
             },
         )
-        schedule = gibss.logistic_quadrature.default_schedule()
+        schedule = gibss.logistic_localtaylor.default_schedule()
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
@@ -797,8 +797,8 @@ def fit_gsea_susie_twogroup(
             )
             base_schedule = gibss.localjj.default_schedule()
         elif variant == "quadrature":
-            base_data = gibss.logistic_quadrature.prep_data(X_model, y_jax[:, 0])
-            base_state = gibss.logistic_quadrature.initialize_state(
+            base_data = gibss.logistic_localtaylor.prep_data(X_model, y_jax[:, 0])
+            base_state = gibss.logistic_localtaylor.initialize_state(
                 base_data,
                 L=l_model,
                 family_state_kwargs={
@@ -806,7 +806,7 @@ def fit_gsea_susie_twogroup(
                     **family_kwargs,
                 },
             )
-            base_schedule = gibss.logistic_quadrature.default_schedule()
+            base_schedule = gibss.logistic_localtaylor.default_schedule()
     elif base_method == "cox":
         base_data = gibss.cox.prep_data(X_model, y_jax)
         base_state = gibss.cox.initialize_state(

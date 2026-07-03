@@ -54,7 +54,7 @@ def test_centered_univariate_matches_joint_jj_optimum():
 def test_centered_bf_not_inflated():
     # the centered effect profiles a per-feature intercept, so the null must too;
     # the SER logBF must stay near exact (was wildly inflated before the fix).
-    import gibss.logistic_quadrature as q
+    import gibss.logistic_localtaylor as q
     from gibss.engine import fit_ibss as _fit
     rng = np.random.default_rng(0)
     n, p = 1000, 50

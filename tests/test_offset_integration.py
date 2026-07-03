@@ -188,7 +188,7 @@ def test_finite_under_saturation_with_offset_var(offset_integration):
 # engine wiring
 # --------------------------------------------------------------------------- #
 def test_engine_integrate_offset_runs_and_differs():
-    import gibss.logistic_quadrature as Q
+    import gibss.logistic_localtaylor as Q
     from gibss.engine import fit_ibss
 
     rng = np.random.default_rng(1)

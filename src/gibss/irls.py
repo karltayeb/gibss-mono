@@ -27,8 +27,7 @@ import numpy as np
 
 from . import linear
 from .operators import as_operator, CenteredOperator
-from .ser_ops import global_gaussian_ser, _smooth_cumulant
-from .logistic_quadrature import _profiled_logistic_null
+from .ser_ops import global_gaussian_ser, _smooth_cumulant, profiled_logistic_null
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -295,7 +294,7 @@ def _relogistic_null(effect, data, fs, message_mean, offset_var=0.0, offset_inte
     log_bf = np.asarray(effect.feature_log_evidence) - float(effect.null_log_likelihood)
     glm_eta = jnp.asarray(fs.glm_offset) + jnp.asarray(message_mean)  # b=0 GLM predictor
     ov = None if offset_integration == "none" else offset_var
-    null_ll = float(_profiled_logistic_null(
+    null_ll = float(profiled_logistic_null(
         jnp.asarray(data.y), glm_eta, offset_var=ov, offset_integration=offset_integration))
     fle = null_ll + log_bf
     return replace(
