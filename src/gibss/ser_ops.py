@@ -614,17 +614,20 @@ def profile_ser(
         A = _smooth_A_only(eta, ov_e, offset_integration)
         A0 = _smooth_A_only(eta0, ov_e, offset_integration)
         supp = op.local_moment(0, (y_e * eta - A) - (y_e * eta0 - A0))
-        ll_star = bgll + supp
-        return lw + node**2 + (ll_star - ll_null) + _normal_logpdf(b, prior_variance) + jnp.log(
+        dll = bgll + supp - ll_null  # node loglik rel the profiled null
+        logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
             jnp.sqrt(2.0) * sigma
         )
+        return logint, dll
 
-    logint = jax.vmap(node_supp)(nodes, log_w, b_nodes, b0_nodes, BGll)  # (order, p)
+    logint, dll_nodes = jax.vmap(node_supp)(nodes, log_w, b_nodes, b0_nodes, BGll)  # (order, p)
     log_norm = jax.nn.logsumexp(logint, axis=0)
     pw = jnp.exp(logint - log_norm)
     mu = jnp.sum(pw * b_nodes, axis=0)
     var = jnp.sum(pw * b_nodes**2, axis=0) - mu**2
-    return mu, var, log_norm
+    coefficient_kl = jnp.sum(pw * dll_nodes, axis=0) - log_norm  # E_q[loglik] - log marginal
+    # log_norm is rel the profiled null; b0_hat/h (Schur) carry the mode + curvature
+    return mu, var, log_norm, coefficient_kl, b0_hat, 1.0 / var_lap
 
 
 def local_gaussian_ser(

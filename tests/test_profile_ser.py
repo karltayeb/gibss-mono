@@ -69,7 +69,7 @@ def test_profile_ser_matches_brute_cox_reid(kind):
     offset = rng.normal(size=n) * 0.3
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.4 + 1.2 * Xd[:, 2]))), size=n).astype(float)
     pv = 1.5
-    mu, var, lbf = profile_ser(_ops(Xd)[kind], jnp.asarray(y), jnp.asarray(offset), pv, order=15)
+    mu, var, lbf, *_ = profile_ser(_ops(Xd)[kind], jnp.asarray(y), jnp.asarray(offset), pv, order=15)
     ref = np.array([_brute_profile_col(Xd[:, j], y, offset, pv, 15) for j in range(p)])
     np.testing.assert_allclose(np.asarray(mu), ref[:, 0], atol=1e-5)
     np.testing.assert_allclose(np.asarray(var), ref[:, 1], atol=1e-5)
@@ -84,7 +84,7 @@ def test_order1_recovers_centered_laplace():
     y = rng.binomial(1, 1 / (1 + np.exp(-(offset + Xd[:, 1]))), size=n).astype(float)
     op = DenseOperator(jnp.asarray(Xd))
     _, _, _, lbf_lap = local_irls_centered(op, jnp.asarray(y), jnp.asarray(offset), 1.0)
-    _, _, lbf_q1 = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=1)
+    _, _, lbf_q1, *_ = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=1)
     np.testing.assert_allclose(np.asarray(lbf_q1), np.asarray(lbf_lap), atol=1e-9)
 
 
@@ -163,7 +163,7 @@ def test_newton_node_intercept_matches_exact_profile(kind):
     offset = rng.normal(size=n) * 0.3
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.4 + 1.5 * Xd[:, 2]))), size=n).astype(float)
     pv = 1.5
-    mu, var, lbf = profile_ser(
+    mu, var, lbf, *_ = profile_ser(
         _ops(Xd)[kind], jnp.asarray(y), jnp.asarray(offset), pv, order=15, node_intercept="newton"
     )
     ref = np.array([_brute_profile_exact_col(Xd[:, j], y, offset, pv, 15) for j in range(p)])
@@ -192,6 +192,6 @@ def test_profile_ser_offset_shift_invariance():
     offset = rng.normal(size=n) * 0.3
     y = rng.binomial(1, 1 / (1 + np.exp(-(offset + Xd[:, 1]))), size=n).astype(float)
     op = DenseOperator(jnp.asarray(Xd))
-    _, _, lbf_a = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=11)
-    _, _, lbf_b = profile_ser(op, jnp.asarray(y), jnp.asarray(offset) + 2.6, 1.0, order=11)
+    _, _, lbf_a, *_ = profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=11)
+    _, _, lbf_b, *_ = profile_ser(op, jnp.asarray(y), jnp.asarray(offset) + 2.6, 1.0, order=11)
     np.testing.assert_allclose(np.asarray(lbf_a), np.asarray(lbf_b), atol=1e-5)
