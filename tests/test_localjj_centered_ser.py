@@ -109,3 +109,25 @@ def test_localjj_offset_var_backward_compat_and_effect():
             np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-10)
         assert np.all(np.isfinite(np.asarray(real[-1])))
         assert np.max(np.abs(np.asarray(real[-1]) - np.asarray(none[-1]))) > 1e-3
+
+
+def test_localjj_centered_chebyshev_matches_exact():
+    # the Chebyshev JJ row-background (O(nD+Dp)) matches the exact O(np) background,
+    # dense and sparse. This is what makes sparse centered localjj efficient.
+    from jax.experimental import sparse
+    rng = np.random.default_rng(11)
+    n, p = 400, 30
+    Xd = rng.normal(size=(n, p)) * rng.binomial(1, 0.4, size=(n, p))
+    offset = rng.normal(size=n) * 0.5
+    ov = jnp.asarray(rng.uniform(0.1, 1.0, n))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(offset + 1.3 * Xd[:, 5]))), n).astype(float)
+    opd = DenseOperator(jnp.asarray(Xd))
+    ops = BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(Xd)))
+    yj, oj = jnp.asarray(y), jnp.asarray(offset)
+    ex = localjj_centered_ser(opd, yj, oj, 1.0, offset_var=ov, background="exact")
+    ch = localjj_centered_ser(opd, yj, oj, 1.0, offset_var=ov, background="chebyshev")
+    chs = localjj_centered_ser(ops, yj, oj, 1.0, offset_var=ov, background="chebyshev")
+    for a, b in zip(ex, ch):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-9)
+    for a, b in zip(ch, chs):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-9)

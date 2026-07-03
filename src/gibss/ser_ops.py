@@ -255,14 +255,40 @@ def _jj_background(offset, b0, y, offset_var=None):
     return BG_W, BG_Toff, BG_bound
 
 
-@partial(jax.jit, static_argnames=("n_iter", "variational"))
+@partial(jax.jit, static_argnames=("degree",))
+def _jj_background_cheb(offset, b0, y, degree: int = 40, ov=0.0):
+    """Chebyshev surrogate of the JJ row-background (the l_d analog for localjj):
+    one 1-D fit of each all-rows sum over the range of b0 (O(n*D)), eval at b0
+    (O(D*p)). Same BG_W/BG_Toff/BG_bound as _jj_background, O(n*D + D*p) not O(n*p).
+    b0 is a (p,) vector here. `ov` (random offset) enters xi0."""
+    xnodes_np, P_np = _cheb_fit_matrix(degree)
+    xnodes = jnp.asarray(xnodes_np)
+    P = jnp.asarray(P_np)
+    c_lo = jnp.min(b0) - 0.5
+    c_hi = jnp.max(b0) + 0.5
+    c_nodes = 0.5 * (c_hi + c_lo) + 0.5 * (c_hi - c_lo) * xnodes  # (D+1,)
+    eta0 = offset[:, None] + c_nodes[None, :]  # (n, D+1)
+    ov_c = ov[:, None] if jnp.ndim(ov) else ov
+    a = jnp.sqrt(jnp.maximum(eta0**2 + ov_c, 1e-12))  # xi0
+    tau0 = 2.0 * lambda_xi(a)
+    Sw = jnp.sum(tau0, 0)  # (D+1,)
+    SToff = jnp.sum(tau0 * offset[:, None], 0)
+    Sbound = jnp.sum((y[:, None] - 0.5) * eta0 - jax.nn.softplus(a) + 0.5 * a, 0)
+    aw, at_, ab = P @ Sw, P @ SToff, P @ Sbound
+    t = (2.0 * b0 - (c_hi + c_lo)) / (c_hi - c_lo)  # map to [-1,1]
+    return _clenshaw(aw, t), _clenshaw(at_, t), _clenshaw(ab, t)
+
+
+@partial(jax.jit, static_argnames=("n_iter", "variational", "background", "degree"))
 def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 150, variational: bool = True,
-                         tol: float = 1e-8, offset_var=None):
+                         tol: float = 1e-8, offset_var=None, background: str = "exact",
+                         degree: int = 40):
     """Per-column JJ SER with a PROFILED per-column intercept (= localjj center=True).
     JJ xi-fixed-point (localjj_ser) + per-column re-centering (Schur with the JJ tau)
-    + the JJ intercept row-background (naive O(n*p); the l_d analog). Parameterization
-    (b): profiled mean, conditional variance. variational as in localjj_ser.
-    With `offset_var` the JJ tuning integrates the random offset (E[eta^2]+=offset_var).
+    + the JJ intercept row-background. Parameterization (b): profiled mean, conditional
+    variance. variational as in localjj_ser. With `offset_var` the JJ tuning integrates
+    the random offset (E[eta^2]+=offset_var). `background`: "exact" O(n*p) or
+    "chebyshev" O(n*D + D*p) (the l_d surrogate, for sparse/large p).
     Returns per-feature (m, v, b0, feature_log_bf) rel. the profiled JJ null."""
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
@@ -275,6 +301,11 @@ def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 150, varia
     R0 = jnp.sum(y - 0.5)
     vfac = 1.0 if variational else 0.0
 
+    def _bg(b0):
+        if background == "chebyshev":
+            return _jj_background_cheb(offset, b0, y, degree, ov)
+        return _jj_background(offset, b0, y, offset_var)
+
     def body(state):
         m, v, b0, _, it = state
         me, ve, b0e = op.broadcast_cols(m), op.broadcast_cols(v), op.broadcast_cols(b0)
@@ -283,7 +314,7 @@ def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 150, varia
         tau = 2.0 * lambda_xi(xi)
         xi0_s = jnp.sqrt(jnp.maximum((off_e + b0e)**2 + ov_e, 1e-12))
         tau0_s = 2.0 * lambda_xi(xi0_s)
-        BG_W, BG_Toff, _ = _jj_background(offset, b0, y, offset_var)
+        BG_W, BG_Toff, _ = _bg(b0)
         W = BG_W + op.local_moment(0, tau - tau0_s)  # sum_all tau
         S1 = op.local_moment(1, tau)  # support
         S2 = op.local_moment(2, tau)
@@ -312,7 +343,7 @@ def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 150, varia
     eta_mean = off_e + b0e + x * me
     xi = jnp.sqrt(jnp.maximum(eta_mean**2 + vfac * x**2 * ve + ov_e, 1e-12))
     xi0_s = jnp.sqrt(jnp.maximum((off_e + b0e)**2 + ov_e, 1e-12))
-    _, _, BG_bound = _jj_background(offset, b0, y, offset_var)
+    _, _, BG_bound = _bg(b0)
     supp = op.local_moment(
         0,
         (y_e - 0.5) * x * me

@@ -73,17 +73,19 @@ def fit_local_jj_ser_centered(
     """SER wrapper for the profiled-intercept (centered) per-feature JJ update.
 
     Routes through the operator kernel `ser_ops.localjj_centered_ser`, which handles
-    dense AND BCOO (the per-feature intercept still needs the dense O(n*p) JJ
-    row-background, but the support reductions are sparse). The kernel cold-starts
-    the JJ-MM fixed point each sweep (monotone -> always converges), so `b0_init` /
-    the warm mu/var are not threaded; the converged answer matches the legacy
-    dense kernel (validated to ~1e-13 on the log-BF)."""
+    dense AND BCOO. The per-feature intercept couples all rows via the JJ
+    row-background; sparse uses the Chebyshev surrogate (O(n*D + D*p) vs O(n*p)),
+    dense uses the exact background. The kernel cold-starts the JJ-MM fixed point
+    each sweep (monotone -> always converges), so `b0_init` / the warm mu/var are
+    not threaded; the converged answer matches the legacy dense kernel (~1e-13)."""
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     offset_var = jnp.asarray(offset_var)
     p = data.X.shape[1]
+    background = "chebyshev" if _is_bcoo(data.X) else "exact"
     m, var, b0, log_bf = localjj_centered_ser(
-        as_operator(data.X), y, offset, prior_variance, offset_var=offset_var
+        as_operator(data.X), y, offset, prior_variance, offset_var=offset_var,
+        background=background,
     )
     # log_bf is the ELBO relative to the profiled JJ null; recover the absolute
     # feature evidence (the null cancels in alpha, so PIPs are unaffected).
