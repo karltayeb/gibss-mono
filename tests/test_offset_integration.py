@@ -41,16 +41,16 @@ def _brute_cumulant(eta, ov):
 @pytest.mark.parametrize("ov", [0.25, 1.0])
 def test_smooth_cumulant_matches_brute(eta, ov):
     Ab, sb, wb = _brute_cumulant(eta, ov)
-    # gh is accurate; taylor2 is only asymptotic in ov -> loose tol for it
-    for meth, oo, tol in [("gh", 15, 1e-6), ("taylor2", 0, 5e-2)]:
-        A, s, w = [float(x) for x in _smooth_cumulant(jnp.array(eta), jnp.array(ov), meth, oo)]
+    # gh is accurate; taylor is only asymptotic in ov -> loose tol for it
+    for integ, tol in [(15, 1e-6), ("taylor", 5e-2)]:
+        A, s, w = [float(x) for x in _smooth_cumulant(jnp.array(eta), jnp.array(ov), integ)]
         assert abs(A - Ab) < tol and abs(s - sb) < tol and abs(w - wb) < tol
 
 
-@pytest.mark.parametrize("smooth,order_o", [("none", 0), ("taylor2", 0), ("gh", 9)])
-def test_smooth_cumulant_ov0_is_exact(smooth, order_o):
+@pytest.mark.parametrize("offset_integration", ["none", "taylor", 9])
+def test_smooth_cumulant_ov0_is_exact(offset_integration):
     eta = jnp.linspace(-4, 4, 21)
-    A, s, w = _smooth_cumulant(eta, jnp.zeros_like(eta), smooth, order_o)
+    A, s, w = _smooth_cumulant(eta, jnp.zeros_like(eta), offset_integration)
     p = jax.nn.sigmoid(eta)
     np.testing.assert_allclose(np.asarray(A), np.asarray(jax.nn.softplus(eta)), atol=1e-12)
     np.testing.assert_allclose(np.asarray(s), np.asarray(p), atol=1e-12)
@@ -62,12 +62,12 @@ def test_taylor2_internally_consistent():
     eta = jnp.linspace(-3, 3, 25)
     ov = jnp.full_like(eta, 0.7)
     h = 1e-5
-    Ap = _smooth_cumulant(eta + h, ov, "taylor2", 0)[0]
-    Am = _smooth_cumulant(eta - h, ov, "taylor2", 0)[0]
-    A, s, w = _smooth_cumulant(eta, ov, "taylor2", 0)
+    Ap = _smooth_cumulant(eta + h, ov, "taylor")[0]
+    Am = _smooth_cumulant(eta - h, ov, "taylor")[0]
+    A, s, w = _smooth_cumulant(eta, ov, "taylor")
     np.testing.assert_allclose(np.asarray((Ap - Am) / (2 * h)), np.asarray(s), atol=1e-6)
-    sp = _smooth_cumulant(eta + h, ov, "taylor2", 0)[1]
-    sm = _smooth_cumulant(eta - h, ov, "taylor2", 0)[1]
+    sp = _smooth_cumulant(eta + h, ov, "taylor")[1]
+    sm = _smooth_cumulant(eta - h, ov, "taylor")[1]
     np.testing.assert_allclose(np.asarray((sp - sm) / (2 * h)), np.asarray(w), atol=1e-6)
 
 
@@ -127,7 +127,7 @@ def test_quadrature_ser_offset_integration_matches_brute():
     op = DenseOperator(jnp.asarray(X))
     _, _, lbf, _ = quadrature_ser(
         op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=25,
-        offset_var=jnp.asarray(ov), smooth="gh", order_o=15,
+        offset_var=jnp.asarray(ov), offset_integration=15,
     )
     brute = np.array([_brute_quad_logbf(X, y, offset, ov, j, 1.0) for j in range(p)])
     np.testing.assert_allclose(np.asarray(lbf), brute, atol=1e-4)
@@ -138,15 +138,15 @@ def test_offset_integration_changes_logbf():
     op, y, offset = _data()
     ov = jnp.full(op.n, 0.8)
     _, _, lbf0, _ = quadrature_ser(op, y, offset, 1.0, order=15)
-    _, _, lbf1, _ = quadrature_ser(op, y, offset, 1.0, order=15, offset_var=ov, smooth="gh", order_o=11)
+    _, _, lbf1, _ = quadrature_ser(op, y, offset, 1.0, order=15, offset_var=ov, offset_integration=11)
     assert np.max(np.abs(np.asarray(lbf1) - np.asarray(lbf0))) > 1e-3
 
 
 def test_taylor2_close_to_gh_small_ov():
     op, y, offset = _data()
     ov = jnp.full(op.n, 0.3)
-    _, _, lg, _ = quadrature_ser(op, y, offset, 1.0, order=15, offset_var=ov, smooth="gh", order_o=15)
-    _, _, lt, _ = quadrature_ser(op, y, offset, 1.0, order=15, offset_var=ov, smooth="taylor2")
+    _, _, lg, _ = quadrature_ser(op, y, offset, 1.0, order=15, offset_var=ov, offset_integration=15)
+    _, _, lt, _ = quadrature_ser(op, y, offset, 1.0, order=15, offset_var=ov, offset_integration="taylor")
     # 2nd-order agrees to <1% rel; abs error grows with signal strength (summed
     # cumulant error), so allow ~0.15 nat on the strong feature.
     np.testing.assert_allclose(np.asarray(lt), np.asarray(lg), atol=0.15)
@@ -155,8 +155,8 @@ def test_taylor2_close_to_gh_small_ov():
 # --------------------------------------------------------------------------- #
 # convexity / robustness
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("smooth,order_o", [("taylor2", 0), ("gh", 9)])
-def test_finite_under_saturation_with_offset_var(smooth, order_o):
+@pytest.mark.parametrize("offset_integration", ["taylor", 9])
+def test_finite_under_saturation_with_offset_var(offset_integration):
     rng = np.random.default_rng(0)
     n, p = 400, 20
     X = rng.normal(size=(n, p))
@@ -165,9 +165,9 @@ def test_finite_under_saturation_with_offset_var(smooth, order_o):
     op = DenseOperator(jnp.asarray(X))
     ov = jnp.full(n, 1.0)
     for fn in (
-        lambda: local_irls(op, jnp.asarray(y), jnp.asarray(offset), 1.0, offset_var=ov, smooth=smooth, order_o=order_o),
-        lambda: quadrature_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=11, offset_var=ov, smooth=smooth, order_o=order_o),
-        lambda: profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=11, offset_var=ov, smooth=smooth, order_o=order_o),
+        lambda: local_irls(op, jnp.asarray(y), jnp.asarray(offset), 1.0, offset_var=ov, offset_integration=offset_integration),
+        lambda: quadrature_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=11, offset_var=ov, offset_integration=offset_integration),
+        lambda: profile_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0, order=11, offset_var=ov, offset_integration=offset_integration),
     ):
         for a in fn():
             assert np.all(np.isfinite(np.asarray(a)))
@@ -196,8 +196,8 @@ def test_engine_integrate_offset_runs_and_differs():
 
     # message type drives it: MeanMessage init = fixed offset, Message init = integrated
     mean_only = run(Q.initialize_state_mean_message)
-    integ = run(Q.initialize_state, offset_smooth="gh", offset_order=7)
-    integ_t2 = run(Q.initialize_state, offset_smooth="taylor2")
+    integ = run(Q.initialize_state, offset_integration=7)
+    integ_t2 = run(Q.initialize_state, offset_integration="taylor")
 
     # both recover the signals
     for st in (mean_only, integ, integ_t2):

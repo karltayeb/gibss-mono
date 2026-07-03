@@ -46,7 +46,7 @@ def _normal_logpdf(b, prior_variance):
     return -0.5 * (b**2 / prior_variance + jnp.log(2.0 * jnp.pi * prior_variance))
 
 
-def _smooth_cumulant(eta, ov, smooth: str = "taylor2", order_o: int = 5):
+def _smooth_cumulant(eta, ov, offset_integration="taylor"):
     """Gaussian-convolved logistic cumulant + its first two derivatives.
 
     Returns (A, s, w) = E_{d~N(0,ov)}[ (softplus, sigmoid, weight)(eta + d) ], the
@@ -54,41 +54,43 @@ def _smooth_cumulant(eta, ov, smooth: str = "taylor2", order_o: int = 5):
     curvature `w~ = E[w]` (working weight). `eta`, `ov` broadcast to the same shape.
 
     Convexity is preserved (convolution with a nonneg kernel), so Newton on the
-    `A~`-objective stays well-posed. `ov=0` is the identity for every method:
-      - "none"   : exact (ov ignored).
-      - "taylor2": 2nd-order `f + 1/2 f'' ov` -- consistent (A,s,w are derivatives
+    `A~`-objective stays well-posed. `ov=0` is the identity for every method. The
+    single `offset_integration` argument picks the method AND its cost:
+      - "none"   : exact (ov ignored) -- fixed offset.
+      - "taylor" : 2nd-order `f + 1/2 f'' ov` -- consistent (A,s,w are derivatives
                    of each other), O(1), good for small ov.
-      - "gh"     : `order_o`-node Gauss-Hermite over the offset, exact-ish, O(order_o).
+      - int k    : k-node Gauss-Hermite over the offset, exact-ish, O(k). k>=2 is
+                   needed for the variance to enter (GH order k exact to degree
+                   2k-1); k=1 collapses to the fixed offset.
     """
     p = jax.nn.sigmoid(eta)
     w = p * (1.0 - p)
     A = jax.nn.softplus(eta)
-    if smooth == "none":
+    if offset_integration == "none":
         return A, p, w
-    if smooth == "taylor2":
+    if offset_integration == "taylor":
         c = 0.5 * ov
         u = 1.0 - 2.0 * p
         return A + c * w, p + c * w * u, w + c * w * (u * u - 2.0 * w)
-    if smooth == "gh":
-        nodes_np, logw_np = _gh_rule(order_o)
-        nodes = jnp.asarray(nodes_np)
-        wts = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))  # sum to 1
-        sd = jnp.sqrt(2.0 * jnp.maximum(ov, 0.0))
-        lead = (-1,) + (1,) * jnp.ndim(eta)
-        shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)
-        pp = jax.nn.sigmoid(shft)
-        we = wts.reshape(lead)
-        return (
-            jnp.sum(we * jax.nn.softplus(shft), 0),
-            jnp.sum(we * pp, 0),
-            jnp.sum(we * pp * (1.0 - pp), 0),
-        )
-    raise ValueError(f"unknown smooth={smooth!r}")
+    order_o = int(offset_integration)  # gh order-{int}
+    nodes_np, logw_np = _gh_rule(order_o)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))  # sum to 1
+    sd = jnp.sqrt(2.0 * jnp.maximum(ov, 0.0))
+    lead = (-1,) + (1,) * jnp.ndim(eta)
+    shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)
+    pp = jax.nn.sigmoid(shft)
+    we = wts.reshape(lead)
+    return (
+        jnp.sum(we * jax.nn.softplus(shft), 0),
+        jnp.sum(we * pp, 0),
+        jnp.sum(we * pp * (1.0 - pp), 0),
+    )
 
 
-def _smooth_A_only(eta, ov, smooth: str = "taylor2", order_o: int = 5):
+def _smooth_A_only(eta, ov, offset_integration="taylor"):
     """Just the convolved cumulant `A~` (for loglik/background terms)."""
-    return _smooth_cumulant(eta, ov, smooth, order_o)[0]
+    return _smooth_cumulant(eta, ov, offset_integration)[0]
 
 
 def global_gaussian_ser(
@@ -119,9 +121,9 @@ def global_gaussian_ser(
     return mu, var, log_bf
 
 
-@partial(jax.jit, static_argnames=("n_iter", "smooth", "order_o"))
+@partial(jax.jit, static_argnames=("n_iter", "offset_integration"))
 def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-8,
-               offset_var=None, smooth: str = "taylor2", order_o: int = 5):
+               offset_var=None, offset_integration="taylor"):
     """Per-column univariate logistic MAP (shared intercept in `offset`) + Laplace.
 
     The minimal per-column ("univariate") kernel: a vectorized Newton over all
@@ -147,7 +149,7 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
     def body(state):
         b, _, it = state
         eta = off_e + op.column_linpred(b)
-        _, s, w = _smooth_cumulant(eta, ov_e, smooth, order_o)
+        _, s, w = _smooth_cumulant(eta, ov_e, offset_integration)
         grad = op.local_moment(1, y_e - s) - inv_pv * b
         curv = op.local_moment(2, w) + inv_pv
         step = grad / curv
@@ -159,8 +161,8 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
     b = jnp.where(jnp.isfinite(b), b, 0.0)  # non-finite feature -> null effect
 
     eta = off_e + op.column_linpred(b)
-    A, _, w = _smooth_cumulant(eta, ov_e, smooth, order_o)
-    A0 = _smooth_A_only(off_e, ov_e, smooth, order_o)
+    A, _, w = _smooth_cumulant(eta, ov_e, offset_integration)
+    A0 = _smooth_A_only(off_e, ov_e, offset_integration)
     precision = op.local_moment(2, w) + inv_pv
     var = 1.0 / precision
     # data loglik difference vs b=0 (support-only; off-support terms cancel). The
@@ -170,13 +172,12 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
     return b, var, log_bf
 
 
-def _null_intercept(offset, y, n_iter: int = 80, ov=0.0, smooth: str = "taylor2",
-                    order_o: int = 5):
+def _null_intercept(offset, y, n_iter: int = 80, ov=0.0, offset_integration="taylor"):
     """Intercept-only logistic MLE (b=0): clipped 1-D Newton over all rows.
     With `ov` (per-row offset variance) the cumulant is offset-integrated."""
     def body(state):
         c, it = state
-        _, s, w = _smooth_cumulant(offset + c, ov, smooth, order_o)
+        _, s, w = _smooth_cumulant(offset + c, ov, offset_integration)
         g = jnp.sum(y - s)
         h = jnp.maximum(jnp.sum(w), 1e-8)
         return c + jnp.clip(g / h, -4.0, 4.0), it + 1
@@ -310,8 +311,7 @@ def localjj_centered_ser(op, y, offset, prior_variance, n_iter: int = 150, varia
     return m, v, elbo - null
 
 
-def _intercept_background(offset, b0, y, ov=0.0, smooth: str = "taylor2",
-                          order_o: int = 5):
+def _intercept_background(offset, b0, y, ov=0.0, offset_integration="taylor"):
     """Row-background for the profiled intercept: sums over ALL rows at eta=offset+b0
     (no x*b term), per column b0_j. Naive O(n*p) -- the dense l_d. b0 any shape.
     With `ov` (per-row offset variance) the cumulant is offset-integrated."""
@@ -319,7 +319,7 @@ def _intercept_background(offset, b0, y, ov=0.0, smooth: str = "taylor2",
     lead = (-1,) + (1,) * b0.ndim
     eta0 = offset.reshape(lead) + b0[None, ...]
     ov0 = ov.reshape(lead) if jnp.ndim(ov) else ov
-    A0, mu0, w0 = _smooth_cumulant(eta0, ov0, smooth, order_o)
+    A0, mu0, w0 = _smooth_cumulant(eta0, ov0, offset_integration)
     yb = y.reshape(lead)
     return (
         jnp.sum(w0, 0),
@@ -347,9 +347,9 @@ def _clenshaw(coeffs, t):
     return coeffs[0] + t * b1 - b2
 
 
-@partial(jax.jit, static_argnames=("degree", "smooth", "order_o"))
+@partial(jax.jit, static_argnames=("degree", "offset_integration"))
 def _intercept_background_cheb(offset, b0, y, degree: int = 40, ov=0.0,
-                              smooth: str = "taylor2", order_o: int = 5):
+                              offset_integration="taylor"):
     """Chebyshev surrogate of the row-background: build one 1-D fit of L_f(c)=
     sum_i f(offset_i+c) over the range of b0 (O(n*D)), eval at b0 (O(D*|b0|)).
     Same BGw/BGg/BGll as _intercept_background, O(n*D + D*p) instead of O(n*p).
@@ -362,7 +362,7 @@ def _intercept_background_cheb(offset, b0, y, degree: int = 40, ov=0.0,
     c_nodes = 0.5 * (c_hi + c_lo) + 0.5 * (c_hi - c_lo) * xnodes  # (D+1,)
     eta = offset[:, None] + c_nodes[None, :]  # (n, D+1)
     ov_c = ov[:, None] if jnp.ndim(ov) else ov
-    A, mu, w = _smooth_cumulant(eta, ov_c, smooth, order_o)
+    A, mu, w = _smooth_cumulant(eta, ov_c, offset_integration)
     Sw = jnp.sum(w, 0)  # (D+1,)
     Sg = jnp.sum(y[:, None] - mu, 0)
     Sll = jnp.sum(y[:, None] * eta - A, 0)
@@ -371,9 +371,9 @@ def _intercept_background_cheb(offset, b0, y, degree: int = 40, ov=0.0,
     return _clenshaw(aw, t), _clenshaw(ag, t), _clenshaw(all_, t)
 
 
-@partial(jax.jit, static_argnames=("n_iter", "smooth", "order_o"))
+@partial(jax.jit, static_argnames=("n_iter", "offset_integration"))
 def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-8,
-                        offset_var=None, smooth: str = "taylor2", order_o: int = 5):
+                        offset_var=None, offset_integration="taylor"):
     """Per-column MAP with a PROFILED per-column intercept (b0_j, b_j) -- profile at
     order 1. = local_irls + per-column re-centering (Schur) + the intercept
     row-background. With `offset_var` the cumulant (mode-find, background, null) is
@@ -389,10 +389,10 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: fl
     def newton(b, b0):
         b0_e = op.broadcast_cols(b0)
         eta = off_e + b0_e + op.column_linpred(b)  # support, full
-        _, s, w = _smooth_cumulant(eta, ov_e, smooth, order_o)
+        _, s, w = _smooth_cumulant(eta, ov_e, offset_integration)
         eta0 = off_e + b0_e  # support, no x*b
-        _, s0, w0 = _smooth_cumulant(eta0, ov_e, smooth, order_o)
-        BGw, BGg, _ = _intercept_background(offset, b0, y, ov, smooth, order_o)
+        _, s0, w0 = _smooth_cumulant(eta0, ov_e, offset_integration)
+        BGw, BGg, _ = _intercept_background(offset, b0, y, ov, offset_integration)
         H00 = BGw + op.local_moment(0, w - w0)  # all rows
         H0b = op.local_moment(1, w)  # support (x factor)
         Hbb = op.local_moment(2, w) + inv_pv
@@ -402,9 +402,9 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: fl
 
     # profiled null intercept (b=0); also the b0 warm-start for the 2-D Newton
     # -> robust to large offset shifts.
-    c0 = _null_intercept(offset, y, ov=ov, smooth=smooth, order_o=order_o)
+    c0 = _null_intercept(offset, y, ov=ov, offset_integration=offset_integration)
     ll_null = jnp.sum(
-        y * (offset + c0) - _smooth_A_only(offset + c0, ov, smooth, order_o)
+        y * (offset + c0) - _smooth_A_only(offset + c0, ov, offset_integration)
     )  # scalar
 
     def body(state):
@@ -428,19 +428,19 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: fl
     H00, H0b, Hbb, _, _ = newton(b, b0)
     schur = Hbb - H0b**2 / H00  # profiled curvature (incl. prior)
     var = 1.0 / schur
-    _, _, BGll = _intercept_background(offset, b0, y, ov, smooth, order_o)
+    _, _, BGll = _intercept_background(offset, b0, y, ov, offset_integration)
     eta = off_e + op.broadcast_cols(b0) + op.column_linpred(b)
     eta0 = off_e + op.broadcast_cols(b0)
-    A = _smooth_A_only(eta, ov_e, smooth, order_o)
-    A0 = _smooth_A_only(eta0, ov_e, smooth, order_o)
+    A = _smooth_A_only(eta, ov_e, offset_integration)
+    A0 = _smooth_A_only(eta0, ov_e, offset_integration)
     ll_alt = BGll + op.local_moment(0, (y_e * eta - A) - (y_e * eta0 - A0))
     log_bf = (ll_alt - ll_null) - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * schur)
     return b, b0, var, log_bf
 
 
-@partial(jax.jit, static_argnames=("order", "n_iter", "smooth", "order_o"))
+@partial(jax.jit, static_argnames=("order", "n_iter", "offset_integration"))
 def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30,
-                   offset_var=None, smooth: str = "taylor2", order_o: int = 5):
+                   offset_var=None, offset_integration="taylor"):
     """Per-column exact-ish logistic SER: local_irls mode + Gauss-Hermite tail.
 
     = quadrature (shared intercept). Finds each feature's MAP + Laplace scale
@@ -452,13 +452,13 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     With `offset_var` the per-node cumulant is offset-integrated (see
     `_smooth_cumulant`); the mode-find inherits it too. `offset_var=None` -> the
     mean-only kernel. This is the {b} x {o} product-quadrature: GH over b, an
-    offset-convolution over each o_i (analytic taylor2 or nested GH `order_o`).
+    offset-convolution over each o_i (analytic "taylor" or nested GH order-{int}).
     """
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
     b_hat, var_lap, _ = local_irls(
         op, y, offset, prior_variance, n_iter,
-        offset_var=offset_var, smooth=smooth, order_o=order_o,
+        offset_var=offset_var, offset_integration=offset_integration,
     )
     sigma = jnp.sqrt(var_lap)
 
@@ -468,13 +468,13 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     y_e = op.broadcast_rows(y)
     off_e = op.broadcast_rows(offset)
     ov_e = 0.0 if offset_var is None else op.broadcast_rows(jnp.asarray(offset_var))
-    A0 = _smooth_A_only(off_e, ov_e, smooth, order_o)
+    A0 = _smooth_A_only(off_e, ov_e, offset_integration)
     null_e = y_e * off_e - A0  # per-entry null loglik (b=0), offset-integrated
 
     def node_term(node, lw):
         b = b_hat + jnp.sqrt(2.0) * sigma * node  # (p,)
         eta = off_e + op.column_linpred(b)
-        A = _smooth_A_only(eta, ov_e, smooth, order_o)
+        A = _smooth_A_only(eta, ov_e, offset_integration)
         dll = op.local_moment(0, (y_e * eta - A) - null_e)  # (p,)
         logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
             jnp.sqrt(2.0) * sigma
@@ -490,11 +490,11 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     return mu, var, log_norm, coefficient_kl
 
 
-@partial(jax.jit, static_argnames=("order", "n_iter", "background", "node_intercept", "node_newton", "smooth", "order_o"))
+@partial(jax.jit, static_argnames=("order", "n_iter", "background", "node_intercept", "node_newton", "offset_integration"))
 def profile_ser(
     op, y, offset, prior_variance, order: int = 15, n_iter: int = 30,
     background: str = "exact", node_intercept: str = "linear", node_newton: int = 4,
-    offset_var=None, smooth: str = "taylor2", order_o: int = 5,
+    offset_var=None, offset_integration="taylor",
 ):
     """Per-column profiled-intercept SER: local_irls_centered mode + GH tail with
     per-node intercept re-profiling (= profile).
@@ -510,7 +510,7 @@ def profile_ser(
     ov_e = 0.0 if offset_var is None else op.broadcast_rows(ov)
     b_hat, b0_hat, var_lap, _ = local_irls_centered(
         op, y, offset, prior_variance, n_iter,
-        offset_var=offset_var, smooth=smooth, order_o=order_o,
+        offset_var=offset_var, offset_integration=offset_integration,
     )
     sigma = jnp.sqrt(var_lap)
     y_e = op.broadcast_rows(y)
@@ -518,14 +518,14 @@ def profile_ser(
 
     # re-centering slope c = H0b/H00 at the mode
     b0e = op.broadcast_cols(b0_hat)
-    _, _, w = _smooth_cumulant(off_e + b0e + op.column_linpred(b_hat), ov_e, smooth, order_o)
-    _, _, w0 = _smooth_cumulant(off_e + b0e, ov_e, smooth, order_o)
-    BGw, _, _ = _intercept_background(offset, b0_hat, y, ov, smooth, order_o)
+    _, _, w = _smooth_cumulant(off_e + b0e + op.column_linpred(b_hat), ov_e, offset_integration)
+    _, _, w0 = _smooth_cumulant(off_e + b0e, ov_e, offset_integration)
+    BGw, _, _ = _intercept_background(offset, b0_hat, y, ov, offset_integration)
     H00 = BGw + op.local_moment(0, w - w0)
     c_slope = op.local_moment(1, w) / H00
 
-    c0 = _null_intercept(offset, y, ov=ov, smooth=smooth, order_o=order_o)
-    ll_null = jnp.sum(y * (offset + c0) - _smooth_A_only(offset + c0, ov, smooth, order_o))
+    c0 = _null_intercept(offset, y, ov=ov, offset_integration=offset_integration)
+    ll_null = jnp.sum(y * (offset + c0) - _smooth_A_only(offset + c0, ov, offset_integration))
 
     nodes_np, log_w_np = _gh_rule(order)
     nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
@@ -534,15 +534,15 @@ def profile_ser(
 
     def _row_bg(b0):
         return (
-            _intercept_background_cheb(offset, b0, y, 40, ov, smooth, order_o)
+            _intercept_background_cheb(offset, b0, y, 40, ov, offset_integration)
             if background == "chebyshev"
-            else _intercept_background(offset, b0, y, ov, smooth, order_o)
+            else _intercept_background(offset, b0, y, ov, offset_integration)
         )
 
     def _supp_gw(b, b0):  # per-node support corrections to g0, H00
         b0e = op.broadcast_cols(b0)
-        _, s, wf = _smooth_cumulant(off_e + b0e + op.column_linpred(b), ov_e, smooth, order_o)
-        _, s0, w0f = _smooth_cumulant(off_e + b0e, ov_e, smooth, order_o)
+        _, s, wf = _smooth_cumulant(off_e + b0e + op.column_linpred(b), ov_e, offset_integration)
+        _, s0, w0f = _smooth_cumulant(off_e + b0e, ov_e, offset_integration)
         sg = op.local_moment(0, s0 - s)
         sw = op.local_moment(0, wf - w0f)
         return sg, sw
@@ -560,8 +560,8 @@ def profile_ser(
         b0e = op.broadcast_cols(b0)
         eta = off_e + b0e + op.column_linpred(b)
         eta0 = off_e + b0e
-        A = _smooth_A_only(eta, ov_e, smooth, order_o)
-        A0 = _smooth_A_only(eta0, ov_e, smooth, order_o)
+        A = _smooth_A_only(eta, ov_e, offset_integration)
+        A0 = _smooth_A_only(eta0, ov_e, offset_integration)
         supp = op.local_moment(0, (y_e * eta - A) - (y_e * eta0 - A0))
         ll_star = bgll + supp
         return lw + node**2 + (ll_star - ll_null) + _normal_logpdf(b, prior_variance) + jnp.log(
