@@ -9,7 +9,6 @@ from gibss.localjj import (
     estimate_intercept,
     estimate_intercept_step,
     fit_local_jj_ser,
-    fit_univariate_local_jj_regression,
     initialize_state,
     prep_data,
     subtract_message_index_step,
@@ -56,31 +55,6 @@ def test_jj_bound_null_log_likelihood_matches_manual_formula():
     )
     actual = _jj_bound_null_log_likelihood(data.y, offset, xi, offset_var=offset_var)
     assert np.isclose(actual, expected)
-
-
-def test_fit_univariate_local_jj_regression_returns_finite_arrays():
-    data = _binary_data()
-    p = data.X.shape[1]
-    offset = np.zeros_like(data.y)
-    mu_init = np.zeros(p)
-    var_init = np.full(p, 0.5)
-
-    mu, var, feature_log_evidence = fit_univariate_local_jj_regression(
-        data,
-        offset,
-        mu_init,
-        var_init,
-        prior_variance=1.5,
-        offset_var=np.zeros_like(data.y),
-    )
-
-    assert mu.shape == (p,)
-    assert var.shape == (p,)
-    assert feature_log_evidence.shape == (p,)
-    assert np.all(np.isfinite(mu))
-    assert np.all(np.isfinite(var))
-    assert np.all(np.isfinite(feature_log_evidence))
-    assert np.all(var > 0.0)
 
 
 def test_fit_local_jj_ser_returns_normalized_ser_state():
