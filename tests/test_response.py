@@ -9,13 +9,13 @@ from jax.experimental import sparse
 jax.config.update("jax_enable_x64", True)
 
 from gibss.operators import BCOOOperator, DenseOperator
-from gibss.response import Bernoulli, Poisson, TwoGroupMarginal
+from gibss.response import Bernoulli, Gaussian, Poisson, TwoGroupMarginal
 from gibss.response_ser import glm_ser
 from gibss.ser_ops import quadrature_ser
 
 
 @pytest.mark.parametrize(
-    "resp,aux", [(Bernoulli(), 1.0), (Poisson(), 3.0),
+    "resp,aux", [(Bernoulli(), 1.0), (Poisson(), 3.0), (Gaussian(variance=0.7), 0.5),
                  (TwoGroupMarginal(), 1.5), (TwoGroupMarginal(), -0.8)]
 )
 def test_grad_is_dloglik(resp, aux):
@@ -95,6 +95,27 @@ def test_poisson_glm_ser_matches_brute():
 
     brute = np.array([_brute_glm_logbf(loglik, X, off, y, j) for j in range(p)])
     np.testing.assert_allclose(np.asarray(ps[2]), brute, atol=3e-3)
+
+
+def test_gaussian_glm_ser_matches_closed_form():
+    # linear SuSiE is GLM(Gaussian): the per-effect integrand is exactly Gaussian, so
+    # glm_ser's GH quadrature reproduces the closed-form single-effect BF and mu.
+    rng = np.random.default_rng(4)
+    n, p, var = 300, 6, 0.7
+    X = rng.normal(size=(n, p))
+    off = np.zeros(n)
+    y = 1.0 * X[:, 2] + rng.normal(0, np.sqrt(var), n)
+    pv = 1.5
+    op = DenseOperator(jnp.asarray(X))
+    g = glm_ser(op, jnp.asarray(y), jnp.asarray(off), pv, Gaussian(variance=var), order=15)
+
+    xtx = (X**2).sum(0) / var
+    xty = (X * y[:, None]).sum(0) / var
+    prec = xtx + 1.0 / pv
+    mu_cf = xty / prec
+    logbf_cf = 0.5 * (xty**2 / prec) + 0.5 * np.log(1.0 / pv) - 0.5 * np.log(prec)
+    np.testing.assert_allclose(np.asarray(g[0]), mu_cf, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(g[2]), logbf_cf, atol=1e-9)
 
 
 def test_glm_ser_dense_sparse_parity():

@@ -45,6 +45,11 @@ the exact per-feature marginal (the part EM never did).
 
 Bernoulli:  loglik = y*eta - softplus, grad = y - mu, weight = w.
 Poisson:    loglik = y*eta - exp(eta), grad = y - exp(eta), weight = exp(eta).
+Gaussian:   loglik = -(y-eta)^2/2v, grad = (y-eta)/v, weight = 1/v. The per-effect
+            integrand is exactly Gaussian so GH is exact -> linear SuSiE = GLM(Gaussian),
+            and glm_ser reproduces the closed-form single-effect BF/mu to ~1e-13. This
+            is the whole point: every family (Gaussian/logistic/Poisson/two-group) is
+            one kernel, one ResponseModel.
 
 ## Paths considered
 - (A) Standalone twogroup marginal kernel — fast to validate, not general. (stepping stone)

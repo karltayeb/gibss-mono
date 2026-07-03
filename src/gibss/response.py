@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-__all__ = ["ResponseModel", "Bernoulli", "TwoGroupMarginal", "Poisson"]
+__all__ = ["ResponseModel", "Bernoulli", "TwoGroupMarginal", "Poisson", "Gaussian"]
 
 
 class ResponseModel:
@@ -65,3 +65,20 @@ class Poisson(ResponseModel):
     def terms(self, eta, aux):
         lam = jnp.exp(eta)
         return aux * eta - lam, aux - lam, lam
+
+
+@dataclass(frozen=True)
+class Gaussian(ResponseModel):
+    """Gaussian (identity link), fixed variance. aux = y.
+
+    loglik = -(y - eta)^2 / (2 var); grad = (y - eta)/var; weight = 1/var. The
+    per-effect integrand is exactly Gaussian, so glm_ser's Gauss-Hermite quadrature
+    is exact (any order): linear SuSiE is just GLM(Gaussian).
+    """
+
+    variance: float = 1.0
+
+    def terms(self, eta, aux):
+        r = aux - eta
+        inv_v = 1.0 / self.variance
+        return -0.5 * r * r * inv_v, r * inv_v, jnp.full_like(eta, inv_v)
