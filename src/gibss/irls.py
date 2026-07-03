@@ -382,9 +382,12 @@ def to_numpy_state_step(data, state):
 
 def default_schedule() -> Schedule:
     return Schedule(
-        # intercept -> recompute weights -> center -> fit effects (no lag)
-        before_sweep=(
-            snapshot_state_step,
+        # Match globaljj: the working weights are the (Taylor) analog of xi, the
+        # optimal local param given (q, b0). Refresh them after EVERY change so they
+        # are never stale -- before-update follows the intercept change, after-update
+        # follows the effect (q) change. cbar tracks the weights (recompute adjacent).
+        before_sweep=(snapshot_state_step,),
+        before_effect_update=(
             update_intercept_step,
             update_working_data_step,
             update_centering_step,
@@ -394,6 +397,10 @@ def default_schedule() -> Schedule:
             update_effect_index_step,
             update_prior_variance_index_step,
             add_message_index_step,
+        ),
+        after_effect_update=(
+            update_working_data_step,
+            update_centering_step,
         ),
         after_sweep=(check_convergence_step,),
         after_fit=(to_numpy_state_step,),
