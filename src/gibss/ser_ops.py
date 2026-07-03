@@ -416,13 +416,16 @@ def _intercept_background_cheb(offset, b0, y, degree: int = 40, ov=0.0,
     return _clenshaw(aw, t), _clenshaw(ag, t), _clenshaw(all_, t)
 
 
-@partial(jax.jit, static_argnames=("n_iter", "offset_integration"))
+@partial(jax.jit, static_argnames=("n_iter", "offset_integration", "background", "degree"))
 def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-8,
-                        offset_var=None, offset_integration="taylor"):
+                        offset_var=None, offset_integration="taylor", background: str = "exact",
+                        degree: int = 40):
     """Per-column MAP with a PROFILED per-column intercept (b0_j, b_j) -- profile at
     order 1. = local_irls + per-column re-centering (Schur) + the intercept
     row-background. With `offset_var` the cumulant (mode-find, background, null) is
-    Gaussian-convolved over the random offset. Returns (b, b0, var, laplace_log_bf)."""
+    Gaussian-convolved over the random offset. `background`: "exact" O(n*p) or
+    "chebyshev" O(n*D + D*p) (the l_d surrogate, for sparse/large p).
+    Returns (b, b0, var, laplace_log_bf)."""
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
     y_e = op.broadcast_rows(y)
@@ -433,13 +436,18 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: fl
     ov_e = 0.0 if offset_var is None else op.broadcast_rows(ov)
     inv_pv = 1.0 / prior_variance
 
+    def _bg(b0):
+        if background == "chebyshev":
+            return _intercept_background_cheb(offset, b0, y, degree, ov, offset_integration)
+        return _intercept_background(offset, b0, y, ov, offset_integration)
+
     def newton(b, b0):
         b0_e = op.broadcast_cols(b0)
         eta = off_e + b0_e + op.column_linpred(b)  # support, full
         _, s, w = _smooth_cumulant(eta, ov_e, offset_integration)
         eta0 = off_e + b0_e  # support, no x*b
         _, s0, w0 = _smooth_cumulant(eta0, ov_e, offset_integration)
-        BGw, BGg, _ = _intercept_background(offset, b0, y, ov, offset_integration)
+        BGw, BGg, _ = _bg(b0)
         H00 = BGw + op.local_moment(0, w - w0)  # all rows
         H0b = op.local_moment(1, w)  # support (x factor)
         Hbb = op.local_moment(2, w) + inv_pv
@@ -475,7 +483,7 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: fl
     H00, H0b, Hbb, _, _ = newton(b, b0)
     schur = Hbb - H0b**2 / H00  # profiled curvature (incl. prior)
     var = 1.0 / schur
-    _, _, BGll = _intercept_background(offset, b0, y, ov, offset_integration)
+    _, _, BGll = _bg(b0)
     eta = off_e + op.broadcast_cols(b0) + op.column_linpred(b)
     eta0 = off_e + op.broadcast_cols(b0)
     A = _smooth_A_only(eta, ov_e, offset_integration)
@@ -561,17 +569,24 @@ def profile_ser(
     ov_e = 0.0 if offset_var is None else op.broadcast_rows(ov)
     b_hat, b0_hat, var_lap, _ = local_irls_centered(
         op, y, offset, prior_variance, n_iter,
-        offset_var=offset_var, offset_integration=offset_integration,
+        offset_var=offset_var, offset_integration=offset_integration, background=background,
     )
     sigma = jnp.sqrt(var_lap)
     y_e = op.broadcast_rows(y)
     off_e = op.broadcast_rows(offset)
 
+    def _row_bg(b0):  # the l_d row-background: cheb surrogate or exact
+        return (
+            _intercept_background_cheb(offset, b0, y, 40, ov, offset_integration)
+            if background == "chebyshev"
+            else _intercept_background(offset, b0, y, ov, offset_integration)
+        )
+
     # re-centering slope c = H0b/H00 at the mode
     b0e = op.broadcast_cols(b0_hat)
     _, _, w = _smooth_cumulant(off_e + b0e + op.column_linpred(b_hat), ov_e, offset_integration)
     _, _, w0 = _smooth_cumulant(off_e + b0e, ov_e, offset_integration)
-    BGw, _, _ = _intercept_background(offset, b0_hat, y, ov, offset_integration)
+    BGw, _, _ = _row_bg(b0_hat)
     H00 = BGw + op.local_moment(0, w - w0)
     c_slope = op.local_moment(1, w) / H00
 
@@ -582,13 +597,6 @@ def profile_ser(
     nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
     b_nodes = b_hat[None, :] + jnp.sqrt(2.0) * sigma[None, :] * nodes[:, None]  # (order, p)
     b0_nodes = b0_hat[None, :] - c_slope[None, :] * (b_nodes - b_hat[None, :])  # Cox-Reid
-
-    def _row_bg(b0):
-        return (
-            _intercept_background_cheb(offset, b0, y, 40, ov, offset_integration)
-            if background == "chebyshev"
-            else _intercept_background(offset, b0, y, ov, offset_integration)
-        )
 
     def _supp_gw(b, b0):  # per-node support corrections to g0, H00
         b0e = op.broadcast_cols(b0)

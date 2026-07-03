@@ -85,3 +85,25 @@ def test_offset_shift_invariance():
     _, _, _, lbf_a = local_irls_centered(op, jnp.asarray(y), jnp.asarray(offset), 1.0)
     _, _, _, lbf_b = local_irls_centered(op, jnp.asarray(y), jnp.asarray(offset) + 3.1, 1.0)
     np.testing.assert_allclose(np.asarray(lbf_a), np.asarray(lbf_b), atol=1e-6)
+
+
+def test_local_irls_centered_chebyshev_matches_exact():
+    # the Chebyshev intercept row-background (O(nD+Dp)) matches the exact O(np)
+    # background in the mode-find -- dense and sparse. This makes sparse Taylor-
+    # centered fully O(nD+Dp) (symmetric with localjj-centered).
+    rng = np.random.default_rng(12)
+    n, p = 400, 30
+    Xd = rng.normal(size=(n, p)) * rng.binomial(1, 0.4, size=(n, p))
+    offset = rng.normal(size=n) * 0.5
+    ov = jnp.asarray(rng.uniform(0.1, 1.0, n))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(offset + 1.3 * Xd[:, 5]))), n).astype(float)
+    opd = DenseOperator(jnp.asarray(Xd))
+    ops = BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(Xd)))
+    yj, oj = jnp.asarray(y), jnp.asarray(offset)
+    ex = local_irls_centered(opd, yj, oj, 1.0, offset_var=ov, background="exact")
+    ch = local_irls_centered(opd, yj, oj, 1.0, offset_var=ov, background="chebyshev")
+    chs = local_irls_centered(ops, yj, oj, 1.0, offset_var=ov, background="chebyshev")
+    for a, b in zip(ex, ch):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-9)
+    for a, b in zip(ch, chs):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-9)
