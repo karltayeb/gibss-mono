@@ -94,6 +94,8 @@ def _profiled_logistic_null(y: Any, offset: Any, n_iter: int = 50, offset_var=No
     """
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
+    if offset_var is None:
+        offset_integration = "none"  # no var -> skip the convolution machinery
     ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
 
     def body(state):
@@ -139,6 +141,8 @@ def fit_univariate_quadrature_regression(
     """
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
+    if offset_var is None:
+        offset_integration = "none"  # no var -> skip the convolution machinery
     ov = None if offset_var is None else jnp.asarray(offset_var)
     # operator-native per-column quadrature (dense/BCOO/low-rank in one path)
     mu, var, feature_log_bf, coefficient_kl = quadrature_ser(
@@ -265,7 +269,9 @@ def estimate_intercept(
     tm = state.total_message
     total_mean = jnp.asarray(tm.mean)
     ov = 0.0 if isinstance(tm, MeanMessage) else jnp.asarray(tm.var)
-    offset_integration = fs.offset_integration
+    # MeanMessage carries no var -> skip the convolution machinery regardless of
+    # the configured method (avoids running GH-over-offset on zeros).
+    offset_integration = "none" if isinstance(tm, MeanMessage) else fs.offset_integration
     y = jnp.asarray(data.y)
 
     def body_fun(state_):

@@ -47,6 +47,17 @@ def test_smooth_cumulant_matches_brute(eta, ov):
         assert abs(A - Ab) < tol and abs(s - sb) < tol and abs(w - wb) < tol
 
 
+@pytest.mark.parametrize("meth", ["taylor", 3, 9])
+def test_no_var_forces_none_no_wasted_gh(meth):
+    # offset_var=None (e.g. a MeanMessage) must short-circuit to the identity for
+    # ANY offset_integration -- no GH-over-offset run on zeros.
+    op, y, offset = _data()
+    a = quadrature_ser(op, y, offset, 1.0, order=11, offset_var=None, offset_integration=meth)
+    b = quadrature_ser(op, y, offset, 1.0, order=11, offset_var=None, offset_integration="none")
+    for x, z in zip(a, b):
+        np.testing.assert_allclose(np.asarray(x), np.asarray(z), atol=1e-12)
+
+
 @pytest.mark.parametrize("offset_integration", ["none", "taylor", 9])
 def test_smooth_cumulant_ov0_is_exact(offset_integration):
     eta = jnp.linspace(-4, 4, 21)

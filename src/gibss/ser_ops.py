@@ -143,6 +143,8 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
     offset = jnp.asarray(offset)
     y_e = op.broadcast_rows(y)
     off_e = op.broadcast_rows(offset)
+    if offset_var is None:
+        offset_integration = "none"  # no var -> skip the convolution machinery
     ov_e = 0.0 if offset_var is None else op.broadcast_rows(jnp.asarray(offset_var))
     inv_pv = 1.0 / prior_variance
 
@@ -382,6 +384,8 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: fl
     offset = jnp.asarray(offset)
     y_e = op.broadcast_rows(y)
     off_e = op.broadcast_rows(offset)
+    if offset_var is None:
+        offset_integration = "none"  # no var -> skip the convolution machinery
     ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
     ov_e = 0.0 if offset_var is None else op.broadcast_rows(ov)
     inv_pv = 1.0 / prior_variance
@@ -456,6 +460,8 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     """
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
+    if offset_var is None:
+        offset_integration = "none"  # no var -> skip the convolution machinery
     b_hat, var_lap, _ = local_irls(
         op, y, offset, prior_variance, n_iter,
         offset_var=offset_var, offset_integration=offset_integration,
@@ -506,6 +512,8 @@ def profile_ser(
     With `offset_var` the cumulant (mode, background, null, nodes) is offset-integrated."""
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
+    if offset_var is None:
+        offset_integration = "none"  # no var -> skip the convolution machinery
     ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
     ov_e = 0.0 if offset_var is None else op.broadcast_rows(ov)
     b_hat, b0_hat, var_lap, _ = local_irls_centered(
