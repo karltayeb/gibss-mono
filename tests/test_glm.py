@@ -60,6 +60,25 @@ def test_glm_poisson_recovers(seed):
     assert np.isfinite(g.family_state.intercept)
 
 
+def test_glm_dense_sparse_parity():
+    # full engine loop agrees on dense vs BCOO input (intercept-Newton accumulation
+    # over sweeps keeps this slightly looser than the kernel-level 1e-9 parity)
+    import jax
+    from jax.experimental import sparse
+
+    rng = np.random.default_rng(0)
+    n, p, causal = 400, 10, 4
+    Xd = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.4)
+    y = rng.binomial(1, 1 / (1 + np.exp(-(Xd[:, causal]))), n).astype(float)
+    Xs = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+
+    def run(X):
+        d = glm.prep_data(X, y)
+        return fit_ibss(d, glm.initialize_state(d, L=2, response=Bernoulli()), glm.default_schedule(), max_iter=40)
+
+    np.testing.assert_allclose(np.asarray(run(Xd).alpha), np.asarray(run(Xs).alpha), atol=2e-3)
+
+
 def test_glm_response_is_static_across_families():
     # the same module/schedule serves different families purely via the response arg
     rng = np.random.default_rng(0)

@@ -72,3 +72,20 @@ def test_marginal_at_least_as_sharp_as_em():
     # the true feature should be no worse (and typically sharper) than the EM path.
     X, bhat, se = _sim(0)
     assert _feat_pip(_fit_marginal(X, bhat, se), 3) >= _feat_pip(_fit_em(X, bhat, se), 3)
+
+
+def test_marginal_dense_sparse_parity():
+    # the full engine loop agrees to machine precision on dense vs BCOO input
+    import jax
+    from jax.experimental import sparse
+
+    rng = np.random.default_rng(0)
+    n, p = 400, 10
+    Xd = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.4)
+    z = rng.binomial(1, 1 / (1 + np.exp(-(-1.0 + 2.0 * Xd[:, 3]))), n)
+    se = np.ones(n)
+    bhat = z * rng.normal(0, 2.0, n) + rng.normal(0, se)
+    Xs = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+    ad = _fit_marginal(Xd, bhat, se).alpha
+    asp = _fit_marginal(Xs, bhat, se).alpha
+    np.testing.assert_allclose(np.asarray(ad), np.asarray(asp), atol=1e-9)
