@@ -225,34 +225,14 @@ class BaseSERState:
         return self.alpha
 
     def message(self, data: Any) -> Message:
-        X = data.X
-        X_sq = getattr(data, "X_sq", None)
+        # operator-native: mean = X coef, var = (X^2) coef2 - mean^2. The design's
+        # `op` handles layout AND pre-centering (CenteredOperator's matvec/matvec_sq
+        # carry the rank-1 correction), so no X_sq / cbar plumbing here.
+        op = data.op
         coef_mean = self.alpha * self.mu
         coef_second_moment = self.alpha * (self.mu**2 + self.var)
-        mean = X @ coef_mean
-        if X_sq is None:
-            if isinstance(X, sparse.BCOO):
-                # We can't use replace on BCOO as it's not a dataclass
-                # Use tree_flatten/unflatten to create a copy with squared data
-                leaves, treedef = jax.tree_util.tree_flatten(X)
-                # BCOO leaves are typically (data, indices)
-                # We square the first leaf (data)
-                new_leaves = [jnp.square(leaves[0])] + leaves[1:]
-                X_sq = treedef.unflatten(new_leaves)
-            else:
-                X_sq = jnp.square(X)
-        second_moment = X_sq @ coef_second_moment
-        # Sparse pre-centering: X is kept raw, columns centered implicitly by cbar.
-        # (Dense pre-centering bakes it into X, so column_center is None there.)
-        cbar = getattr(data, "column_center", None)
-        if cbar is not None:
-            mean = mean - jnp.sum(coef_mean * cbar)
-            second_moment = (
-                second_moment
-                - 2.0 * (X @ (coef_second_moment * cbar))
-                + jnp.sum(coef_second_moment * cbar**2)
-            )
-        var = jnp.maximum(second_moment - jnp.square(mean), 0.0)
+        mean = op.matvec(coef_mean)
+        var = jnp.maximum(op.matvec_sq(coef_second_moment) - jnp.square(mean), 0.0)
         return Message(mean=mean, var=var)
 
 

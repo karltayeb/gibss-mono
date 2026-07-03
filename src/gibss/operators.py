@@ -49,6 +49,11 @@ class DesignOperator:
     def matvec(self, v: Any) -> Any:  # X v
         raise NotImplementedError
 
+    def matvec_sq(self, v: Any) -> Any:  # (X.X) v -- elementwise-squared design matvec
+        """(X^2) v, (p,) -> (n,). The per-row second moment sum_j x_ij^2 v_j; drives
+        the message variance. Centering-aware in CenteredOperator (rank-1 correction)."""
+        raise NotImplementedError
+
     def rmatvec(self, u: Any) -> Any:  # X^T u
         return self.moment(1, u)
 
@@ -110,6 +115,9 @@ class DenseOperator(DesignOperator):
     def matvec(self, v):
         return self.X @ v
 
+    def matvec_sq(self, v):
+        return (self.X**2) @ v
+
     def rmatvec(self, u):
         return u @ self.X  # (n,) @ (n, p) -> (p,)
 
@@ -166,6 +174,13 @@ class BCOOOperator(DesignOperator):
 
     def matvec(self, v):
         return self.X @ v
+
+    def matvec_sq(self, v):
+        idx = self.X.indices
+        rows, cols = idx[:, 0], idx[:, 1]
+        return jax.ops.segment_sum(
+            self.X.data**2 * v[cols], rows, num_segments=self.X.shape[0]
+        )
 
     def moment(self, k, w):
         if k == 0:  # x^0 = 1 over ALL rows, not just the support
@@ -275,6 +290,14 @@ class CenteredOperator(DesignOperator):
 
     def matvec(self, v):
         return self.base.matvec(v) - jnp.sum(self.c * v)
+
+    def matvec_sq(self, v):
+        # sum_j (x_ij - c_j)^2 v_j = base.matvec_sq(v) - 2 base.matvec(c*v) + sum(c^2 v)
+        return (
+            self.base.matvec_sq(v)
+            - 2.0 * self.base.matvec(self.c * v)
+            + jnp.sum(self.c**2 * v)
+        )
 
     def rmatvec(self, u):
         return self.base.rmatvec(u) - self.c * jnp.sum(u)

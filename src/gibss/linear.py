@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
-from .operators import as_operator
+from .operators import as_operator, CenteredOperator
 from .ser_ops import global_gaussian_ser
 from .engine import (
     BaseSERState,
@@ -62,6 +62,16 @@ class LinearData:
     # eagerly and this stays None. For sparse (BCOO) X we keep X sparse and store
     # the means here so methods can center implicitly (X@coef - <coef,cbar>, etc.).
     column_center: Any = None
+
+    @property
+    def op(self):
+        """The design as a DesignOperator: raw DenseOperator/BCOOOperator, wrapped in
+        a CenteredOperator when pre-centering is implicit (sparse column_center). The
+        operator layer subsumes the ad-hoc X_sq / cbar plumbing (see matvec_sq)."""
+        base = as_operator(self.X)
+        if self.column_center is not None:
+            return CenteredOperator.from_offsets(base, self.column_center)
+        return base
 
 
 def _logsumexp(x):

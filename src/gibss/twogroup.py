@@ -3,6 +3,8 @@ from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 import jax
+
+from .operators import as_operator
 import jax.numpy as jnp
 from jax.experimental import sparse
 
@@ -319,6 +321,7 @@ def _use_response_step(step, response_fn):
             X=data.X,
             X_sq=data.X_sq,
             y=response_fn(data, state),
+            op=as_operator(data.X),  # base SER message is operator-native now
         )
 
         # 2. Extract inner family state for the underlying SuSiE step
