@@ -11,7 +11,7 @@ import pytest
 
 from gibss import localjj, twogroup
 from gibss import twogroup_marginal as TM
-from gibss.distributions import Normal, PointMass
+from gibss.distributions import Normal, NormalMixture, PointMass
 from gibss.engine import fit_ibss
 
 
@@ -82,6 +82,17 @@ def test_marginal_null_calibration(seed):
     maxpip = max(float(np.asarray(e.alpha).max()) for e in st.single_effects)
     assert maxpip < 0.9  # no feature falsely certain
     assert all(len(e.get_cs(0.95)) > 2 for e in st.single_effects)  # CS stays broad
+
+
+def test_marginal_with_normal_mixture_f1():
+    # the f0/f1 seam is general: any distribution with log_likelihood_nm/update_nm
+    # works, not just a single Normal. A NormalMixture f1 still recovers the feature.
+    X, bhat, se = _sim(0)
+    f0 = PointMass()
+    f1 = NormalMixture(weights=np.array([1 / 3, 1 / 3, 1 / 3]), locs=np.zeros(3),
+                       scales=np.array([0.5, 2.0, 4.0]), estimate_weights=True)
+    st = TM.fit(X, bhat, se, f0, f1, L=2, max_iter=40)
+    assert _feat_pip(st, 3) > 0.9
 
 
 def test_marginal_dense_sparse_parity():
