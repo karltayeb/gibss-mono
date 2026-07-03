@@ -292,3 +292,49 @@ def test_engine_smoke_recovers_signal():
     assert int(np.argmax(alpha)) == 7
     # per-feature intercept persisted
     assert np.asarray(state.single_effects[0].b0).shape == (p,)
+
+
+def test_offset_integration_dense_sparse_cheb_agree():
+    # offset integration (o ~ N(mean,var)) matches across dense / sparse-exact /
+    # chebyshev, and differs from the fixed-offset fit. Message init integrates,
+    # mean-message init is fixed.
+    import gibss.chebyshev as cb
+    rng = np.random.default_rng(5)
+    n, p = 250, 12
+    Xd = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.5)
+    off = rng.normal(size=n) * 0.4
+    ov = jnp.asarray(rng.uniform(0.1, 1.0, n))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(off + 1.2 * Xd[:, 3]))), n).astype(float)
+    Xj, yj, oj = jnp.asarray(Xd), jnp.asarray(y), jnp.asarray(off)
+    Xs = sparse.BCOO.fromdense(Xj)
+    b0i, bi = jnp.zeros(p), jnp.zeros(p)
+    dd, ds = lp.prep_data(Xj, yj), lp.prep_data(Xs, yj)
+    ctx = lp._build_sparse_context(Xs)
+
+    md = lp.fit_univariate_profile_regression(dd, oj, b0i, bi, 1.0, 15, "newton", 4, None, ov, "taylor")
+    ms = lp.fit_univariate_profile_regression(ds, oj, b0i, bi, 1.0, 15, "newton", 4, ctx, ov, "taylor")
+    fixed = lp.fit_univariate_profile_regression(dd, oj, b0i, bi, 1.0, 15, "newton", 4)
+    np.testing.assert_allclose(np.asarray(ms[0]), np.asarray(md[0]), atol=1e-10)  # dense==sparse
+    assert np.max(np.abs(np.asarray(md[0]) - np.asarray(fixed[0]))) > 1e-3  # not a no-op
+
+    # chebyshev integrated (panels built from the convolved l_d) matches dense
+    ldf = lp._make_ld(np.asarray(y), np.asarray(off), np.asarray(ov), "taylor")
+    chat, wid = lp._seed_origin_width(np.asarray(y), np.asarray(off), 2.0, np.asarray(ov), "taylor")
+    panels = cb.cheb_init(ldf, chat, wid, 12, 8, seed_points=np.zeros(p))
+    eff, _, _ = lp._fit_profile_ser_cheb(ds, oj, b0i, bi, 1.0, 15, panels, ldf, ctx, 8, "newton", 3, ov, "taylor")
+    np.testing.assert_allclose(np.asarray(eff.mu), np.asarray(md[0]), atol=1e-9)
+
+
+def test_profile_engine_message_type_drives_integration():
+    from gibss.engine import Message, fit_ibss, MeanMessage
+    rng = np.random.default_rng(8)
+    n, p = 500, 30
+    X = rng.normal(size=(n, p))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.4 + 2.0 * X[:, 3] + 1.5 * X[:, 12]))), n).astype(float)
+    data = lp.prep_data(jnp.asarray(X), jnp.asarray(y))
+    integ = fit_ibss(data, lp.initialize_state(data, L=3), lp.default_schedule(), max_iter=25)
+    fixed = fit_ibss(data, lp.initialize_state_mean_message(data, L=3), lp.default_schedule(), max_iter=25)
+    assert isinstance(integ.total_message, Message)
+    assert isinstance(fixed.total_message, MeanMessage)
+    for st in (integ, fixed):
+        assert {3, 12} <= {int(np.argmax(np.asarray(e.alpha))) for e in st.single_effects}

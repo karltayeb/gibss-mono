@@ -42,6 +42,7 @@ from jax.ops import segment_sum
 from .engine import (
     BaseSERState,
     GIBSSState,
+    Message,
     MeanMessage,
     Schedule,
     add_message_index_step,
@@ -58,6 +59,7 @@ from .logistic_quadrature import (
     _logistic_loglik,
     _normal_logpdf,
 )
+from .ser_ops import _smooth_cumulant, _smooth_A_only
 
 ProfileData = LinearData
 
@@ -82,8 +84,9 @@ class ProfileEffect(BaseSERState):
     profile_hessian: np.ndarray  # Schur complement h, per feature
     b0: np.ndarray  # per-feature profiled intercept, persisted across sweeps
 
-    def message(self, data) -> MeanMessage:
-        return MeanMessage(mean=data.X @ (self.alpha * self.mu))
+    # message: inherit BaseSERState.message -> Message(mean, var). The per-row var
+    # feeds the offset-integrated path (integrate over the leave-one-out variance);
+    # a MeanMessage total (initialize_state_mean_message) disables it.
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +95,9 @@ class ProfileFamilyState:
     node_intercept_mode: str = "linear"  # "linear" | "newton"
     n_intercept_newton: int = 3
     estimate_prior_variance: bool = True
+    # offset integration (message type drives it: Message integrates over the
+    # leave-one-out variance, MeanMessage is fixed). "none"|"taylor"|int(gh order).
+    offset_integration: str | int = "taylor"
     sparse_context: Any = None
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
@@ -126,17 +132,17 @@ def _build_sparse_context(X: sparse.BCOO) -> SparseContext:
 # ---------------------------------------------------------------------------
 
 
-def _profile_null_intercept(y, offset, max_iter: int = 50) -> Any:
-    """argmax_{b0} ell(b0, 0) given offset (the profiled null intercept)."""
+def _profile_null_intercept(y, offset, max_iter: int = 50, ov=0.0, oi="none") -> Any:
+    """argmax_{b0} ell(b0, 0) given offset (the profiled null intercept).
+    With `ov` (per-row offset variance) the cumulant is offset-integrated."""
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
 
     def body(state):
         b0, it = state
-        eta = offset + b0
-        prob = jax.nn.sigmoid(eta)
-        grad = jnp.sum(y - prob)
-        hess = jnp.sum(prob * (1.0 - prob))
+        _, s, w = _smooth_cumulant(offset + b0, ov, oi)
+        grad = jnp.sum(y - s)
+        hess = jnp.sum(w)
         step = grad / jnp.maximum(hess, 1e-8)
         return b0 + jnp.clip(step, -4.0, 4.0), it + 1
 
@@ -144,10 +150,12 @@ def _profile_null_intercept(y, offset, max_iter: int = 50) -> Any:
     return b0
 
 
-def _profile_null_loglik(y, offset, max_iter: int = 50) -> Any:
+def _profile_null_loglik(y, offset, max_iter: int = 50, ov=0.0, oi="none") -> Any:
     """max_{b0} ell(b0, 0) given offset -- the offset-shift-covariant null."""
-    b0 = _profile_null_intercept(y, offset, max_iter)
-    return _logistic_loglik(jnp.asarray(offset) + b0, jnp.asarray(y))
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    b0 = _profile_null_intercept(y, offset, max_iter, ov, oi)
+    return jnp.sum(y * (offset + b0) - _smooth_A_only(offset + b0, ov, oi))
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +163,10 @@ def _profile_null_loglik(y, offset, max_iter: int = 50) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _dense_map_2d(x, y, offset, prior_variance, b0_init, b_init, max_iter: int = 50):
-    """Joint MAP (b0, b) via damped 2-D Newton with backtracking."""
+def _dense_map_2d(x, y, offset, prior_variance, b0_init, b_init, max_iter: int = 50,
+                  ov=0.0, oi="none"):
+    """Joint MAP (b0, b) via damped 2-D Newton with backtracking.
+    With `ov` (per-row offset variance) the cumulant is offset-integrated."""
     x = jnp.asarray(x)
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
@@ -164,10 +174,9 @@ def _dense_map_2d(x, y, offset, prior_variance, b0_init, b_init, max_iter: int =
 
     def obj_grad_hess(b0, b):
         eta = offset + b0 + x * b
-        prob = jax.nn.sigmoid(eta)
-        w = prob * (1.0 - prob)
+        A, prob, w = _smooth_cumulant(eta, ov, oi)
         resid = prob - y
-        objective = jnp.sum(jnp.logaddexp(0.0, eta) - y * eta) + 0.5 * prec * b**2
+        objective = jnp.sum(A - y * eta) + 0.5 * prec * b**2
         g0 = jnp.sum(resid)
         g1 = jnp.sum(resid * x) + prec * b
         H00 = jnp.sum(w)
@@ -213,18 +222,20 @@ def _dense_map_2d(x, y, offset, prior_variance, b0_init, b_init, max_iter: int =
     return b0, b, H00, H0b, Hbb
 
 
-def _dense_node_intercepts(x, y, offset, b0_hat, b_hat, H00, H0b, b_k, mode, n_newton):
+def _dense_node_intercepts(x, y, offset, b0_hat, b_hat, H00, H0b, b_k, mode, n_newton,
+                           ov=0.0, oi="none"):
     """Intercept at each grid node b_k (shape (m,))."""
     b0_lin = b0_hat - (H0b / H00) * (b_k - b_hat)
     if mode == "linear":
         return b0_lin
+    ov_c = ov[:, None] if jnp.ndim(ov) else ov
 
     def body(state):
         b0_k, it = state
         eta = offset[:, None] + b0_k[None, :] + x[:, None] * b_k[None, :]
-        prob = jax.nn.sigmoid(eta)
+        _, prob, w = _smooth_cumulant(eta, ov_c, oi)
         grad = jnp.sum(prob - y[:, None], axis=0)
-        hess = jnp.sum(prob * (1.0 - prob), axis=0)
+        hess = jnp.sum(w, axis=0)
         return b0_k - grad / jnp.maximum(hess, 1e-8), it + 1
 
     b0_k, _ = jax.lax.while_loop(lambda s: s[1] < n_newton, body, (b0_lin, 0))
@@ -232,19 +243,21 @@ def _dense_node_intercepts(x, y, offset, b0_hat, b_hat, H00, H0b, b_k, mode, n_n
 
 
 def _dense_feature_1d(
-    x, y, offset, prior_variance, b0_init, b_init, nodes, log_weights, mode, n_newton
+    x, y, offset, prior_variance, b0_init, b_init, nodes, log_weights, mode, n_newton,
+    ov=0.0, oi="none",
 ):
     b0_hat, b_hat, H00, H0b, Hbb = _dense_map_2d(
-        x, y, offset, prior_variance, b0_init, b_init
+        x, y, offset, prior_variance, b0_init, b_init, ov=ov, oi=oi
     )
     h = jnp.maximum(Hbb - H0b * H0b / H00, 1e-8)
     sd = jnp.sqrt(1.0 / h)
     b_k = b_hat + jnp.sqrt(2.0) * sd * nodes
     b0_k = _dense_node_intercepts(
-        x, y, offset, b0_hat, b_hat, H00, H0b, b_k, mode, n_newton
+        x, y, offset, b0_hat, b_hat, H00, H0b, b_k, mode, n_newton, ov, oi
     )
     eta = offset[:, None] + b0_k[None, :] + x[:, None] * b_k[None, :]
-    loglik = jnp.sum(y[:, None] * eta - jnp.logaddexp(0.0, eta), axis=0)
+    ov_c = ov[:, None] if jnp.ndim(ov) else ov
+    loglik = jnp.sum(y[:, None] * eta - _smooth_A_only(eta, ov_c, oi), axis=0)
     log_prior = _normal_logpdf(b_k, prior_variance)
     log_jacobian = jnp.log(jnp.sqrt(2.0) * sd + 1e-30)
     logw = log_weights + nodes**2 + loglik + log_prior + log_jacobian
@@ -256,16 +269,17 @@ def _dense_feature_1d(
     return mu, var, feature_log_evidence, coefficient_kl, b_hat, h, b0_hat
 
 
-@partial(jax.jit, static_argnames=("quadrature_order", "mode", "n_newton"))
+@partial(jax.jit, static_argnames=("quadrature_order", "mode", "n_newton", "oi"))
 def _fit_dense(
-    X, y, offset, b0_init, b_init, prior_variance, quadrature_order, mode, n_newton
+    X, y, offset, b0_init, b_init, prior_variance, quadrature_order, mode, n_newton,
+    ov=0.0, oi="none",
 ):
     nodes_np, log_weights_np = _hermgauss_rule(quadrature_order)
     nodes = jnp.asarray(nodes_np, dtype=jnp.asarray(offset).dtype)
     log_weights = jnp.asarray(log_weights_np, dtype=jnp.asarray(offset).dtype)
     return jax.vmap(
         lambda x, m0, mb: _dense_feature_1d(
-            x, y, offset, prior_variance, m0, mb, nodes, log_weights, mode, n_newton
+            x, y, offset, prior_variance, m0, mb, nodes, log_weights, mode, n_newton, ov, oi
         ),
         in_axes=(1, 0, 0),
     )(X, b0_init, b_init)
@@ -276,33 +290,36 @@ def _fit_dense(
 # ---------------------------------------------------------------------------
 
 
-def _dense_intercept_loglik(y, offset, c):
-    """l_d(c) = sum_i [y_i (o_i + c) - logaddexp(0, o_i + c)], broadcast over c."""
-    eta = offset.reshape((-1,) + (1,) * jnp.ndim(c)) + c
-    yb = y.reshape((-1,) + (1,) * jnp.ndim(c))
-    return jnp.sum(yb * eta - jnp.logaddexp(0.0, eta), axis=0)
+def _dense_intercept_loglik(y, offset, c, ov=0.0, oi="none"):
+    """l_d(c) = sum_i [y_i (o_i + c) - A~(o_i + c)], broadcast over c."""
+    lead = (-1,) + (1,) * jnp.ndim(c)
+    eta = offset.reshape(lead) + c
+    yb = y.reshape(lead)
+    ovc = ov.reshape(lead) if jnp.ndim(ov) else ov
+    return jnp.sum(yb * eta - _smooth_A_only(eta, ovc, oi), axis=0)
 
 
 def _sparse_map_2d(
-    rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p, max_iter: int = 50
+    rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p, max_iter: int = 50,
+    ov=0.0, oi="none",
 ):
     prec = 1.0 / prior_variance
     y_r = y[rows]
     o_r = offset[rows]
+    ovr = ov[rows] if jnp.ndim(ov) else ov  # support offset var
+    ovb = ov[:, None] if jnp.ndim(ov) else ov  # background (n,p)
 
     def grad_hess(b0, b):
         # background over all rows (l_d), per feature -- naive O(n*p)
         eta_bg = offset[:, None] + b0[None, :]
-        prob_bg = jax.nn.sigmoid(eta_bg)
+        _, prob_bg, H00_bg_w = _smooth_cumulant(eta_bg, ovb, oi)
         g0_bg = jnp.sum(prob_bg - y[:, None], axis=0)
-        H00_bg = jnp.sum(prob_bg * (1.0 - prob_bg), axis=0)
+        H00_bg = jnp.sum(H00_bg_w, axis=0)
         # support perturbation (l_s)
         eta = o_r + b0[cols] + vals * b[cols]
         eta0 = o_r + b0[cols]
-        prob = jax.nn.sigmoid(eta)
-        prob0 = jax.nn.sigmoid(eta0)
-        w = prob * (1.0 - prob)
-        w0 = prob0 * (1.0 - prob0)
+        _, prob, w = _smooth_cumulant(eta, ovr, oi)
+        _, prob0, w0 = _smooth_cumulant(eta0, ovr, oi)
         g0 = g0_bg + segment_sum(prob - prob0, cols, num_segments=p)
         g1 = segment_sum(vals * (prob - y_r), cols, num_segments=p) + prec * b
         H00 = H00_bg + segment_sum(w - w0, cols, num_segments=p)
@@ -333,51 +350,44 @@ def _sparse_map_2d(
 
 def _sparse_feature(
     rows, cols, vals, y, offset, prior_variance, b0_init, b_init,
-    nodes, log_weights, mode, n_newton, p,
+    nodes, log_weights, mode, n_newton, p, ov=0.0, oi="none",
 ):
     b0_hat, b_hat, H00, H0b, Hbb = _sparse_map_2d(
-        rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p
+        rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p, ov=ov, oi=oi
     )
     h = jnp.maximum(Hbb - H0b * H0b / H00, 1e-8)
     sd = jnp.sqrt(1.0 / h)
     b_k = b_hat[:, None] + jnp.sqrt(2.0) * sd[:, None] * nodes[None, :]  # (p, m)
     b0_k = b0_hat[:, None] - (H0b / H00)[:, None] * (b_k - b_hat[:, None])
+    ov_bg3 = ov[:, None, None] if jnp.ndim(ov) else ov
+    ovr1 = ov[rows][:, None] if jnp.ndim(ov) else ov
 
     if mode == "newton":
         def nbody(state):
             b0g, it = state
-            grad_bg = jnp.sum(
-                jax.nn.sigmoid(offset[:, None, None] + b0g[None, :, :])
-                - y[:, None, None],
-                axis=0,
-            )
-            hess_bg = jnp.sum(
-                (lambda s: s * (1.0 - s))(
-                    jax.nn.sigmoid(offset[:, None, None] + b0g[None, :, :])
-                ),
-                axis=0,
-            )
+            eta_bg = offset[:, None, None] + b0g[None, :, :]
+            _, s_bg, w_bg = _smooth_cumulant(eta_bg, ov_bg3, oi)
+            grad_bg = jnp.sum(s_bg - y[:, None, None], axis=0)
+            hess_bg = jnp.sum(w_bg, axis=0)
             eta = o_r3(offset, rows) + b0g[cols] + vals[:, None] * b_k[cols]
             eta0 = o_r3(offset, rows) + b0g[cols]
-            prob = jax.nn.sigmoid(eta)
-            prob0 = jax.nn.sigmoid(eta0)
+            _, prob, wsup = _smooth_cumulant(eta, ovr1, oi)
+            _, prob0, wsup0 = _smooth_cumulant(eta0, ovr1, oi)
             grad = grad_bg + segment_sum(prob - prob0, cols, num_segments=p)
-            hess = hess_bg + segment_sum(
-                prob * (1.0 - prob) - prob0 * (1.0 - prob0), cols, num_segments=p
-            )
+            hess = hess_bg + segment_sum(wsup - wsup0, cols, num_segments=p)
             return b0g - grad / jnp.maximum(hess, 1e-8), it + 1
 
         b0_k, _ = jax.lax.while_loop(lambda s: s[1] < n_newton, nbody, (b0_k, 0))
 
-    l_d = _dense_intercept_loglik(y, offset, b0_k)  # (p, m)
+    l_d = _dense_intercept_loglik(y, offset, b0_k, ov, oi)  # (p, m)
     c_nz = b0_k[cols]  # (nnz, m)
     b_nz = b_k[cols]
     o_nz = offset[rows][:, None]
     y_nz = y[rows][:, None]
     eta = o_nz + c_nz + vals[:, None] * b_nz
     eta0 = o_nz + c_nz
-    s = (y_nz * eta - jnp.logaddexp(0.0, eta)) - (
-        y_nz * eta0 - jnp.logaddexp(0.0, eta0)
+    s = (y_nz * eta - _smooth_A_only(eta, ovr1, oi)) - (
+        y_nz * eta0 - _smooth_A_only(eta0, ovr1, oi)
     )
     l_s = segment_sum(s, cols, num_segments=p)  # (p, m)
     loglik = l_d + l_s
@@ -400,16 +410,17 @@ def o_r3(offset, rows):
     return offset[rows][:, None]
 
 
-@partial(jax.jit, static_argnames=("quadrature_order", "mode", "n_newton", "p"))
+@partial(jax.jit, static_argnames=("quadrature_order", "mode", "n_newton", "p", "oi"))
 def _fit_sparse(
-    ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order, mode, n_newton, p
+    ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order, mode, n_newton, p,
+    ov=0.0, oi="none",
 ):
     nodes_np, log_weights_np = _hermgauss_rule(quadrature_order)
     nodes = jnp.asarray(nodes_np, dtype=jnp.asarray(offset).dtype)
     log_weights = jnp.asarray(log_weights_np, dtype=jnp.asarray(offset).dtype)
     return _sparse_feature(
         ctx.rows, ctx.cols, ctx.vals, y, offset, prior_variance, b0_init, b_init,
-        nodes, log_weights, mode, n_newton, p,
+        nodes, log_weights, mode, n_newton, p, ov, oi,
     )
 
 
@@ -418,49 +429,73 @@ def _fit_sparse(
 # ---------------------------------------------------------------------------
 
 
-def _make_ld(y, offset):
-    """Host callable l_d(c) = sum_i [y_i(o_i+c) - log(1+e^{o_i+c})], vectorized over c."""
+def _np_smooth_A(eta, ov, oi):
+    """numpy offset-convolved cumulant A~ (for the host l_d surrogate). eta any shape,
+    ov broadcastable. oi: "none" | "taylor" | int (Gauss-Hermite order)."""
+    A = np.logaddexp(0.0, eta)
+    if oi == "none":
+        return A
+    if oi == "taylor":
+        p = 1.0 / (1.0 + np.exp(-eta))
+        return A + 0.5 * (p * (1.0 - p)) * ov
+    k = int(oi)  # gh order-k
+    nodes, wts = np.polynomial.hermite.hermgauss(k)
+    wts = wts / np.sqrt(np.pi)
+    sd = np.sqrt(2.0 * np.maximum(ov, 0.0))
+    out = np.zeros_like(A)
+    for z, wg in zip(nodes, wts):
+        out = out + wg * np.logaddexp(0.0, eta + sd * z)
+    return out
+
+
+def _make_ld(y, offset, ov=0.0, oi="none"):
+    """Host callable l_d(c) = sum_i [y_i(o_i+c) - A~(o_i+c, ov_i)], vectorized over c.
+    A~ is the offset-integrated cumulant, so the panel derivatives (cheb_grad/hess)
+    are the convolved null grad/curvature -- the whole cheb background integrates the
+    random offset with no other change."""
     y = np.asarray(y, dtype=float)
     offset = np.asarray(offset, dtype=float)
+    ovn = np.asarray(ov, dtype=float)
 
     def f(c):
         c = np.atleast_1d(np.asarray(c, dtype=float))
         eta = offset[:, None] + c[None, :]
-        return np.sum(y[:, None] * eta - np.logaddexp(0.0, eta), axis=0)
+        ovc = ovn[:, None] if np.ndim(ovn) else ovn
+        return np.sum(y[:, None] * eta - _np_smooth_A(eta, ovc, oi), axis=0)
 
     return f
 
 
-def _seed_origin_width(y, offset, panel_width):
+def _seed_origin_width(y, offset, panel_width, ov=0.0, oi="none"):
     """Lattice origin (null intercept) and panel width (in null-SE units)."""
     y = np.asarray(y, dtype=float)
     offset = np.asarray(offset, dtype=float)
-    c_hat = float(_profile_null_intercept(jnp.asarray(y), jnp.asarray(offset)))
-    s = 1.0 / (1.0 + np.exp(-(offset + c_hat)))
-    info = float(np.sum(s * (1.0 - s)))  # = -l_d''(c_hat)
+    ov_j = 0.0 if oi == "none" else jnp.asarray(ov)
+    c_hat = float(_profile_null_intercept(jnp.asarray(y), jnp.asarray(offset), ov=ov_j, oi=oi))
+    _, _, w = _smooth_cumulant(jnp.asarray(offset) + c_hat, ov_j, oi)
+    info = float(jnp.sum(w))  # = -l_d''(c_hat), offset-integrated
     width = float(panel_width) / np.sqrt(max(info, 1e-8))
     return c_hat, width
 
 
 def _sparse_map_2d_cheb(
     rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p, panels,
-    max_iter: int = 50,
+    max_iter: int = 50, ov=0.0, oi="none",
 ):
     prec = 1.0 / prior_variance
     y_r = y[rows]
     o_r = offset[rows]
+    ovr = ov[rows] if jnp.ndim(ov) else ov
     lo, hi = cb._band(panels)
 
     def grad_hess(b0, b):
         b0 = jnp.clip(b0, lo, hi)
-        g0_bg = -cb.cheb_grad(panels, b0)  # sum(sigmoid - y) over all rows
-        H00_bg = -cb.cheb_hess(panels, b0)  # sum w over all rows
+        g0_bg = -cb.cheb_grad(panels, b0)  # sum(s~ - y) over all rows (panels convolved)
+        H00_bg = -cb.cheb_hess(panels, b0)  # sum w~ over all rows
         eta = o_r + b0[cols] + vals * b[cols]
         eta0 = o_r + b0[cols]
-        prob = jax.nn.sigmoid(eta)
-        prob0 = jax.nn.sigmoid(eta0)
-        w = prob * (1.0 - prob)
-        w0 = prob0 * (1.0 - prob0)
+        _, prob, w = _smooth_cumulant(eta, ovr, oi)
+        _, prob0, w0 = _smooth_cumulant(eta0, ovr, oi)
         g0 = g0_bg + segment_sum(prob - prob0, cols, num_segments=p)
         g1 = segment_sum(vals * (prob - y_r), cols, num_segments=p) + prec * b
         H00 = H00_bg + segment_sum(w - w0, cols, num_segments=p)
@@ -489,11 +524,12 @@ def _sparse_map_2d_cheb(
 
 def _sparse_feature_cheb(
     rows, cols, vals, y, offset, prior_variance, b0_init, b_init,
-    nodes, log_weights, panels, mode, n_newton, p,
+    nodes, log_weights, panels, mode, n_newton, p, ov=0.0, oi="none",
 ):
     b0_hat, b_hat, H00, H0b, Hbb = _sparse_map_2d_cheb(
-        rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p, panels
+        rows, cols, vals, y, offset, prior_variance, b0_init, b_init, p, panels, ov=ov, oi=oi
     )
+    ovr1 = ov[rows][:, None] if jnp.ndim(ov) else ov
     h = jnp.maximum(Hbb - H0b * H0b / H00, 1e-8)
     sd = jnp.sqrt(1.0 / h)
     b_k = b_hat[:, None] + jnp.sqrt(2.0) * sd[:, None] * nodes[None, :]  # (p, m)
@@ -520,12 +556,10 @@ def _sparse_feature_cheb(
             c_nz = b0c[cols]
             eta = o_r[:, None] + c_nz + vals[:, None] * b_nz
             eta0 = o_r[:, None] + c_nz
-            prob = jax.nn.sigmoid(eta)
-            prob0 = jax.nn.sigmoid(eta0)
+            _, prob, wsup = _smooth_cumulant(eta, ovr1, oi)
+            _, prob0, wsup0 = _smooth_cumulant(eta0, ovr1, oi)
             grad = g_bg + segment_sum(prob0 - prob, cols, num_segments=p)
-            curv = h_bg + segment_sum(
-                prob * (1.0 - prob) - prob0 * (1.0 - prob0), cols, num_segments=p
-            )
+            curv = h_bg + segment_sum(wsup - wsup0, cols, num_segments=p)
             step = grad / jnp.maximum(curv, 1e-8)
             return jnp.clip(b0g + step, lo, hi), it + 1
 
@@ -542,8 +576,8 @@ def _sparse_feature_cheb(
     y_nz = y[rows][:, None]
     eta = o_nz + c_nz + vals[:, None] * b_nz
     eta0 = o_nz + c_nz
-    s = (y_nz * eta - jnp.logaddexp(0.0, eta)) - (
-        y_nz * eta0 - jnp.logaddexp(0.0, eta0)
+    s = (y_nz * eta - _smooth_A_only(eta, ovr1, oi)) - (
+        y_nz * eta0 - _smooth_A_only(eta0, ovr1, oi)
     )
     l_s = segment_sum(s, cols, num_segments=p)  # (p, m)
     loglik = l_d + l_s
@@ -562,17 +596,17 @@ def _sparse_feature_cheb(
             grid_min, grid_max)
 
 
-@partial(jax.jit, static_argnames=("quadrature_order", "mode", "n_newton", "p"))
+@partial(jax.jit, static_argnames=("quadrature_order", "mode", "n_newton", "p", "oi"))
 def _fit_sparse_cheb(
     ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order,
-    panels, mode, n_newton, p,
+    panels, mode, n_newton, p, ov=0.0, oi="none",
 ):
     nodes_np, log_weights_np = _hermgauss_rule(quadrature_order)
     nodes = jnp.asarray(nodes_np, dtype=jnp.asarray(offset).dtype)
     log_weights = jnp.asarray(log_weights_np, dtype=jnp.asarray(offset).dtype)
     return _sparse_feature_cheb(
         ctx.rows, ctx.cols, ctx.vals, y, offset, prior_variance, b0_init, b_init,
-        nodes, log_weights, panels, mode, n_newton, p,
+        nodes, log_weights, panels, mode, n_newton, p, ov, oi,
     )
 
 
@@ -580,20 +614,25 @@ def _fit_profile_ser_cheb(
     data, offset, b0_init, b_init, prior_variance, quadrature_order,
     panels, ld_fn, sparse_context, max_panels,
     node_intercept_mode="linear", n_intercept_newton=3,
+    offset_var=None, offset_integration="none",
 ):
-    """Chebyshev-surrogate SER update with the miss/ensure loop. Returns (effect, panels)."""
+    """Chebyshev-surrogate SER update with the miss/ensure loop. Returns (effect, panels).
+    `ld_fn`/`panels` must already be built with the matching offset integration (the
+    convolved l_d), so only the sparse support terms take ov/oi here."""
     ctx = sparse_context if sparse_context is not None else _build_sparse_context(data.X)
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     b0_init = jnp.asarray(b0_init)
     b_init = jnp.asarray(b_init)
     p = data.X.shape[1]
+    oi = "none" if offset_var is None else offset_integration
+    ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
 
     n_build = 0
     for _ in range(max_panels + 1):
         out = _fit_sparse_cheb(
             ctx, y, offset, b0_init, b_init, prior_variance, quadrature_order,
-            panels, node_intercept_mode, n_intercept_newton, p,
+            panels, node_intercept_mode, n_intercept_newton, p, ov, oi,
         )
         grid_min = float(out[7])
         grid_max = float(out[8])
@@ -615,7 +654,7 @@ def _fit_profile_ser_cheb(
     log_pi = -jnp.log(float(pcount))
     kl_cat = float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi)))
     kl = kl_cat + float(jnp.sum(alpha * coefficient_kl))
-    null_ll = float(_profile_null_loglik(y, offset))
+    null_ll = float(_profile_null_loglik(y, offset, ov=ov, oi=oi))
     effect = ProfileEffect(
         mu=mu,
         var=var,
@@ -634,6 +673,14 @@ def _fit_profile_ser_cheb(
     return effect, panels, n_build
 
 
+def _offset_integration(state):
+    """(offset_var, method) from the total message type: MeanMessage -> no integration."""
+    tm = state.total_message
+    if isinstance(tm, MeanMessage):
+        return None, "none"
+    return np.asarray(tm.var), state.family_state.offset_integration
+
+
 def seed_surrogate_index_step(data, l, state):
     """Build the panel surrogate for the effect about to be updated (cheb mode)."""
     fs = state.family_state
@@ -641,8 +688,10 @@ def seed_surrogate_index_step(data, l, state):
         return state
     offset = np.asarray(state.total_message.mean)
     y = np.asarray(data.y)
-    ld_fn = _make_ld(y, offset)
-    c_hat, width = _seed_origin_width(y, offset, fs.cheb_panel_width)
+    ov, oi = _offset_integration(state)
+    ld_fn = _make_ld(y, offset, 0.0 if ov is None else ov, oi)  # convolved l_d
+    c_hat, width = _seed_origin_width(y, offset, fs.cheb_panel_width,
+                                      0.0 if ov is None else ov, oi)
     prior_b0 = np.asarray(state.single_effects[l].b0)
     panels = cb.cheb_init(
         ld_fn, c_hat, width, fs.cheb_degree, fs.cheb_max_panels, seed_points=prior_b0
@@ -665,25 +714,30 @@ def fit_univariate_profile_regression(
     node_intercept_mode: str = "linear",
     n_intercept_newton: int = 3,
     sparse_context: SparseContext | None = None,
+    offset_var: np.ndarray | None = None,
+    offset_integration="none",
 ):
     """Per-feature intercept-profiled quadrature update.
 
     Returns ``(mu, var, feature_log_evidence, coefficient_kl, mode, h, b0)``.
+    With ``offset_var`` the per-feature cumulant is offset-integrated.
     """
     X = data.X
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     b0_init = jnp.asarray(b0_init)
     b_init = jnp.asarray(b_init)
+    oi = "none" if offset_var is None else offset_integration
+    ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
     if _is_bcoo(X):
         ctx = sparse_context if sparse_context is not None else _build_sparse_context(X)
         return _fit_sparse(
             ctx, y, offset, b0_init, b_init, prior_variance,
-            quadrature_order, node_intercept_mode, n_intercept_newton, X.shape[1],
+            quadrature_order, node_intercept_mode, n_intercept_newton, X.shape[1], ov, oi,
         )
     return _fit_dense(
         X, y, offset, b0_init, b_init, prior_variance,
-        quadrature_order, node_intercept_mode, n_intercept_newton,
+        quadrature_order, node_intercept_mode, n_intercept_newton, ov, oi,
     )
 
 
@@ -697,11 +751,14 @@ def fit_profile_ser(
     node_intercept_mode: str = "linear",
     n_intercept_newton: int = 3,
     sparse_context: SparseContext | None = None,
+    offset_var: np.ndarray | None = None,
+    offset_integration="none",
 ) -> ProfileEffect:
     mu, var, feature_log_evidence, coefficient_kl, mode, h, b0 = (
         fit_univariate_profile_regression(
             data, offset, b0_init, b_init, prior_variance,
             quadrature_order, node_intercept_mode, n_intercept_newton, sparse_context,
+            offset_var, offset_integration,
         )
     )
     p = data.X.shape[1]
@@ -712,7 +769,9 @@ def fit_profile_ser(
     log_pi = -jnp.log(float(p))
     kl_cat = float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi)))
     kl = kl_cat + float(jnp.sum(alpha * coefficient_kl))
-    null_ll = float(_profile_null_loglik(jnp.asarray(data.y), offset))
+    _oi = "none" if offset_var is None else offset_integration
+    _ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
+    null_ll = float(_profile_null_loglik(jnp.asarray(data.y), offset, ov=_ov, oi=_oi))
     return ProfileEffect(
         mu=mu,
         var=var,
@@ -746,7 +805,10 @@ def initialize_state(
     kwargs["sparse_context"] = _build_sparse_context(X) if _is_bcoo(X) else None
     family_state = ProfileFamilyState(**kwargs)
     n = X.shape[0]
-    zero_message = MeanMessage(jnp.zeros(n))
+    # Message carries per-row var -> offset integration (integrate over the
+    # leave-one-out variance). initialize_state_mean_message uses a MeanMessage to
+    # get the classic fixed-offset profile.
+    zero_message = Message(jnp.zeros(n), jnp.zeros(n))
     # Seed every feature's intercept at the shared profiled null intercept
     # (offset = zero initial message); warm starts take over from sweep 2.
     b0_null = float(_profile_null_intercept(jnp.asarray(data.y), jnp.zeros(n)))
@@ -772,16 +834,32 @@ def initialize_state(
     )
 
 
+def initialize_state_mean_message(
+    data: ProfileData,
+    L: int = 1,
+    quadrature_order: int = 15,
+    family_state_kwargs: dict | None = None,
+) -> GIBSSState[ProfileFamilyState, MeanMessage]:
+    """Fixed-offset profile: a MeanMessage carries no variance, so the per-feature
+    cumulant conditions on the offset mean (classic profiled quadrature)."""
+    state = initialize_state(data, L, quadrature_order, family_state_kwargs)
+    n = data.X.shape[0]
+    return replace(state, total_message=MeanMessage(jnp.zeros(n)))
+
+
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
     fs = state.family_state
     offset = state.total_message.mean  # no shared intercept -- profiled per feature
+    ov, oi = _offset_integration(state)  # leave-one-out var here (post-subtract)
     if getattr(fs, "background_mode", "exact") == "chebyshev" and _is_bcoo(data.X):
-        ld_fn = _make_ld(np.asarray(data.y), np.asarray(offset))
+        ld_fn = _make_ld(np.asarray(data.y), np.asarray(offset),
+                         0.0 if ov is None else ov, oi)
         new_effect, panels, n_build = _fit_profile_ser_cheb(
             data, offset, effect.b0, effect.mu, effect.prior_variance,
             fs.quadrature_order, fs.surrogate, ld_fn, fs.sparse_context,
             fs.cheb_max_panels, fs.cheb_node_intercept_mode, fs.n_intercept_newton,
+            offset_var=ov, offset_integration=oi,
         )
         diag = dict(fs.cheb_diagnostics)
         diag["panels_built"] = diag.get("panels_built", 0) + n_build
@@ -797,6 +875,8 @@ def update_effect_index_step(data, l, state):
         fs.node_intercept_mode,
         fs.n_intercept_newton,
         fs.sparse_context,
+        offset_var=ov,
+        offset_integration=oi,
     )
     return replace_effect_in_gibss_state(state, l, new_effect)
 
@@ -817,7 +897,12 @@ def to_numpy_state(state):
         )
         for e in state.single_effects
     ]
-    total_message = MeanMessage(np.asarray(state.total_message.mean))
+    tm = state.total_message
+    total_message = (
+        MeanMessage(np.asarray(tm.mean))
+        if isinstance(tm, MeanMessage)
+        else Message(np.asarray(tm.mean), np.asarray(tm.var))
+    )
     return replace(state, single_effects=single_effects, total_message=total_message)
 
 
