@@ -67,8 +67,9 @@ def test_recenter_updates_offsets_base_shared():
 
 
 @pytest.mark.parametrize("kind", ["dense", "bcoo"])
-def test_centered_operator_subsumes_cbar_arg(kind):
-    # global_gaussian_ser(CenteredOperator(base, c), ...) == ...(base, ..., cbar=c)
+def test_centered_operator_matches_manual_centering(kind):
+    # global_gaussian_ser(CenteredOperator(base, c), ...) == the same on a manually
+    # centered dense X -- the operator carries the centering (no cbar arg anymore).
     rng = np.random.default_rng(3)
     n, p = 45, 11
     Xd = rng.normal(size=(n, p)) + 0.5
@@ -78,7 +79,7 @@ def test_centered_operator_subsumes_cbar_arg(kind):
     pv = 1.3
     base = _bases(Xd)[kind]
     a = global_gaussian_ser(CenteredOperator.from_offsets(base, c), tau, r, pv)
-    b = global_gaussian_ser(base, tau, r, pv, cbar=c)
+    b = global_gaussian_ser(DenseOperator(jnp.asarray(np.asarray(Xd) - np.asarray(c))), tau, r, pv)
     for x, y in zip(a, b):
         np.testing.assert_allclose(x, y, atol=1e-10)
 

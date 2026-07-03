@@ -88,15 +88,14 @@ def _weighted_colmeans(X, tau):
     return S1 / W, W
 
 
-def _fit_univariate_global_jj_regression(op, y, xi, offset, prior_variance, cbar):
-    """Uncentered (or pre-centered) global-JJ SER via the design operator.
+def _fit_univariate_global_jj_regression(op, y, xi, offset, prior_variance):
+    """Uncentered / (pre- or weighted-)centered global-JJ SER via the design operator.
 
     Covers dense and BCOO (and low-rank) in one path -- curvature moment(2, tau),
-    gradient rmatvec(r) -- with optional fixed pre-centering `cbar`.
-    """
+    gradient rmatvec(r). Centering is carried by `op` (a CenteredOperator)."""
     tau = 2.0 * _lambda_xi(xi)
     r = y - 0.5 - tau * offset
-    mu, var, gaussian_kl_bf = global_gaussian_ser(op, tau, r, prior_variance, cbar=cbar)
+    mu, var, gaussian_kl_bf = global_gaussian_ser(op, tau, r, prior_variance)
     null_ll = _jj_bound_null_log_likelihood(y, offset, xi)
     return mu, var, null_ll + gaussian_kl_bf
 
@@ -189,16 +188,14 @@ def fit_global_jj_ser(
     X_sq = data.X_sq
     p = X.shape[1]
 
-    op = as_operator(X)
     if center:
         # weighted centering = a CenteredOperator at the tau-weighted mean `cbar`
-        # (already recomputed per xi in update_xi_step); pre-centering is off here.
-        op = CenteredOperator.from_offsets(op, cbar)
-        cc = None
+        # (recomputed per xi in update_xi_step).
+        op = CenteredOperator.from_offsets(as_operator(X), cbar)
     else:
-        cc = getattr(data, "column_center", None)
+        op = data.op  # raw, or CenteredOperator when pre-centered (column_center)
     mu, var, feature_log_evidence = _fit_univariate_global_jj_regression(
-        op, y, xi, offset, prior_variance, cc
+        op, y, xi, offset, prior_variance
     )
 
     alpha, marginal_log_likelihood, kl = _fit_global_jj_ser_stats(

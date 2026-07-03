@@ -75,8 +75,9 @@ def test_global_ser_precentering_matches_manual(kind):
     pv = 1.0
     tau = jnp.asarray(np.abs(rng.normal(size=n)) + 0.5)
     cbar = jnp.asarray(np.asarray(Xd).mean(0))
-    op = _ops(Xd)[kind]
-    mu, var, _ = global_gaussian_ser(op, tau, tau * (y - offset), pv, cbar=cbar)
+    from gibss.operators import CenteredOperator
+    op = CenteredOperator.from_offsets(_ops(Xd)[kind], cbar)  # centering via the operator
+    mu, var, _ = global_gaussian_ser(op, tau, tau * (y - offset), pv)
 
     # manual: fit on the explicitly centered design
     Xc = np.asarray(Xd) - np.asarray(cbar)

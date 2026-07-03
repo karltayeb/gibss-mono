@@ -143,12 +143,9 @@ def fit_univariate_linear_regression(data, tau, offset, prior_variance):
     y = data.y
     tau = jnp.asarray(tau)
     offset = jnp.asarray(offset)
-    # One operator-native reduction covers dense/BCOO and (implicit) pre-centering.
-    op = as_operator(data.X)
+    # data.op carries layout AND pre-centering (CenteredOperator when column_center).
     r = tau * (y - offset)
-    mu, var, log_bf = global_gaussian_ser(
-        op, tau, r, prior_variance, cbar=getattr(data, "column_center", None)
-    )
+    mu, var, log_bf = global_gaussian_ser(data.op, tau, r, prior_variance)
     null_ll = linear_null_log_likelihood(data, tau, offset)
     return mu, var, null_ll + log_bf
 

@@ -125,22 +125,15 @@ def global_gaussian_ser(
     tau: Any,
     r: Any,
     prior_variance: Any,
-    cbar: Any = None,
 ) -> tuple[Any, Any, Any]:
     """Global (shared-weight) Gaussian SER: per-feature (mu, var, log_bf).
 
-    curvature  x2_j = sum_i tau_i (x_ij - c_j)^2   (c fixed => pre-centering)
-    gradient   num_j = sum_i (x_ij - c_j) r_i
-    """
-    S2 = op.moment(2, tau)
+    curvature  x2_j = moment(2, tau)_j = sum_i tau_i x_ij^2
+    gradient   num_j = rmatvec(r)_j    = sum_i x_ij r_i
+    Centering (pre or weighted) is carried by the operator: pass a CenteredOperator
+    and moment(2)/rmatvec already include the rank-1 correction."""
+    x2 = op.moment(2, tau)
     num = op.rmatvec(r)
-    if cbar is not None:
-        S1 = op.moment(1, tau)
-        W = jnp.sum(tau)
-        x2 = S2 - 2.0 * cbar * S1 + cbar**2 * W
-        num = num - jnp.sum(r) * cbar
-    else:
-        x2 = S2
     inv_pv = 1.0 / prior_variance
     var = 1.0 / (inv_pv + x2)
     mu = var * num
