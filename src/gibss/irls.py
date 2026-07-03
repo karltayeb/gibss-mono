@@ -27,12 +27,13 @@ import numpy as np
 
 from . import linear
 from .operators import as_operator, CenteredOperator
-from .ser_ops import global_gaussian_ser
+from .ser_ops import global_gaussian_ser, _smooth_cumulant
 from .logistic_quadrature import _profiled_logistic_null
 from .engine import (
     BaseSERState,
     GIBSSState,
     Message,
+    MeanMessage,
     Schedule,
     add_message_index_step,
     compute_total_skl,
@@ -63,13 +64,21 @@ class Logistic:
 
     eps: float = 1e-6
 
-    def mean_and_weight(self, eta: Any) -> tuple[Any, Any]:
-        mu = jnp.clip(jax.nn.sigmoid(eta), self.eps, 1.0 - self.eps)
-        w = jnp.maximum(mu * (1.0 - mu), self.eps)  # mu'^2/V = mu' for canonical logit
+    def mean_and_weight(self, eta: Any, ov=0.0, offset_integration="none") -> tuple[Any, Any]:
+        # With `ov` (per-row predictor variance) the working mean/weight are the
+        # offset-integrated s~ = E[sigmoid], w~ = E[w] -- the global-Taylor random-
+        # offset analog of globaljj's xi (see _smooth_cumulant). ov=0 -> classic.
+        if offset_integration == "none":
+            s = jax.nn.sigmoid(eta)
+            wt = s * (1.0 - s)
+        else:
+            _, s, wt = _smooth_cumulant(eta, ov, offset_integration)
+        mu = jnp.clip(s, self.eps, 1.0 - self.eps)
+        w = jnp.maximum(wt, self.eps)  # mu'^2/V = mu' for canonical logit
         return mu, w
 
-    def working(self, eta: Any, y: Any) -> tuple[Any, Any]:
-        mu, w = self.mean_and_weight(eta)
+    def working(self, eta: Any, y: Any, ov=0.0, offset_integration="none") -> tuple[Any, Any]:
+        mu, w = self.mean_and_weight(eta, ov, offset_integration)
         z = eta + (y - mu) / w
         return z, w
 
@@ -86,6 +95,10 @@ class IRLSFamilyState:
     intercept: float = 0.0
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
+    # offset integration: convolve the working weight/mean over the predictor
+    # variance (message type drives it -- Message integrates, MeanMessage doesn't).
+    #   "none" | "taylor" (default, free) | int k (Gauss-Hermite order-k)
+    offset_integration: str | int = "taylor"
     # Weighted column centering: orthogonalize the intercept and each feature
     # under the working weights (implicit, sparsity-preserving).
     center: bool = True
@@ -111,9 +124,17 @@ class IRLSCenteredEffect(BaseSERState):
     def message(self, data) -> Message:
         coef = self.alpha * self.mu
         mean = data.X @ coef - jnp.sum(coef * self.cbar)
-        # var is unused in the IRLS schedule; uncentered second moment is fine.
+        # centered per-row var of the contribution sum_j coef_j (x_ij - cbar_j).
+        # Must be the CENTERED second moment (not X_sq @ coef2): it now drives
+        # offset integration, and the uncentered form differs between pre-centered
+        # (dense) and raw+cbar (sparse) representations of the same fit.
         coef2 = self.alpha * (self.mu**2 + self.var)
-        var = jnp.maximum(data.X_sq @ coef2 - jnp.square(data.X @ coef), 0.0)
+        second = (
+            data.X_sq @ coef2
+            - 2.0 * (data.X @ (coef2 * self.cbar))
+            + jnp.sum(coef2 * self.cbar**2)
+        )
+        var = jnp.maximum(second - jnp.square(mean), 0.0)
         return Message(mean=mean, var=var)
 
 
@@ -208,11 +229,23 @@ def update_centering_step(data, state):
 # ---------------------------------------------------------------------------
 
 
+def _offset_integration(state):
+    """(ov, method) from the total message type: MeanMessage -> no integration."""
+    tm = state.total_message
+    if isinstance(tm, MeanMessage):
+        return 0.0, "none"
+    return jnp.asarray(tm.var), state.family_state.offset_integration
+
+
 def update_working_data_step(data, state):
-    """Linearize the GLM at the current eta -> working response + weights."""
+    """Linearize the GLM at the current eta -> working response + weights.
+
+    Under a Message total, the working weight/mean are offset-integrated over the
+    predictor variance (global-Taylor random offset); MeanMessage -> fixed."""
     fs = state.family_state
     eta = jnp.asarray(fs.glm_offset) + fs.intercept + jnp.asarray(state.total_message.mean)
-    z, w = fs.glm.working(eta, jnp.asarray(data.y))
+    ov, oi = _offset_integration(state)
+    z, w = fs.glm.working(eta, jnp.asarray(data.y), ov, oi)
     y_work = z - jnp.asarray(fs.glm_offset)  # linear model fits intercept + effects to this
     v_work = 1.0 / w
     return replace(state, family_state=replace(fs, y_work=y_work, v_work=v_work))
@@ -229,7 +262,8 @@ def update_intercept_step(data, state):
     if not fs.estimate_intercept:
         return state
     eta = jnp.asarray(fs.glm_offset) + fs.intercept + jnp.asarray(state.total_message.mean)
-    mu, w = fs.glm.mean_and_weight(eta)
+    ov, oi = _offset_integration(state)
+    mu, w = fs.glm.mean_and_weight(eta, ov, oi)
     score = jnp.sum(jnp.asarray(data.y) - mu)
     curv = jnp.maximum(jnp.sum(w), 1e-8)
     return replace(state, family_state=replace(fs, intercept=fs.intercept + float(score / curv)))
@@ -251,15 +285,18 @@ def update_effect_index_step(data, l, state):
     # in the BF, but as a standalone null it isn't the GLM null). Re-base the per-
     # feature Laplace log_bf onto the EXACT profiled logistic null at the GLM
     # leave-one-out predictor. BF is unchanged.
-    new_effect = _relogistic_null(new_effect, data, fs, state.total_message.mean)
+    ov, oi = _offset_integration(state)  # leave-one-out var here (post-subtract)
+    new_effect = _relogistic_null(new_effect, data, fs, state.total_message.mean, ov, oi)
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
-def _relogistic_null(effect, data, fs, message_mean):
+def _relogistic_null(effect, data, fs, message_mean, offset_var=0.0, offset_integration="none"):
     p = np.asarray(effect.mu).shape[0]
     log_bf = np.asarray(effect.feature_log_evidence) - float(effect.null_log_likelihood)
     glm_eta = jnp.asarray(fs.glm_offset) + jnp.asarray(message_mean)  # b=0 GLM predictor
-    null_ll = float(_profiled_logistic_null(jnp.asarray(data.y), glm_eta))
+    ov = None if offset_integration == "none" else offset_var
+    null_ll = float(_profiled_logistic_null(
+        jnp.asarray(data.y), glm_eta, offset_var=ov, offset_integration=offset_integration))
     fle = null_ll + log_bf
     return replace(
         effect,
@@ -302,6 +339,21 @@ def initialize_state(
     )
 
 
+def initialize_state_mean_message(
+    data,
+    L: int = 1,
+    glm: Any | None = None,
+    glm_offset: Any = 0.0,
+    family_state_kwargs: dict | None = None,
+) -> GIBSSState[IRLSFamilyState, MeanMessage]:
+    """Fixed-offset IRLS: a MeanMessage carries no predictor variance, so the
+    working weights condition on the mean predictor (classic Fisher-scoring). Same
+    as initialize_state but with a MeanMessage total (message-type driven)."""
+    state = initialize_state(data, L, glm, glm_offset, family_state_kwargs)
+    n = data.X.shape[0]
+    return replace(state, total_message=MeanMessage(np.zeros(n)))
+
+
 def _empty_centered_effect(p: int) -> IRLSCenteredEffect:
     base = linear._empty_effect(p, 1.0)
     return IRLSCenteredEffect(
@@ -319,7 +371,12 @@ def to_numpy_state_step(data, state):
         )
         for e in state.single_effects
     ]
-    tm = Message(np.asarray(state.total_message.mean), np.asarray(state.total_message.var))
+    m = state.total_message
+    tm = (
+        MeanMessage(np.asarray(m.mean))
+        if isinstance(m, MeanMessage)
+        else Message(np.asarray(m.mean), np.asarray(m.var))
+    )
     return replace(state, single_effects=single_effects, total_message=tm)
 
 

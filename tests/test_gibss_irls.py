@@ -40,7 +40,9 @@ def test_irls_single_feature_matches_map():
     eta = -0.3 + 1.2 * x
     y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
     data = irls.prep_data(x[:, None], y, center=False)
-    st = irls.initialize_state(
+    # fixed-offset (mean-message) IRLS = the penalized MAP; the integrated default
+    # would smear the working weights over the effect's own posterior variance.
+    st = irls.initialize_state_mean_message(
         data, L=1, family_state_kwargs={"estimate_prior_variance": False}
     )
     st = fit_ibss(data, st, irls.default_schedule(), max_iter=100)
@@ -137,3 +139,36 @@ def test_irls_multi_effect():
     st = fit_ibss(data, irls.initialize_state(data, L=2), irls.default_schedule(), max_iter=50)
     tops = {int(np.argmax(np.asarray(e.alpha))) for e in st.single_effects}
     assert tops == {3, 17}
+
+
+def test_irls_offset_integration():
+    # global-Taylor random offset: Message init integrates the working weights over
+    # the predictor variance (globaljj analog); MeanMessage init is fixed. At L>1
+    # they differ; both recover the signals; dense == sparse under integration.
+    import jax.numpy as jnp
+    from jax.experimental import sparse
+    rng = np.random.default_rng(9)
+    n, p = 700, 40
+    X = rng.normal(size=(n, p))
+    eta = -0.4 + 2.0 * X[:, 5] + 1.6 * X[:, 20]
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
+
+    def run(init, Xin, **kw):
+        d = irls.prep_data(Xin, y)
+        st = fit_ibss(d, init(d, L=3, family_state_kwargs={"estimate_prior_variance": False, **kw}),
+                      irls.default_schedule(), max_iter=40)
+        return st
+
+    fixed = run(irls.initialize_state_mean_message, jnp.asarray(X))
+    integ = run(irls.initialize_state, jnp.asarray(X))
+    for st in (fixed, integ):
+        assert {5, 20} <= {int(np.argmax(np.asarray(e.alpha))) for e in st.single_effects}
+    a_fix = np.concatenate([np.asarray(e.alpha) for e in fixed.single_effects])
+    a_int = np.concatenate([np.asarray(e.alpha) for e in integ.single_effects])
+    assert np.max(np.abs(a_fix - a_int)) > 1e-4  # integration is not a no-op at L>1
+
+    # dense == sparse under integration (the centered message var is representation-
+    # invariant, so the offset-integrated weights match)
+    integ_sp = run(irls.initialize_state, sparse.BCOO.fromdense(jnp.asarray(X)))
+    a_sp = np.concatenate([np.asarray(e.alpha) for e in integ_sp.single_effects])
+    np.testing.assert_allclose(a_int, a_sp, rtol=1e-5, atol=1e-6)
