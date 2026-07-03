@@ -57,16 +57,21 @@ def test_fit_quadrature_ser_returns_normalized_ser_state():
     assert np.isfinite(effect.null_log_likelihood)
 
 
-def test_initialize_state_uses_message_with_var():
-    # quadrature now carries Message(mean, var) so the offset-integrated path can
-    # convolve over the leave-one-out variance; var=0 is the mean-only default.
+def test_initialize_state_message_type_drives_offset_integration():
+    # message TYPE drives offset integration (like localjj): default init carries
+    # Message(mean, var) -> integrated; the mean_message variant -> fixed offset.
+    from gibss.engine import MeanMessage
+    from gibss.logistic_quadrature import initialize_state_mean_message
+
     data = _binary_data()
     state = initialize_state(data, L=2, quadrature_order=9)
     assert isinstance(state.total_message, Message)
-    assert np.allclose(np.asarray(state.total_message.var), 0.0)
-    assert state.family_state.integrate_offset is False
+    assert np.allclose(np.asarray(state.total_message.var), 0.0)  # zero at init
     assert len(state.single_effects) == 2
     assert state.family_state.quadrature_order == 9
+
+    mm = initialize_state_mean_message(data, L=2, quadrature_order=9)
+    assert isinstance(mm.total_message, MeanMessage)
 
 
 def test_initialize_state_accepts_family_state_kwargs():

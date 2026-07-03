@@ -47,9 +47,12 @@ def test_pre_centering_fixes_overconfident_cs_matches_profile():
 
     def fit(mod, center, **kw):
         d = mod.prep_data(jnp.asarray(X), jnp.asarray(y), center=center)
+        # isolate pre-centering: use the fixed-offset (mean-only) init for Q so the
+        # offset-integrated intercept MLE doesn't confound the over-confidence test.
+        init = getattr(mod, "initialize_state_mean_message", mod.initialize_state)
         st = fit_ibss(
-            d, mod.initialize_state(d, L=1, quadrature_order=15,
-                                    family_state_kwargs={"estimate_prior_variance": False, **kw}),
+            d, init(d, L=1, quadrature_order=15,
+                    family_state_kwargs={"estimate_prior_variance": False, **kw}),
             mod.default_schedule(), max_iter=40)
         return _cs(np.asarray(st.single_effects[0].alpha))
 

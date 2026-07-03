@@ -55,9 +55,11 @@ class QuadratureFamilyState:
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
     quadrature_order: int = 15
-    # offset integration: convolve the logistic cumulant over the leave-one-out
-    # message variance N(mean, var) instead of conditioning on the mean only.
-    integrate_offset: bool = False
+    # Offset integration is driven by the TOTAL MESSAGE TYPE (like localjj): a
+    # Message(mean,var) propagates the leave-one-out variance -> the cumulant is
+    # convolved over N(mean,var); a MeanMessage carries no var -> fixed-offset
+    # (mean-only). initialize_state uses Message (integrated), the *_mean_message
+    # variant uses MeanMessage. These only pick the convolution method.
     offset_smooth: str = "taylor2"  # "taylor2" | "gh" | "none"
     offset_order: int = 5           # GH-over-offset nodes when offset_smooth="gh"
     skl_tolerance: float = 1e-4
@@ -235,6 +237,21 @@ def initialize_state(
     )
 
 
+def initialize_state_mean_message(
+    data: QuadratureData,
+    L: int = 1,
+    quadrature_order: int = 15,
+    family_state_kwargs: dict | None = None,
+) -> GIBSSState[QuadratureFamilyState, MeanMessage]:
+    """Fixed-offset (mean-only) quadrature: a MeanMessage carries no variance, so
+    the per-feature cumulant conditions on the offset mean -- the classic
+    quadrature. Same as initialize_state but with a MeanMessage total; message ops
+    drop the incoming var, so offset integration never engages (see localjj)."""
+    state = initialize_state(data, L, quadrature_order, family_state_kwargs)
+    n = data.X.shape[0]
+    return replace(state, total_message=MeanMessage(jnp.zeros(n)))
+
+
 def estimate_intercept(
     data: QuadratureData,
     state: GIBSSState[QuadratureFamilyState, MeanMessage],
@@ -246,8 +263,9 @@ def estimate_intercept(
     keeping the intercept consistent with the offset-integrated per-feature fits."""
     fs = state.family_state
     intercept = jnp.asarray(fs.intercept)
-    total_mean = jnp.asarray(state.total_message.mean)
-    ov = jnp.asarray(state.total_message.var) if fs.integrate_offset else 0.0
+    tm = state.total_message
+    total_mean = jnp.asarray(tm.mean)
+    ov = 0.0 if isinstance(tm, MeanMessage) else jnp.asarray(tm.var)
     smooth, order_o = fs.offset_smooth, fs.offset_order
     y = jnp.asarray(data.y)
 
@@ -291,8 +309,11 @@ def update_effect_index_step(
     """
     effect = state.single_effects[l]
     fs = state.family_state
-    offset = fs.intercept + state.total_message.mean
-    offset_var = state.total_message.var if fs.integrate_offset else None
+    tm = state.total_message
+    offset = fs.intercept + tm.mean
+    # message type drives it: MeanMessage -> None -> fixed offset (cheap identity
+    # path); Message -> per-row var -> the cumulant is offset-integrated.
+    offset_var = None if isinstance(tm, MeanMessage) else tm.var
     new_effect = fit_quadrature_ser(
         data,
         offset,
@@ -326,8 +347,11 @@ def to_numpy_state(
         )
         for effect in state.single_effects
     ]
-    total_message = Message(
-        np.asarray(state.total_message.mean), np.asarray(state.total_message.var)
+    tm = state.total_message
+    total_message = (
+        MeanMessage(np.asarray(tm.mean))
+        if isinstance(tm, MeanMessage)
+        else Message(np.asarray(tm.mean), np.asarray(tm.var))
     )
     return replace(state, single_effects=single_effects, total_message=total_message)
 

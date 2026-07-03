@@ -186,17 +186,18 @@ def test_engine_integrate_offset_runs_and_differs():
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.4 + 2.0 * X[:, 3] + 1.5 * X[:, 10]))), n).astype(float)
     data = Q.prep_data(X, y)
 
-    def run(**fs):
+    def run(init, **fs):
         st = fit_ibss(
             data,
-            Q.initialize_state(data, L=3, family_state_kwargs={"estimate_prior_variance": False, **fs}),
+            init(data, L=3, family_state_kwargs={"estimate_prior_variance": False, **fs}),
             Q.default_schedule(), max_iter=30,
         )
         return st
 
-    mean_only = run(integrate_offset=False)
-    integ = run(integrate_offset=True, offset_smooth="gh", offset_order=7)
-    integ_t2 = run(integrate_offset=True, offset_smooth="taylor2")
+    # message type drives it: MeanMessage init = fixed offset, Message init = integrated
+    mean_only = run(Q.initialize_state_mean_message)
+    integ = run(Q.initialize_state, offset_smooth="gh", offset_order=7)
+    integ_t2 = run(Q.initialize_state, offset_smooth="taylor2")
 
     # both recover the signals
     for st in (mean_only, integ, integ_t2):
