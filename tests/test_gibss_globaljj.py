@@ -107,7 +107,6 @@ def test_initialize_state_accepts_family_state_kwargs():
     assert state.family_state.estimate_prior_variance is False
     assert state.family_state.intercept == -0.75
     np.testing.assert_allclose(state.family_state.xi, np.ones(data.X.shape[0]))
-    np.testing.assert_allclose(state.family_state.X_sq, data.X_sq)
 
 
 def test_jj_bound_null_log_likelihood_matches_manual_formula():

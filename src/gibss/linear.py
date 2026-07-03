@@ -8,7 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
-from ._centering import precenter_curvature
+from .operators import as_operator, CenteredOperator
+from .ser_ops import global_gaussian_ser
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -23,14 +24,6 @@ from .engine import (
 def is_bcoo(X: Any) -> bool:
     return isinstance(X, sparse.BCOO)
 
-
-def squared_bcoo(X: sparse.BCOO) -> sparse.BCOO:
-    return sparse.BCOO(
-        (jnp.square(X.data), X.indices),
-        shape=X.shape,
-        indices_sorted=X.indices_sorted,
-        unique_indices=X.unique_indices,
-    )
 
 LinearEffect = BaseSERState
 
@@ -51,7 +44,6 @@ class LinearFamilyState:
 class LinearData:
     X: Any
     y: Any
-    X_sq: Any
     # Per-observation error variance v_i (Var(y_i) = residual_variance * v_i).
     # None / ones => homoskedastic. Precision weight is tau_i = 1/(sigma^2 v_i).
     obs_variance: Any = None
@@ -61,6 +53,16 @@ class LinearData:
     # eagerly and this stays None. For sparse (BCOO) X we keep X sparse and store
     # the means here so methods can center implicitly (X@coef - <coef,cbar>, etc.).
     column_center: Any = None
+
+    @property
+    def op(self):
+        """The design as a DesignOperator: raw DenseOperator/BCOOOperator, wrapped in
+        a CenteredOperator when pre-centering is implicit (sparse column_center). The
+        operator layer subsumes the ad-hoc X_sq / cbar plumbing (see matvec_sq)."""
+        base = as_operator(self.X)
+        if self.column_center is not None:
+            return CenteredOperator.from_offsets(base, self.column_center)
+        return base
 
 
 def _logsumexp(x):
@@ -95,20 +97,16 @@ def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData
     if is_bcoo(X):
         if center:
             column_center = _column_means(X)  # lazy: keep X sparse, center implicitly
-        X_sq = squared_bcoo(X)
     else:
         X = jnp.asarray(X)
         if center:
             X = X - _column_means(X)  # eager
-        X_sq = jnp.square(X)
     y = jnp.asarray(y)
     if obs_variance is None:
         obs_variance = jnp.ones_like(y)
     else:
         obs_variance = jnp.asarray(obs_variance)
-    return LinearData(
-        X=X, y=y, X_sq=X_sq, obs_variance=obs_variance, column_center=column_center
-    )
+    return LinearData(X=X, y=y, obs_variance=obs_variance, column_center=column_center)
 
 
 def reject_sparse_precenter(data) -> None:
@@ -129,31 +127,12 @@ def _obs_variance(data) -> np.ndarray:
 
 
 def fit_univariate_linear_regression(data, tau, offset, prior_variance):
-    X = data.X
     y = data.y
     tau = jnp.asarray(tau)
     offset = jnp.asarray(offset)
-    X_sq = data.X_sq
-
-    if is_bcoo(X):
-        cbar = getattr(data, "column_center", None)
-        r = tau * (y - offset)
-        if cbar is not None:  # sparse pre-centering: implicit (x - cbar)
-            weighted_x2 = precenter_curvature(tau @ X_sq, tau @ X, jnp.sum(tau), cbar)
-            num = (r @ X) - jnp.sum(r) * cbar
-        else:
-            weighted_x2 = tau @ X_sq
-            num = r @ X
-        precision = (1.0 / prior_variance) + weighted_x2
-        var = 1.0 / precision
-        mu = var * num
-    else:
-        weighted_x2 = jnp.sum(tau[:, None] * X_sq, axis=0)
-        precision = (1.0 / prior_variance) + weighted_x2
-        var = 1.0 / precision
-        mu = var * jnp.sum(tau[:, None] * (y - offset)[:, None] * X, axis=0)
-
-    log_bf = 0.5 * (jnp.log(var / prior_variance) + (mu**2 / var))
+    # data.op carries layout AND pre-centering (CenteredOperator when column_center).
+    r = tau * (y - offset)
+    mu, var, log_bf = global_gaussian_ser(data.op, tau, r, prior_variance)
     null_ll = linear_null_log_likelihood(data, tau, offset)
     return mu, var, null_ll + log_bf
 

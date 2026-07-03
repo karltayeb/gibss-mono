@@ -12,8 +12,8 @@ jax.config.update("jax_enable_x64", True)
 
 import gibss.globaljj as G
 import gibss.localjj as L
-import gibss.logistic_profile as P
-import gibss.logistic_quadrature as Q
+import gibss.logistic_localtaylor as P
+import gibss.logistic_localtaylor as Q
 from gibss.engine import fit_ibss
 
 
@@ -45,8 +45,8 @@ def _fit(mod, X, y, **kw):
 
 @pytest.mark.parametrize(
     "mod,kw",
-    [(Q, {}), (G, {}), (G, {"center": True}), (L, {}), (L, {"center": True}),
-     (P, {"background_mode": "exact"})],
+    [(Q, {}), (G, {}), (G, {"center": True}), (L, {}), (L, {"profile": True}),
+     (P, {"profile": True, "background_mode": "exact"})],
 )
 def test_null_is_profiled(mod, kw):
     X, y = _data()
@@ -66,3 +66,15 @@ def test_ser_logbf_on_same_scale_as_profile():
         _, bf = _fit(mod, X, y, **kw)
         assert bf <= ref + 0.5, f"{mod.__name__} BF {bf:.2f} inflated vs profile {ref:.2f}"
         assert abs(bf - ref) < 2.0
+
+
+def test_irls_reports_logistic_scale_null():
+    # irls null == the exact profiled logistic null (same as quadrature), not the
+    # working-Gaussian null; BF unchanged (null cancels).
+    import gibss.irls as I
+    import gibss.logistic_localtaylor as Q
+    X, y = _data()
+    qn, _ = _fit(Q, X, y)
+    inl, _ = _fit(I, X, y)
+    np.testing.assert_allclose(inl, qn, atol=1e-6)  # same profiled logistic null
+    np.testing.assert_allclose(inl, _profiled_null(y), atol=1e-6)

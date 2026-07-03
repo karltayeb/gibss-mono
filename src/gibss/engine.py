@@ -225,34 +225,14 @@ class BaseSERState:
         return self.alpha
 
     def message(self, data: Any) -> Message:
-        X = data.X
-        X_sq = getattr(data, "X_sq", None)
+        # operator-native: mean = X coef, var = (X^2) coef2 - mean^2. The design's
+        # `op` handles layout AND pre-centering (CenteredOperator's matvec/matvec_sq
+        # carry the rank-1 correction), so no X_sq / cbar plumbing here.
+        op = data.op
         coef_mean = self.alpha * self.mu
         coef_second_moment = self.alpha * (self.mu**2 + self.var)
-        mean = X @ coef_mean
-        if X_sq is None:
-            if isinstance(X, sparse.BCOO):
-                # We can't use replace on BCOO as it's not a dataclass
-                # Use tree_flatten/unflatten to create a copy with squared data
-                leaves, treedef = jax.tree_util.tree_flatten(X)
-                # BCOO leaves are typically (data, indices)
-                # We square the first leaf (data)
-                new_leaves = [jnp.square(leaves[0])] + leaves[1:]
-                X_sq = treedef.unflatten(new_leaves)
-            else:
-                X_sq = jnp.square(X)
-        second_moment = X_sq @ coef_second_moment
-        # Sparse pre-centering: X is kept raw, columns centered implicitly by cbar.
-        # (Dense pre-centering bakes it into X, so column_center is None there.)
-        cbar = getattr(data, "column_center", None)
-        if cbar is not None:
-            mean = mean - jnp.sum(coef_mean * cbar)
-            second_moment = (
-                second_moment
-                - 2.0 * (X @ (coef_second_moment * cbar))
-                + jnp.sum(coef_second_moment * cbar**2)
-            )
-        var = jnp.maximum(second_moment - jnp.square(mean), 0.0)
+        mean = op.matvec(coef_mean)
+        var = jnp.maximum(op.matvec_sq(coef_second_moment) - jnp.square(mean), 0.0)
         return Message(mean=mean, var=var)
 
 
@@ -298,6 +278,31 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
     def get_credible_sets(self, coverage: float = 0.95) -> tuple[tuple[int, ...], ...]:
         """Returns indices of credible sets for all components."""
         return tuple(e.get_cs(coverage=coverage) for e in self.single_effects)
+
+
+def _to_numpy_leaf(x):
+    if x is None or isinstance(x, (str, bool)):
+        return x
+    a = np.asarray(x)
+    return float(a) if a.ndim == 0 else a
+
+
+def state_to_numpy(state: GIBSSState) -> GIBSSState:
+    """Move a fitted state to host numpy: numpy-ify every effect field (arrays ->
+    np.asarray, 0-d -> float) and rebuild the total message by its type. Generic over
+    the effect/message dataclasses -- one implementation for every family."""
+    effects = [
+        replace(e, **{f: _to_numpy_leaf(getattr(e, f)) for f in e.__dataclass_fields__})
+        for e in state.single_effects
+    ]
+    tm = state.total_message
+    tm = tm.__class__(*(_to_numpy_leaf(getattr(tm, f)) for f in tm.__dataclass_fields__))
+    return replace(state, single_effects=effects, total_message=tm)
+
+
+def to_numpy_state_step(data, state):
+    del data
+    return state_to_numpy(state)
 
 
 def replace_effect_in_gibss_state(state, l, new_effect):

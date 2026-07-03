@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import jax
@@ -18,6 +18,7 @@ from .engine import (
     subtract_message_index_step,
     snapshot_state_step,
     check_skl_convergence_step,
+    to_numpy_state_step,
 )
 from .linear import update_prior_variance_index_step
 
@@ -616,36 +617,6 @@ def update_effect_index_step(
         effect.prior_variance,
     )
     return replace_effect_in_gibss_state(state, l, new_effect)
-
-
-def to_numpy_state(
-    state: GIBSSState[CoxFamilyState, MeanMessage],
-) -> GIBSSState[CoxFamilyState, MeanMessage]:
-    """Convert a JAX-backed Cox state into NumPy-backed arrays."""
-    single_effects = [
-        replace(
-            effect,
-            mu=np.asarray(effect.mu),
-            var=np.asarray(effect.var),
-            alpha=np.asarray(effect.alpha),
-            pi=np.asarray(effect.pi),
-            feature_log_evidence=np.asarray(effect.feature_log_evidence),
-            marginal_log_likelihood=float(np.asarray(effect.marginal_log_likelihood)),
-            null_log_likelihood=float(np.asarray(effect.null_log_likelihood)),
-            kl=float(np.asarray(effect.kl)),
-        )
-        for effect in state.single_effects
-    ]
-    total_message = MeanMessage(np.asarray(state.total_message.mean))
-    return replace(state, single_effects=single_effects, total_message=total_message)
-
-
-def to_numpy_state_step(
-    data: CoxData,
-    state: GIBSSState[CoxFamilyState, MeanMessage],
-) -> GIBSSState[CoxFamilyState, MeanMessage]:
-    del data
-    return to_numpy_state(state)
 
 
 def default_schedule() -> Schedule:

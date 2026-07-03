@@ -6,7 +6,7 @@ jax.config.update("jax_enable_x64", True)
 
 import gibss.globaljj as gj
 import gibss.localjj as lj
-import gibss.logistic_quadrature as q
+import gibss.logistic_localtaylor as q
 from gibss._jj import jj_null_log_likelihood
 from gibss.engine import fit_ibss
 

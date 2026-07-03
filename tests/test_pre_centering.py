@@ -9,8 +9,7 @@ from jax.experimental import sparse
 
 jax.config.update("jax_enable_x64", True)
 
-import gibss.logistic_profile as P
-import gibss.logistic_quadrature as Q
+import gibss.logistic_localtaylor as LT  # quadrature (center=False) + profile (center=True)
 from gibss.engine import fit_ibss
 
 
@@ -31,9 +30,9 @@ def _cs(a):
 def test_prep_data_default_centers_dense():
     X = np.array([[1.0, -2.0], [3.0, 0.5]])
     y = np.array([0.0, 1.0])
-    d = Q.prep_data(X, y)  # default -> centered for dense
+    d = LT.prep_data(X, y)  # default -> centered for dense
     np.testing.assert_allclose(np.asarray(d.X).mean(0), 0.0, atol=1e-12)
-    d0 = Q.prep_data(X, y, center=False)
+    d0 = LT.prep_data(X, y, center=False)
     np.testing.assert_array_equal(np.asarray(d0.X), X)
 
 
@@ -45,17 +44,20 @@ def test_pre_centering_fixes_overconfident_cs_matches_profile():
     X = _markov(rng, n, p)
     y = rng.binomial(1, 1 / (1 + np.exp(-(-2.0 + 0.9 * (X[:, 250] > 0)))), size=n).astype(float)
 
-    def fit(mod, center, **kw):
-        d = mod.prep_data(jnp.asarray(X), jnp.asarray(y), center=center)
+    def fit(family_center, pre_center, **kw):
+        d = LT.prep_data(jnp.asarray(X), jnp.asarray(y), center=pre_center)
+        # fixed-offset (mean-message) init so the offset-integrated intercept MLE
+        # doesn't confound the over-confidence test (L=1 -> integrated == fixed).
         st = fit_ibss(
-            d, mod.initialize_state(d, L=1, quadrature_order=15,
-                                    family_state_kwargs={"estimate_prior_variance": False, **kw}),
-            mod.default_schedule(), max_iter=40)
+            d, LT.initialize_state_mean_message(
+                d, L=1, quadrature_order=15,
+                family_state_kwargs={"estimate_prior_variance": False, "profile": family_center, **kw}),
+            LT.default_schedule(), max_iter=40)
         return _cs(np.asarray(st.single_effects[0].alpha))
 
-    unc = fit(Q, False)
-    cen = fit(Q, True)
-    prof = fit(P, False, background_mode="exact")  # profile: already honest
+    unc = fit(False, False)  # quadrature (shared intercept), no pre-center
+    cen = fit(False, True)   # quadrature + pre-center
+    prof = fit(True, False, background_mode="exact")  # profile: already honest
     assert cen > unc + 20  # meaningfully wider (less over-confident)
     assert abs(cen - prof) <= 5  # matches the exact profiled CS
 
@@ -68,9 +70,10 @@ def test_pre_centering_is_noop_for_profile():
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + 1.5 * X[:, 3]))), size=n).astype(float)
 
     def bf(center):
-        d = P.prep_data(jnp.asarray(X), jnp.asarray(y), center=center)
-        st = fit_ibss(d, P.initialize_state(d, L=1, family_state_kwargs={"background_mode": "exact"}),
-                      P.default_schedule(), max_iter=30)
+        d = LT.prep_data(jnp.asarray(X), jnp.asarray(y), center=center)
+        st = fit_ibss(d, LT.initialize_state(
+            d, L=1, family_state_kwargs={"profile": True, "background_mode": "exact"}),
+            LT.default_schedule(), max_iter=30)
         return float(np.asarray(st.ser_log_bayes_factor)[0])
 
     np.testing.assert_allclose(bf(True), bf(False), atol=1e-3)
@@ -81,12 +84,12 @@ def test_bcoo_default_off_node_methods_reject_sparse_center():
     Xs = sparse.BCOO.fromdense(jnp.asarray(rng.normal(size=(40, 5))))
     y = rng.binomial(1, 0.5, 40).astype(float)
     # default (None) -> off for sparse, no cbar stored
-    assert Q.prep_data(Xs, y).column_center is None
+    assert LT.prep_data(Xs, y).column_center is None
     # explicit center=True -> prep stores cbar; node-based methods reject it at init
-    d = Q.prep_data(Xs, y, center=True)
+    d = LT.prep_data(Xs, y, center=True)
     assert d.column_center is not None
     with pytest.raises(NotImplementedError):
-        Q.initialize_state(d, L=1)
+        LT.initialize_state(d, L=1)
 
 
 @pytest.mark.parametrize("mod_name", ["linear", "irls", "globaljj"])
