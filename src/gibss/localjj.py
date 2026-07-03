@@ -54,12 +54,14 @@ class LocalJJFamilyState:
     elbo_history: list[float] = field(default_factory=lambda: [-np.inf])
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
-    # Per-feature profiled intercept via weighted column centering, parameterization
-    # (b): profiled (centered) mean + conditional (uncentered) variance. Each feature
-    # owns its intercept (offset = leave-one-out message only); validated monotone &
-    # joint-optimal at the univariate level. Dense uses the exact O(n*p) JJ
-    # row-background; sparse uses the Chebyshev surrogate (O(nD+Dp)).
-    center: bool = False
+    # `profile`: fit a per-feature profiled intercept b0_j (offset-shift invariant),
+    # parameterization (b) -- profiled (centered) mean + conditional (uncentered)
+    # variance. offset = leave-one-out message only; validated monotone & joint-
+    # optimal. profile=False keeps the single shared intercept.
+    profile: bool = False
+    # background for the profiled row-coupling: "chebyshev" O(nD+Dp) or "exact" O(np);
+    # dense forces exact (matches logistic_localtaylor).
+    background_mode: str = "chebyshev"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +70,8 @@ class LocalJJCenteredEffect(BaseSERState):
 
 
 def fit_local_jj_ser_centered(
-    data, offset, mu_init, var_init, b0_init, prior_variance, offset_var
+    data, offset, mu_init, var_init, b0_init, prior_variance, offset_var,
+    background_mode: str = "chebyshev",
 ) -> LocalJJCenteredEffect:
     """SER wrapper for the profiled-intercept (centered) per-feature JJ update.
 
@@ -82,7 +85,7 @@ def fit_local_jj_ser_centered(
     offset = jnp.asarray(offset)
     offset_var = jnp.asarray(offset_var)
     p = data.X.shape[1]
-    background = "chebyshev" if _is_bcoo(data.X) else "exact"
+    background = background_mode if _is_bcoo(data.X) else "exact"
     m, var, b0, log_bf = localjj_centered_ser(
         as_operator(data.X), y, offset, prior_variance, offset_var=offset_var,
         background=background,
@@ -178,7 +181,7 @@ def initialize_state(
         **({} if family_state_kwargs is None else dict(family_state_kwargs))
     )
     zero_message = Message(jnp.zeros(X.shape[0]), jnp.zeros(X.shape[0]))
-    if family_state.center:
+    if family_state.profile:
         effects = [_empty_centered_effect(p) for _ in range(L)]
     else:
         effects = [_empty_effect(p, 1.0) for _ in range(L)]
@@ -245,7 +248,7 @@ def estimate_intercept_step(
     state: GIBSSState[LocalJJFamilyState, Message],
 ) -> GIBSSState[LocalJJFamilyState, Message]:
     """Schedule wrapper for estimate_intercept()."""
-    if state.family_state.center or not state.family_state.estimate_intercept:
+    if state.family_state.profile or not state.family_state.estimate_intercept:
         return state  # centered path profiles a per-feature intercept instead
     new_intercept = estimate_intercept(data, state)
     family_state = replace(state.family_state, intercept=new_intercept)
@@ -268,7 +271,7 @@ def update_effect_index_step(
     effect = state.single_effects[l]
     fs = state.family_state
     offset_var = jnp.asarray(state.total_message.var)
-    if fs.center:
+    if fs.profile:
         # per-feature profiled intercept: offset = leave-one-out message only
         new_effect = fit_local_jj_ser_centered(
             data,
@@ -278,6 +281,7 @@ def update_effect_index_step(
             effect.b0,
             effect.prior_variance,
             offset_var=offset_var,
+            background_mode=fs.background_mode,
         )
         return replace_effect_in_gibss_state(state, l, new_effect)
     offset = fs.intercept + jnp.asarray(state.total_message.mean)

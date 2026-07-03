@@ -45,8 +45,8 @@ def _fit(mod, X, y, **kw):
 
 @pytest.mark.parametrize(
     "mod,kw",
-    [(Q, {}), (G, {}), (G, {"center": True}), (L, {}), (L, {"center": True}),
-     (P, {"center": True, "background_mode": "exact"})],
+    [(Q, {}), (G, {}), (G, {"center": True}), (L, {}), (L, {"profile": True}),
+     (P, {"profile": True, "background_mode": "exact"})],
 )
 def test_null_is_profiled(mod, kw):
     X, y = _data()

@@ -51,7 +51,7 @@ def test_pre_centering_fixes_overconfident_cs_matches_profile():
         st = fit_ibss(
             d, LT.initialize_state_mean_message(
                 d, L=1, quadrature_order=15,
-                family_state_kwargs={"estimate_prior_variance": False, "center": family_center, **kw}),
+                family_state_kwargs={"estimate_prior_variance": False, "profile": family_center, **kw}),
             LT.default_schedule(), max_iter=40)
         return _cs(np.asarray(st.single_effects[0].alpha))
 
@@ -72,7 +72,7 @@ def test_pre_centering_is_noop_for_profile():
     def bf(center):
         d = LT.prep_data(jnp.asarray(X), jnp.asarray(y), center=center)
         st = fit_ibss(d, LT.initialize_state(
-            d, L=1, family_state_kwargs={"center": True, "background_mode": "exact"}),
+            d, L=1, family_state_kwargs={"profile": True, "background_mode": "exact"}),
             LT.default_schedule(), max_iter=30)
         return float(np.asarray(st.ser_log_bayes_factor)[0])
 

@@ -15,7 +15,7 @@ def test_quadrature_order_kwargs_respected(center):
     X = jnp.asarray(rng.normal(size=(n, p)))
     y = jnp.asarray((rng.random(n) < 0.3).astype(float))
     data = LT.prep_data(X, y)
-    ck = {"center": center}
+    ck = {"profile": center}
     st = LT.initialize_state(data, L=1, family_state_kwargs={"quadrature_order": 1, **ck})
     assert st.family_state.quadrature_order == 1
     assert LT.initialize_state(data, L=1, family_state_kwargs=ck).family_state.quadrature_order == 15

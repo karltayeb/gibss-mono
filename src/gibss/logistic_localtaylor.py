@@ -1,14 +1,17 @@
 """Local covariate-moderated logistic SER, Taylor / Gauss-Hermite-over-b family.
 
-One module for both intercept conventions, dispatched by ``center`` (mirrors
+One module for both intercept conventions, dispatched by ``profile`` (mirrors
 ``localjj`` for the JJ family):
 
-- ``center=False`` -- a single SHARED intercept (estimated once per sweep), each
+- ``profile=False`` -- a single SHARED intercept (estimated once per sweep), each
   feature fit at ``offset = intercept + leave-one-out``. Kernel: ``quadrature_ser``.
   (This is the old ``logistic_quadrature``.)
-- ``center=True`` -- a per-feature PROFILED intercept ``b0_j`` (offset-shift
+- ``profile=True`` -- a per-feature PROFILED intercept ``b0_j`` (offset-shift
   invariant), each feature fit at ``offset = leave-one-out``. Kernel:
   ``profile_ser`` (exact or Chebyshev background). (The old ``logistic_profile``.)
+
+(``profile`` is the per-feature intercept; ``center`` is reserved for the cheap
+pre-centering in ``prep_data``.)
 
 Both: per-feature MAP + Laplace scale, a Gauss-Hermite grid over ``b``, the profiled
 logistic null, and message-type-driven offset integration (``Message`` = integrate
@@ -71,8 +74,8 @@ __all__ = [
 class LocalTaylorEffect(BaseSERState):
     coefficient_kl: np.ndarray
     mode: np.ndarray
-    hessian: np.ndarray  # Schur profile curvature (center=True) or 1/var (center=False)
-    b0: np.ndarray  # per-feature profiled intercept (center=True); zeros otherwise
+    hessian: np.ndarray  # Schur profile curvature (profile=True) or 1/var (profile=False)
+    b0: np.ndarray  # per-feature profiled intercept (profile=True); zeros otherwise
 
     # message: inherit BaseSERState.message -> Message(mean, var). The per-row var
     # feeds the offset-integrated path; a MeanMessage total disables it.
@@ -80,15 +83,15 @@ class LocalTaylorEffect(BaseSERState):
 
 @dataclass(frozen=True, slots=True)
 class LocalTaylorFamilyState:
-    center: bool = False  # False = shared intercept (quadrature); True = profiled (profile)
+    profile: bool = False  # False = shared intercept (quadrature); True = profiled (profile)
     quadrature_order: int = 15
     estimate_prior_variance: bool = True
     # offset integration (message type drives whether it engages).
     offset_integration: str | int = "taylor"  # "none" | "taylor" | int (gh order)
-    # --- center=False (shared intercept) ---
+    # --- profile=False (shared intercept) ---
     estimate_intercept: bool = True
     intercept: float = 0.0
-    # --- center=True (profiled intercept) ---
+    # --- profile=True (profiled intercept) ---
     node_intercept_mode: str = "newton"  # "linear" (Cox-Reid) | "newton" (re-profile)
     n_intercept_newton: int = 4
     background_mode: str = "chebyshev"  # "chebyshev" O(nD+Dp) | "exact"; dense forces exact
@@ -97,9 +100,9 @@ class LocalTaylorFamilyState:
 
 
 def _fit_effect(data, offset, prior_variance, fs, offset_var, offset_integration):
-    """Dispatch on fs.center -> quadrature_ser (shared) or profile_ser (profiled),
+    """Dispatch on fs.profile -> quadrature_ser (shared) or profile_ser (profiled),
     build a LocalTaylorEffect. `offset` already includes the shared intercept when
-    center=False."""
+    profile=False."""
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
@@ -107,7 +110,7 @@ def _fit_effect(data, offset, prior_variance, fs, offset_var, offset_integration
     null_ll = profiled_logistic_null(
         y, offset, offset_var=offset_var, offset_integration=offset_integration
     )
-    if fs.center:
+    if fs.profile:
         mu, var, log_bf, coefficient_kl, b0, h = profile_ser(
             op, y, offset, prior_variance, order=fs.quadrature_order,
             background=(fs.background_mode if is_bcoo(data.X) else "exact"),
@@ -145,13 +148,13 @@ def _fit_effect(data, offset, prior_variance, fs, offset_var, offset_integration
 
 
 def fit_local_taylor_ser(
-    data, offset, prior_variance, center: bool = False, quadrature_order: int = 15,
+    data, offset, prior_variance, profile: bool = False, quadrature_order: int = 15,
     offset_var=None, offset_integration="none", node_intercept_mode: str = "newton",
     n_intercept_newton: int = 4, background_mode: str = "chebyshev",
 ) -> LocalTaylorEffect:
-    """Standalone SER fit (no engine). center=False -> quadrature, True -> profile."""
+    """Standalone SER fit (no engine). profile=False -> quadrature, True -> profile."""
     fs = LocalTaylorFamilyState(
-        center=center, quadrature_order=quadrature_order,
+        profile=profile, quadrature_order=quadrature_order,
         offset_integration=offset_integration, node_intercept_mode=node_intercept_mode,
         n_intercept_newton=n_intercept_newton, background_mode=background_mode,
     )
@@ -207,7 +210,7 @@ def _offset_integration(state):
 
 
 def estimate_intercept(data, state) -> float:
-    """Shared-intercept MLE (center=False), offset-integrated over the total message
+    """Shared-intercept MLE (profile=False), offset-integrated over the total message
     variance so it stays consistent with the per-feature fits."""
     fs = state.family_state
     intercept = jnp.asarray(fs.intercept)
@@ -230,7 +233,7 @@ def estimate_intercept(data, state) -> float:
 
 def estimate_intercept_step(data, state):
     fs = state.family_state
-    if fs.center or not fs.estimate_intercept:
+    if fs.profile or not fs.estimate_intercept:
         return state  # profiled path has no shared intercept
     new_intercept = estimate_intercept(data, state)
     return replace(state, family_state=replace(fs, intercept=new_intercept))
@@ -241,7 +244,7 @@ def update_effect_index_step(data, l, state):
     fs = state.family_state
     tm = state.total_message
     offset_var, oi = _offset_integration(state)
-    offset = tm.mean if fs.center else fs.intercept + tm.mean
+    offset = tm.mean if fs.profile else fs.intercept + tm.mean
     new_effect = _fit_effect(data, offset, effect.prior_variance, fs, offset_var, oi)
     return replace_effect_in_gibss_state(state, l, new_effect)
 
@@ -273,7 +276,7 @@ def to_numpy_state_step(data, state):
 def default_schedule() -> Schedule:
     return Schedule(
         before_sweep=(snapshot_state_step,),
-        before_effect_update=(estimate_intercept_step,),  # no-op when center=True
+        before_effect_update=(estimate_intercept_step,),  # no-op when profile=True
         effect_update=(
             subtract_message_index_step,
             update_effect_index_step,

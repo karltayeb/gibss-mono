@@ -27,7 +27,7 @@ def _sim(rng, n, p, signal=2.0, feat=0, sparsity=None, base=-0.3):
 
 
 def _run(data, center, L=1, max_iter=40, **fs):
-    st = LT.initialize_state(data, L=L, family_state_kwargs={"center": center, **fs})
+    st = LT.initialize_state(data, L=L, family_state_kwargs={"profile": center, **fs})
     return fit_ibss(data, st, LT.default_schedule(), max_iter=max_iter)
 
 
@@ -76,8 +76,8 @@ def test_offset_shift_invariance_profile():
     X, y = _sim(rng, 400, 8, signal=1.5)
     data = LT.prep_data(jnp.asarray(X), jnp.asarray(y))
     off = jnp.asarray(rng.normal(size=400) * 0.3)
-    a = LT.fit_local_taylor_ser(data, off, 1.0, center=True)
-    b = LT.fit_local_taylor_ser(data, off + 1.7, 1.0, center=True)
+    a = LT.fit_local_taylor_ser(data, off, 1.0, profile=True)
+    b = LT.fit_local_taylor_ser(data, off + 1.7, 1.0, profile=True)
     bfa = np.asarray(a.feature_log_evidence) - a.null_log_likelihood
     bfb = np.asarray(b.feature_log_evidence) - b.null_log_likelihood
     np.testing.assert_allclose(bfa, bfb, atol=1e-4)
@@ -93,7 +93,7 @@ def test_message_type_drives_offset_integration(center):
     integ = _run(data, center, L=3, estimate_prior_variance=False)
     fixed = fit_ibss(
         data,
-        LT.initialize_state_mean_message(data, L=3, family_state_kwargs={"center": center, "estimate_prior_variance": False}),
+        LT.initialize_state_mean_message(data, L=3, family_state_kwargs={"profile": center, "estimate_prior_variance": False}),
         LT.default_schedule(), max_iter=30,
     )
     assert isinstance(integ.total_message, Message)
