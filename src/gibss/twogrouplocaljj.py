@@ -252,7 +252,7 @@ def fit_univariate_local_twogroup_regression(
         mu_init,
         var_init,
         X,
-        data.X_sq,
+        jnp.square(X),  # dense X^2 (X_sq is no longer materialized on LinearData)
         llr,
         offset,
         offset_var,

@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -50,7 +51,7 @@ def _signal_data(seed: int = 0):
 
 def _expected_univariate_fit(data, tau, offset, prior_variance):
     resid = data.y - offset
-    weighted_x2 = np.sum(tau[:, None] * data.X_sq, axis=0)
+    weighted_x2 = np.sum(tau[:, None] * np.asarray(data.X) ** 2, axis=0)
     precision = (1.0 / prior_variance) + weighted_x2
     var = 1.0 / precision
     mu = var * np.sum(tau[:, None] * resid[:, None] * data.X, axis=0)
@@ -88,13 +89,15 @@ def test_logsumexp_matches_naive_and_is_stable():
     assert np.isclose(_logsumexp(x), expected)
 
 
-def test_prep_data_materializes_squared_design():
+def test_prep_data_op_squared_matvec():
+    # X_sq is no longer materialized; the design's operator provides (X^2) v.
     X = np.array([[1.0, -2.0], [3.0, 0.5]])
     y = np.array([0.0, 1.0])
     data = prep_data(X, y, center=False)
     np.testing.assert_array_equal(data.X, X)
     np.testing.assert_array_equal(data.y, y)
-    np.testing.assert_array_equal(data.X_sq, X**2)
+    v = jnp.asarray([1.0, 0.5])
+    np.testing.assert_allclose(np.asarray(data.op.matvec_sq(v)), (X**2) @ np.asarray(v), atol=1e-12)
 
 
 def test_initialize_state_accepts_family_state_kwargs():

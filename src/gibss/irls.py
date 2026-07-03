@@ -121,26 +121,22 @@ class IRLSCenteredEffect(BaseSERState):
     cbar: Any = None
 
     def message(self, data) -> Message:
+        # centered contribution sum_j coef_j (x_ij - cbar_j); CenteredOperator's
+        # matvec / matvec_sq carry the rank-1 correction. The CENTERED second moment
+        # (not X_sq @ coef2) is required -- it drives offset integration and must be
+        # representation-invariant (pre-centered dense vs raw+cbar sparse).
+        op = CenteredOperator.from_offsets(as_operator(data.X), self.cbar)
         coef = self.alpha * self.mu
-        mean = data.X @ coef - jnp.sum(coef * self.cbar)
-        # centered per-row var of the contribution sum_j coef_j (x_ij - cbar_j).
-        # Must be the CENTERED second moment (not X_sq @ coef2): it now drives
-        # offset integration, and the uncentered form differs between pre-centered
-        # (dense) and raw+cbar (sparse) representations of the same fit.
         coef2 = self.alpha * (self.mu**2 + self.var)
-        second = (
-            data.X_sq @ coef2
-            - 2.0 * (data.X @ (coef2 * self.cbar))
-            + jnp.sum(coef2 * self.cbar**2)
-        )
-        var = jnp.maximum(second - jnp.square(mean), 0.0)
+        mean = op.matvec(coef)
+        var = jnp.maximum(op.matvec_sq(coef2) - jnp.square(mean), 0.0)
         return Message(mean=mean, var=var)
 
 
 def _working_data(data, fs: IRLSFamilyState) -> LinearData:
     """Transient LinearData for the inner linear solver: working y + obs variance."""
     return LinearData(
-        X=data.X, y=fs.y_work, X_sq=data.X_sq, obs_variance=fs.v_work,
+        X=data.X, y=fs.y_work, obs_variance=fs.v_work,
         column_center=getattr(data, "column_center", None),
     )
 

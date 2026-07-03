@@ -25,14 +25,6 @@ def is_bcoo(X: Any) -> bool:
     return isinstance(X, sparse.BCOO)
 
 
-def squared_bcoo(X: sparse.BCOO) -> sparse.BCOO:
-    return sparse.BCOO(
-        (jnp.square(X.data), X.indices),
-        shape=X.shape,
-        indices_sorted=X.indices_sorted,
-        unique_indices=X.unique_indices,
-    )
-
 LinearEffect = BaseSERState
 
 
@@ -52,7 +44,6 @@ class LinearFamilyState:
 class LinearData:
     X: Any
     y: Any
-    X_sq: Any
     # Per-observation error variance v_i (Var(y_i) = residual_variance * v_i).
     # None / ones => homoskedastic. Precision weight is tau_i = 1/(sigma^2 v_i).
     obs_variance: Any = None
@@ -106,20 +97,16 @@ def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData
     if is_bcoo(X):
         if center:
             column_center = _column_means(X)  # lazy: keep X sparse, center implicitly
-        X_sq = squared_bcoo(X)
     else:
         X = jnp.asarray(X)
         if center:
             X = X - _column_means(X)  # eager
-        X_sq = jnp.square(X)
     y = jnp.asarray(y)
     if obs_variance is None:
         obs_variance = jnp.ones_like(y)
     else:
         obs_variance = jnp.asarray(obs_variance)
-    return LinearData(
-        X=X, y=y, X_sq=X_sq, obs_variance=obs_variance, column_center=column_center
-    )
+    return LinearData(X=X, y=y, obs_variance=obs_variance, column_center=column_center)
 
 
 def reject_sparse_precenter(data) -> None:

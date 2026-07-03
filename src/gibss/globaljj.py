@@ -47,7 +47,6 @@ class GlobalJJFamilyState:
     elbo_tolerance: float = 1e-3
     elbo_history: list[float] = field(default_factory=lambda: [-np.inf])
     xi: Any = 0.0
-    X_sq: Any = None
     # Weighted column centering (tau-weighted), orthogonalizing intercept/features.
     # Opt-in (globaljj has a reference-parity contract); reparameterizes the
     # intercept, so results differ from the non-centered default.
@@ -67,17 +66,13 @@ class GlobalJJCenteredEffect(BaseSERState):
     cbar: Any = None
 
     def message(self, data) -> Message:
-        c = self.cbar
+        # centered contribution sum_j coef_j (x_ij - cbar_j); the CenteredOperator's
+        # matvec / matvec_sq carry the rank-1 correction (mean and second moment).
+        op = CenteredOperator.from_offsets(as_operator(data.X), self.cbar)
         coef = self.alpha * self.mu
         coef2 = self.alpha * (self.mu**2 + self.var)
-        mean = data.X @ coef - jnp.sum(coef * c)
-        # E[m_i^2] = sum_j coef2_j (x_ij - c_j)^2
-        sm = (
-            data.X_sq @ coef2
-            - 2.0 * (data.X @ (coef2 * c))
-            + jnp.sum(coef2 * c**2)
-        )
-        var = jnp.maximum(sm - jnp.square(mean), 0.0)
+        mean = op.matvec(coef)
+        var = jnp.maximum(op.matvec_sq(coef2) - jnp.square(mean), 0.0)
         return Message(mean=mean, var=var)
 
 
@@ -108,10 +103,9 @@ def initialize_state(
     X = data.X
     p = X.shape[1]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)
-    # `xi` and `X_sq` are initialization-owned derived fields; user kwargs are
+    # `xi` is an initialization-owned derived field; user kwargs are
     # silently overridden here for now.
     kwargs["xi"] = jnp.ones(X.shape[0])
-    kwargs["X_sq"] = data.X_sq
     family_state = GlobalJJFamilyState(**kwargs)
     zero_message = Message(jnp.zeros(X.shape[0]), jnp.zeros(X.shape[0]))
     return GIBSSState(
@@ -129,10 +123,9 @@ def initialize_state_mean_message(
     X = data.X
     p = X.shape[1]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)
-    # `xi` and `X_sq` are initialization-owned derived fields; user kwargs are
+    # `xi` is an initialization-owned derived field; user kwargs are
     # silently overridden here for now.
     kwargs["xi"] = jnp.ones(X.shape[0])
-    kwargs["X_sq"] = data.X_sq
     family_state = GlobalJJFamilyState(**kwargs)
     zero_message = MeanMessage(jnp.zeros(X.shape[0]))
     return GIBSSState(
@@ -185,7 +178,6 @@ def fit_global_jj_ser(
     offset_var=None,
 ) -> BaseSERState:
     X = data.X
-    X_sq = data.X_sq
     p = X.shape[1]
 
     if center:
