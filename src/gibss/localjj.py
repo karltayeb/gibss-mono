@@ -9,12 +9,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
-from ._centering import weighted_centering, precenter_curvature
 from ._jj import (
     lambda_xi as _lambda_xi,
     jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
     jj_profiled_null_log_likelihood as _jj_profiled_null_log_likelihood,
 )
+from .operators import as_operator
+from .ser_ops import localjj_centered_ser
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -178,81 +179,38 @@ def _fit_univariate_local_jj_regression_dense(
     return jax.vmap(single_feature_update, in_axes=(1, 1, 1, 1))(X, X_sq, tau, xi)
 
 
-@jax.jit
-def _fit_univariate_local_jj_centered_dense(
-    mu_init, var_init, b0_init, X, y, offset, offset_var, prior_variance, X_sq
-):
-    """Per-feature JJ with profiled intercept, parameterization (b).
-
-    Mean uses the centered (profiled) denominator; variance uses the conditional
-    (uncentered) denominator; each feature owns its intercept b0_j.
-    """
-    pv = prior_variance
-
-    def feat(x, x2, mu0, var0, b00):
-        # xi from the warm per-feature predictor eta = offset + b0 + mu*x
-        Em = offset + b00 + mu0 * x
-        Eeta2 = Em**2 + var0 * x2 + offset_var
-        xi = jnp.sqrt(jnp.maximum(Eeta2, 1e-12))
-        tau = 2.0 * _lambda_xi(xi)
-        # parameterization (b): profiled mean, conditional variance
-        W = jnp.sum(tau)
-        c = jnp.sum(tau * x) / W
-        sx2 = jnp.sum(tau * x2)
-        r = y - 0.5 - tau * offset
-        R = jnp.sum(r)
-        m, v = weighted_centering(c, W, sx2, jnp.sum(x * r), R, pv, conditional_variance=True)
-        b0 = R / W - m * c
-        # tight bound at eta = offset + b0 + m*x with optimal xi (xi^2 = E[eta^2])
-        eta = offset + b0 + m * x
-        Eeta2n = eta**2 + v * x2 + offset_var
-        xib = jnp.sqrt(jnp.maximum(Eeta2n, 1e-12))
-        bound = jnp.sum(
-            (y - 0.5) * eta
-            - _lambda_xi(xib) * (Eeta2n - xib**2)
-            - jnp.logaddexp(0.0, xib)
-            + 0.5 * xib
-        )
-        kl = 0.5 * (jnp.log(pv / v) + (v + m**2) / pv - 1.0)
-        return m, v, b0, bound - kl
-
-    return jax.vmap(feat, in_axes=(1, 1, 0, 0, 0))(X, X_sq, mu_init, var_init, b0_init)
-
-
 def fit_local_jj_ser_centered(
     data, offset, mu_init, var_init, b0_init, prior_variance, offset_var
 ) -> LocalJJCenteredEffect:
-    """SER wrapper for the profiled-intercept (centered) per-feature JJ update."""
-    X = data.X
-    if _is_bcoo(X):
-        raise NotImplementedError(
-            "centered localjj is dense-only for now: per-feature intercept profiling "
-            "makes m, b0, and the bound O(n*p) (the zero-row tau depends on b0_j). "
-            "Sparse path needs a Chebyshev surrogate over b0_j -- see "
-            "docs/superpowers/plans/2026-06-28-localjj-centered-sparse-chebyshev.md"
-        )
+    """SER wrapper for the profiled-intercept (centered) per-feature JJ update.
+
+    Routes through the operator kernel `ser_ops.localjj_centered_ser`, which handles
+    dense AND BCOO (the per-feature intercept still needs the dense O(n*p) JJ
+    row-background, but the support reductions are sparse). The kernel cold-starts
+    the JJ-MM fixed point each sweep (monotone -> always converges), so `b0_init` /
+    the warm mu/var are not threaded; the converged answer matches the legacy
+    dense kernel (validated to ~1e-13 on the log-BF)."""
     y = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     offset_var = jnp.asarray(offset_var)
-    mu, var, b0, feature_log_evidence = _fit_univariate_local_jj_centered_dense(
-        jnp.asarray(mu_init), jnp.asarray(var_init), jnp.asarray(b0_init),
-        X, y, offset, offset_var, prior_variance, data.X_sq,
+    p = data.X.shape[1]
+    m, var, b0, log_bf = localjj_centered_ser(
+        as_operator(data.X), y, offset, prior_variance, offset_var=offset_var
     )
-    p = X.shape[1]
+    # log_bf is the ELBO relative to the profiled JJ null; recover the absolute
+    # feature evidence (the null cancels in alpha, so PIPs are unaffected).
+    null_ll = _jj_profiled_null_log_likelihood(y, offset, offset_var)
+    feature_log_evidence = log_bf + null_ll
     log_norm = jax.nn.logsumexp(feature_log_evidence)
     alpha = jnp.exp(feature_log_evidence - log_norm)
     alpha = alpha / jnp.sum(alpha)
     log_pi = -jnp.log(float(p))
     kl = float(
         jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi))
-        + 0.5 * jnp.sum(alpha * (jnp.log(prior_variance / var) + (var + mu**2) / prior_variance - 1.0))
+        + 0.5 * jnp.sum(alpha * (jnp.log(prior_variance / var) + (var + m**2) / prior_variance - 1.0))
     )
-    # the centered effect profiles a per-feature intercept, so the null must too
-    # (offset-shift invariance) -- otherwise the feature is credited for the
-    # intercept fit and the BF inflates.
-    null_ll = _jj_profiled_null_log_likelihood(y, offset, offset_var)
     return LocalJJCenteredEffect(
-        mu=mu, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
+        mu=m, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
         prior_variance=float(prior_variance),
         feature_log_evidence=feature_log_evidence,
         marginal_log_likelihood=float(log_norm - jnp.log(float(p))),

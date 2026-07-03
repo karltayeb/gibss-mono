@@ -55,7 +55,7 @@ def test_localjj_centered_matches_brute(kind, variational):
     offset = rng.normal(size=n) * 0.3
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.4 + 1.2 * Xd[:, 3]))), size=n).astype(float)
     pv = 1.5
-    m, v, lbf = localjj_centered_ser(
+    m, v, _b0, lbf = localjj_centered_ser(
         _ops(Xd)[kind], jnp.asarray(y), jnp.asarray(offset), pv, n_iter=200, variational=variational
     )
     null = float(jj_profiled_null_log_likelihood(jnp.asarray(y), jnp.asarray(offset)))
@@ -84,6 +84,28 @@ def test_localjj_centered_offset_shift_invariance():
     offset = rng.normal(size=n) * 0.3
     y = rng.binomial(1, 1 / (1 + np.exp(-(offset + Xd[:, 1]))), size=n).astype(float)
     op = DenseOperator(jnp.asarray(Xd))
-    _, _, a = localjj_centered_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0)
-    _, _, b = localjj_centered_ser(op, jnp.asarray(y), jnp.asarray(offset) + 2.4, 1.0)
+    _, _, _, a = localjj_centered_ser(op, jnp.asarray(y), jnp.asarray(offset), 1.0)
+    _, _, _, b = localjj_centered_ser(op, jnp.asarray(y), jnp.asarray(offset) + 2.4, 1.0)
     np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-5)
+
+
+def test_localjj_offset_var_backward_compat_and_effect():
+    # offset_var=None == offset_var=0 (identity); a real offset_var changes the JJ
+    # tuning (E[eta^2] += offset_var) and stays finite -- both centered + not.
+    from gibss.ser_ops import localjj_ser, localjj_centered_ser
+    rng = np.random.default_rng(7)
+    n, p = 300, 12
+    Xd = rng.normal(size=(n, p))
+    offset = rng.normal(size=n) * 0.4
+    ov = jnp.asarray(rng.uniform(0.1, 1.0, n))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(offset + 1.2 * Xd[:, 3]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(Xd))
+    yj, oj = jnp.asarray(y), jnp.asarray(offset)
+    for fn, k in [(localjj_ser, 3), (localjj_centered_ser, 4)]:
+        none = fn(op, yj, oj, 1.0)
+        zero = fn(op, yj, oj, 1.0, offset_var=jnp.zeros(n))
+        real = fn(op, yj, oj, 1.0, offset_var=ov)
+        for a, b in zip(none, zero):
+            np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-10)
+        assert np.all(np.isfinite(np.asarray(real[-1])))
+        assert np.max(np.abs(np.asarray(real[-1]) - np.asarray(none[-1]))) > 1e-3

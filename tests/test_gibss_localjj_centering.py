@@ -113,13 +113,24 @@ def test_centered_multi_effect():
     assert tops == {3, 17}
 
 
-def test_centered_sparse_raises():
+def test_centered_sparse_matches_dense():
+    # centered localjj now routes through the operator kernel -> BCOO works, and
+    # matches the dense fit (the per-feature intercept still uses the dense JJ
+    # row-background; only the support reductions are sparse).
     from jax.experimental import sparse
     rng = np.random.default_rng(4)
-    X = sparse.BCOO.fromdense(jnp.asarray(rng.normal(size=(50, 5))))
-    y = rng.binomial(1, 0.5, 50).astype(float)
-    data = lj.prep_data(X, y)
-    st = lj.initialize_state(data, L=1, family_state_kwargs={"center": True})
-    import pytest
-    with pytest.raises(NotImplementedError):
-        fit_ibss(data, st, lj.default_schedule(), max_iter=2)
+    n, p = 400, 20
+    Xd = rng.normal(size=(n, p)) * rng.binomial(1, 0.4, size=(n, p))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(Xd[:, 6] * 1.5 + Xd[:, 13] * 1.2))), n).astype(float)
+
+    def run(Xin):
+        data = lj.prep_data(Xin, y)
+        st = lj.initialize_state(data, L=3, family_state_kwargs={"center": True})
+        return fit_ibss(data, st, lj.default_schedule(), max_iter=40)
+
+    dense = run(jnp.asarray(Xd))
+    sp = run(sparse.BCOO.fromdense(jnp.asarray(Xd)))
+    ad = np.concatenate([np.asarray(e.alpha) for e in dense.single_effects])
+    as_ = np.concatenate([np.asarray(e.alpha) for e in sp.single_effects])
+    np.testing.assert_allclose(ad, as_, atol=1e-4)
+    assert {6, 13} <= {int(np.argmax(np.asarray(e.alpha))) for e in dense.single_effects}
