@@ -28,6 +28,7 @@ from .engine import (
     subtract_message_index_step,
     snapshot_state_step,
     check_skl_convergence_step,
+    to_numpy_state_step,
 )
 from .linear import (
     reject_sparse_precenter,
@@ -50,8 +51,6 @@ class LocalJJFamilyState:
     intercept: float = 0.0
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
-    elbo_tolerance: float = 1e-3
-    elbo_history: list[float] = field(default_factory=lambda: [-np.inf])
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
     # `profile`: fit a per-feature profiled intercept b0_j (offset-shift invariant),
@@ -294,39 +293,6 @@ def update_effect_index_step(
         offset_var=offset_var,
     )
     return replace_effect_in_gibss_state(state, l, new_effect)
-
-
-def to_numpy_state(
-    state: GIBSSState[LocalJJFamilyState, Message | MeanMessage],
-) -> GIBSSState[LocalJJFamilyState, Message | MeanMessage]:
-    single_effects = [
-        replace(
-            effect,
-            mu=np.asarray(effect.mu),
-            var=np.asarray(effect.var),
-            alpha=np.asarray(effect.alpha),
-            pi=np.asarray(effect.pi),
-            feature_log_evidence=np.asarray(effect.feature_log_evidence),
-            marginal_log_likelihood=float(np.asarray(effect.marginal_log_likelihood)),
-            null_log_likelihood=float(np.asarray(effect.null_log_likelihood)),
-            kl=float(np.asarray(effect.kl)),
-        )
-        for effect in state.single_effects
-    ]
-    total_message = state.total_message.__class__(
-        np.asarray(state.total_message.mean),
-        *(
-            ()
-            if isinstance(state.total_message, MeanMessage)
-            else (np.asarray(state.total_message.var),)
-        ),
-    )
-    return replace(state, single_effects=single_effects, total_message=total_message)
-
-
-def to_numpy_state_step(data, state):
-    del data
-    return to_numpy_state(state)
 
 
 def default_schedule() -> Schedule:

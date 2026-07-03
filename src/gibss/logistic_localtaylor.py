@@ -38,6 +38,8 @@ from .engine import (
     replace_effect_in_gibss_state,
     snapshot_state_step,
     subtract_message_index_step,
+    to_numpy_state_step,
+    state_to_numpy as to_numpy_state,
 )
 from .linear import (
     LinearData,
@@ -247,30 +249,6 @@ def update_effect_index_step(data, l, state):
     offset = tm.mean if fs.profile else fs.intercept + tm.mean
     new_effect = _fit_effect(data, offset, effect.prior_variance, fs, offset_var, oi)
     return replace_effect_in_gibss_state(state, l, new_effect)
-
-
-def to_numpy_state(state):
-    single_effects = [
-        replace(
-            e, mu=np.asarray(e.mu), var=np.asarray(e.var), alpha=np.asarray(e.alpha),
-            pi=np.asarray(e.pi), feature_log_evidence=np.asarray(e.feature_log_evidence),
-            coefficient_kl=np.asarray(e.coefficient_kl), mode=np.asarray(e.mode),
-            hessian=np.asarray(e.hessian), b0=np.asarray(e.b0),
-        )
-        for e in state.single_effects
-    ]
-    tm = state.total_message
-    total_message = (
-        MeanMessage(np.asarray(tm.mean))
-        if isinstance(tm, MeanMessage)
-        else Message(np.asarray(tm.mean), np.asarray(tm.var))
-    )
-    return replace(state, single_effects=single_effects, total_message=total_message)
-
-
-def to_numpy_state_step(data, state):
-    del data
-    return to_numpy_state(state)
 
 
 def default_schedule() -> Schedule:

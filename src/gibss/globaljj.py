@@ -24,6 +24,7 @@ from .engine import (
     add_message_index_step,
     replace_effect_in_gibss_state,
     subtract_message_index_step,
+    state_to_numpy,
 )
 from .linear import (
     prep_data,
@@ -273,40 +274,12 @@ def compute_elbo_step(data, state):
     return replace(state, family_state=family_state)
 
 
-def to_numpy_state(
-    state: GIBSSState[GlobalJJFamilyState, Message | MeanMessage],
-) -> GIBSSState[GlobalJJFamilyState, Message | MeanMessage]:
-    single_effects = [
-        replace(
-            effect,
-            mu=np.asarray(effect.mu),
-            var=np.asarray(effect.var),
-            alpha=np.asarray(effect.alpha),
-            pi=np.asarray(effect.pi),
-            feature_log_evidence=np.asarray(effect.feature_log_evidence),
-            marginal_log_likelihood=float(np.asarray(effect.marginal_log_likelihood)),
-            null_log_likelihood=float(np.asarray(effect.null_log_likelihood)),
-            kl=float(np.asarray(effect.kl)),
-        )
-        for effect in state.single_effects
-    ]
-    total_message = state.total_message.__class__(
-        np.asarray(state.total_message.mean),
-        *(
-            ()
-            if isinstance(state.total_message, MeanMessage)
-            else (np.asarray(state.total_message.var),)
-        ),
-    )
+def to_numpy_state(state):
+    # generic effects + message, plus globaljj's derived family fields (xi, cbar).
+    state = state_to_numpy(state)
     fs = state.family_state
     cbar = None if fs.cbar is None else np.asarray(fs.cbar)
-    family_state = replace(fs, xi=np.asarray(fs.xi), cbar=cbar)
-    return replace(
-        state,
-        single_effects=single_effects,
-        total_message=total_message,
-        family_state=family_state,
-    )
+    return replace(state, family_state=replace(fs, xi=np.asarray(fs.xi), cbar=cbar))
 
 
 def to_numpy_state_step(data, state):

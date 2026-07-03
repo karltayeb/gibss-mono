@@ -280,6 +280,31 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
         return tuple(e.get_cs(coverage=coverage) for e in self.single_effects)
 
 
+def _to_numpy_leaf(x):
+    if x is None or isinstance(x, (str, bool)):
+        return x
+    a = np.asarray(x)
+    return float(a) if a.ndim == 0 else a
+
+
+def state_to_numpy(state: GIBSSState) -> GIBSSState:
+    """Move a fitted state to host numpy: numpy-ify every effect field (arrays ->
+    np.asarray, 0-d -> float) and rebuild the total message by its type. Generic over
+    the effect/message dataclasses -- one implementation for every family."""
+    effects = [
+        replace(e, **{f: _to_numpy_leaf(getattr(e, f)) for f in e.__dataclass_fields__})
+        for e in state.single_effects
+    ]
+    tm = state.total_message
+    tm = tm.__class__(*(_to_numpy_leaf(getattr(tm, f)) for f in tm.__dataclass_fields__))
+    return replace(state, single_effects=effects, total_message=tm)
+
+
+def to_numpy_state_step(data, state):
+    del data
+    return state_to_numpy(state)
+
+
 def replace_effect_in_gibss_state(state, l, new_effect):
     single_effects = list(state.single_effects)
     single_effects[l] = new_effect

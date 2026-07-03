@@ -39,6 +39,7 @@ from .engine import (
     replace_effect_in_gibss_state,
     snapshot_state_step,
     subtract_message_index_step,
+    to_numpy_state_step,
 )
 from .linear import LinearData, is_bcoo, prep_data, update_prior_variance_index_step
 
@@ -354,25 +355,6 @@ def _empty_centered_effect(p: int) -> IRLSCenteredEffect:
     return IRLSCenteredEffect(
         **{f: getattr(base, f) for f in base.__dataclass_fields__}, cbar=np.zeros(p)
     )
-
-
-def to_numpy_state_step(data, state):
-    del data
-    single_effects = [
-        replace(
-            e,
-            mu=np.asarray(e.mu), var=np.asarray(e.var), alpha=np.asarray(e.alpha),
-            pi=np.asarray(e.pi), feature_log_evidence=np.asarray(e.feature_log_evidence),
-        )
-        for e in state.single_effects
-    ]
-    m = state.total_message
-    tm = (
-        MeanMessage(np.asarray(m.mean))
-        if isinstance(m, MeanMessage)
-        else Message(np.asarray(m.mean), np.asarray(m.var))
-    )
-    return replace(state, single_effects=single_effects, total_message=tm)
 
 
 def default_schedule() -> Schedule:
