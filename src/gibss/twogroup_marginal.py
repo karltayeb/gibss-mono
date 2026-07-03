@@ -50,6 +50,7 @@ __all__ = [
     "TwoGroupMarginalFamilyState",
     "prep_data",
     "initialize_state",
+    "fit",
     "update_effect_index_step",
     "update_intercept_step",
     "default_schedule",
@@ -108,6 +109,24 @@ def initialize_state(data, L=1, family_state_kwargs=None):
         total_message=Message(jnp.zeros(n), jnp.zeros(n)),
         family_state=fs,
     )
+
+
+def fit(X, bhat, se, f0, f1, L=1, max_iter=50, family_state_kwargs=None):
+    """One-call marginalized two-group SER: no EM over z, exact per-feature marginal.
+
+    Assembles the `twogroup` wrapper (f0/f1 M-steps) around the marginal inner family
+    and runs the engine. Returns the fitted `GIBSSState`; `state.family_state.f0/f1`
+    are the fitted null/alternative and `state.single_effects[l].alpha` the PIPs.
+    """
+    from . import twogroup
+    from .engine import fit_ibss
+
+    data = twogroup.prep_data(X, bhat=bhat, se=se)
+    inner = initialize_state(prep_data(X, np.zeros(len(bhat))), L=L,
+                             family_state_kwargs=family_state_kwargs)
+    state = twogroup.initialize_state(data, inner, f0, f1)
+    schedule = twogroup.local_default_schedule(default_schedule())
+    return fit_ibss(data, state, schedule, max_iter=max_iter)
 
 
 def estimate_intercept(data, state):

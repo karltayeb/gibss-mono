@@ -30,10 +30,7 @@ def _sim(seed, n=400, p=10, causal=3, b0=-1.0, beta=2.0, f1_sd=2.0):
 
 def _fit_marginal(X, bhat, se, L=2, max_iter=50):
     f0, f1 = PointMass(), Normal(scale=2.0, estimate_scale=True)
-    data = twogroup.prep_data(X, bhat=bhat, se=se)
-    inner = TM.initialize_state(TM.prep_data(X, np.zeros(len(bhat))), L=L)
-    state = twogroup.initialize_state(data, inner, f0, f1)
-    return fit_ibss(data, state, twogroup.local_default_schedule(TM.default_schedule()), max_iter=max_iter)
+    return TM.fit(X, bhat, se, f0, f1, L=L, max_iter=max_iter)
 
 
 def _fit_em(X, bhat, se, L=2, max_iter=50):
