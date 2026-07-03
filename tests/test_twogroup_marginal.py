@@ -74,6 +74,22 @@ def test_marginal_at_least_as_sharp_as_em():
     assert _feat_pip(_fit_marginal(X, bhat, se), 3) >= _feat_pip(_fit_em(X, bhat, se), 3)
 
 
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_marginal_null_calibration(seed):
+    # No feature drives enrichment (constant logit): the SER must stay diffuse -- no
+    # confident false discovery. Guard that no effect concentrates a high PIP.
+    rng = np.random.default_rng(100 + seed)
+    n, p = 400, 10
+    X = rng.normal(size=(n, p))
+    z = rng.binomial(1, 1 / (1 + np.exp(-(-1.0))), n)  # no X dependence
+    se = np.ones(n)
+    bhat = z * rng.normal(0, 2.0, n) + rng.normal(0, se)
+    st = _fit_marginal(X, bhat, se)
+    maxpip = max(float(np.asarray(e.alpha).max()) for e in st.single_effects)
+    assert maxpip < 0.9  # no feature falsely certain
+    assert all(len(e.get_cs(0.95)) > 2 for e in st.single_effects)  # CS stays broad
+
+
 def test_marginal_dense_sparse_parity():
     # the full engine loop agrees to machine precision on dense vs BCOO input
     import jax
