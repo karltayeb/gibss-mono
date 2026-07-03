@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 
 from .engine import (
-    BaseSERState,
     GIBSSState,
     Message,
     Schedule,
@@ -33,7 +32,7 @@ from .engine import (
 from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
 from .operators import as_operator
 from .response import Bernoulli, ResponseModel
-from .response_ser import glm_ser
+from .response_ser import build_ser_state, glm_ser
 
 __all__ = [
     "GLMFamilyState",
@@ -60,23 +59,10 @@ def _fit_effect(data, response, offset, prior_variance, order):
     aux = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
-    p = data.X.shape[1]
     mu, var, log_bf, coefficient_kl = glm_ser(op, aux, offset, prior_variance, response, order=order)
     # log_bf is relative to the b=0 fit at `offset`; alpha only needs the relative
     # feature evidence, so use log_bf directly (the shared baseline cancels).
-    feature_log_evidence = log_bf
-    log_norm = jax.nn.logsumexp(feature_log_evidence)
-    alpha = jnp.exp(feature_log_evidence - log_norm)
-    alpha = alpha / jnp.sum(alpha)
-    log_pi = -jnp.log(float(p))
-    kl = float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi)) + jnp.sum(alpha * coefficient_kl))
-    return BaseSERState(
-        mu=mu, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
-        prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
-        marginal_log_likelihood=float(log_norm - jnp.log(float(p))),
-        null_log_likelihood=0.0, kl=kl,
-    )
+    return build_ser_state(mu, var, log_bf, coefficient_kl, prior_variance)
 
 
 def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_state_kwargs=None):

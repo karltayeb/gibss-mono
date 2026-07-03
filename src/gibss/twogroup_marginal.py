@@ -29,7 +29,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from .engine import (
-    BaseSERState,
     GIBSSState,
     Message,
     Schedule,
@@ -43,7 +42,7 @@ from .engine import (
 from .linear import LinearData, prep_data, update_prior_variance_index_step
 from .operators import as_operator
 from .response import TwoGroupMarginal
-from .response_ser import glm_ser
+from .response_ser import build_ser_state, glm_ser
 
 _RESPONSE = TwoGroupMarginal()
 
@@ -85,7 +84,6 @@ def _fit_effect(data, offset, prior_variance, order):
     llr = jnp.asarray(data.y)  # injected by the twogroup wrapper
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
-    p = data.X.shape[1]
     mu, var, log_bf, coefficient_kl = glm_ser(
         op, llr, offset, prior_variance, _RESPONSE, order=order
     )
@@ -94,19 +92,8 @@ def _fit_effect(data, offset, prior_variance, order):
     baseline = jnp.sum(_RESPONSE.terms(offset, llr)[0])
     feature_log_evidence = log_bf + baseline
     null_ll = _marginal_null(llr, offset)
-    log_norm = jax.nn.logsumexp(feature_log_evidence)
-    alpha = jnp.exp(feature_log_evidence - log_norm)
-    alpha = alpha / jnp.sum(alpha)
-    log_pi = -jnp.log(float(p))
-    kl = float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi))
-               + jnp.sum(alpha * coefficient_kl))
-    return BaseSERState(
-        mu=mu, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
-        prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
-        marginal_log_likelihood=float(log_norm - jnp.log(float(p))),
-        null_log_likelihood=float(null_ll), kl=kl,
-    )
+    return build_ser_state(mu, var, feature_log_evidence, coefficient_kl,
+                           prior_variance, null_log_likelihood=null_ll)
 
 
 def initialize_state(data, L=1, family_state_kwargs=None):

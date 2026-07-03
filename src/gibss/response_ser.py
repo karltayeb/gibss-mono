@@ -16,11 +16,36 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
+from .engine import BaseSERState
 from .operators import DesignOperator
 from .response import Bernoulli, ResponseModel
 from .ser_ops import _gh_rule, _normal_logpdf
 
-__all__ = ["glm_ser"]
+__all__ = ["glm_ser", "build_ser_state"]
+
+
+def build_ser_state(mu, var, feature_log_evidence, coefficient_kl, prior_variance,
+                    null_log_likelihood=0.0):
+    """Assemble a `BaseSERState` from per-feature glm_ser outputs.
+
+    `feature_log_evidence` is the per-feature log-evidence (log-BF up to a shared,
+    feature-independent baseline that cancels in `alpha`). Shared by every family
+    built on `glm_ser`; only how the evidence baseline / null are defined differs.
+    """
+    p = feature_log_evidence.shape[0]
+    log_norm = jax.nn.logsumexp(feature_log_evidence)
+    alpha = jnp.exp(feature_log_evidence - log_norm)
+    alpha = alpha / jnp.sum(alpha)
+    log_pi = -jnp.log(float(p))
+    kl = float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi))
+               + jnp.sum(alpha * coefficient_kl))
+    return BaseSERState(
+        mu=mu, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
+        prior_variance=float(prior_variance),
+        feature_log_evidence=feature_log_evidence,
+        marginal_log_likelihood=float(log_norm - jnp.log(float(p))),
+        null_log_likelihood=float(null_log_likelihood), kl=kl,
+    )
 
 
 @partial(jax.jit, static_argnames=("order", "n_iter", "response"))
