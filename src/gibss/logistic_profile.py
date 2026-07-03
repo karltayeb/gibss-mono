@@ -56,7 +56,6 @@ from .linear import LinearData, prep_data, reject_sparse_precenter, update_prior
 from .logistic_quadrature import (
     _hermgauss_rule,
     _is_bcoo,
-    _logistic_loglik,
     _normal_logpdf,
 )
 from .ser_ops import _smooth_cumulant, _smooth_A_only

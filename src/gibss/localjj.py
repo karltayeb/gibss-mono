@@ -33,7 +33,6 @@ from .linear import (
     reject_sparse_precenter,
     prep_data,
     _empty_effect,
-    _logsumexp,
     LinearData,
     update_prior_variance_index_step,
 )
@@ -58,7 +57,8 @@ class LocalJJFamilyState:
     # Per-feature profiled intercept via weighted column centering, parameterization
     # (b): profiled (centered) mean + conditional (uncentered) variance. Each feature
     # owns its intercept (offset = leave-one-out message only); validated monotone &
-    # joint-optimal at the univariate level. Dense bound is O(n*p) (sparse: TODO).
+    # joint-optimal at the univariate level. Dense uses the exact O(n*p) JJ
+    # row-background; sparse uses the Chebyshev surrogate (O(nD+Dp)).
     center: bool = False
 
 
