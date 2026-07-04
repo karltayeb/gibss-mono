@@ -19,9 +19,118 @@ import jax.numpy as jnp
 from .engine import BaseSERState
 from .operators import DesignOperator
 from .response import Bernoulli, ResponseModel
-from .ser_ops import _gh_rule, _normal_logpdf
+from .ser_ops import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
-__all__ = ["glm_ser", "build_ser_state"]
+__all__ = ["glm_ser", "build_ser_state", "glm_profile_map"]
+
+
+def _background(response, offset, aux, c, mode: str = "exact", degree: int = 40):
+    """All-rows sums (W, G, L) of (weight, grad, loglik) at eta = offset + c, per c_j.
+
+    The x-free (intercept) part of a profiled per-column fit: it depends only on the
+    scalar intercept `c` (a (p,) vector, one per feature), NOT on the design column, so
+    it is shared across features/nodes. `mode="exact"` sums directly O(n*p); "chebyshev"
+    fits a 1-D surrogate of c -> sum_i f(offset_i + c) once (O(n*D)) then evaluates at c
+    (O(D*p)) -- the win when the intercept is re-profiled per feature/node on sparse."""
+    offset = jnp.asarray(offset)
+    aux = jnp.asarray(aux)
+    c = jnp.asarray(c)
+    if mode == "chebyshev":
+        xnodes_np, P_np = _cheb_fit_matrix(degree)
+        xnodes, P = jnp.asarray(xnodes_np), jnp.asarray(P_np)
+        c_lo, c_hi = jnp.min(c) - 0.5, jnp.max(c) + 0.5
+        c_nodes = 0.5 * (c_hi + c_lo) + 0.5 * (c_hi - c_lo) * xnodes  # (D+1,)
+        eta = offset[:, None] + c_nodes[None, :]  # (n, D+1)
+        ll, g, w = response.terms(eta, aux[:, None])
+        aw, ag, al = P @ jnp.sum(w, 0), P @ jnp.sum(g, 0), P @ jnp.sum(ll, 0)
+        t = (2.0 * c - (c_hi + c_lo)) / (c_hi - c_lo)  # map to [-1, 1]
+        return _clenshaw(aw, t), _clenshaw(ag, t), _clenshaw(al, t)
+    eta0 = offset[:, None] + c[None, :]  # (n, p)
+    ll, g, w = response.terms(eta0, aux[:, None])
+    return jnp.sum(w, 0), jnp.sum(g, 0), jnp.sum(ll, 0)
+
+
+def _profile_null(response, offset, aux, n_iter: int = 80):
+    """Profiled null intercept c0 = argmax_c sum_i loglik(offset_i + c) at b = 0, and
+    the all-rows null loglik there. Generic Newton on the response score/curvature."""
+    offset = jnp.asarray(offset)
+    aux = jnp.asarray(aux)
+
+    def body(state):
+        c, it = state
+        _, g, w = response.terms(offset + c, aux)
+        step = jnp.sum(g) / jnp.maximum(jnp.sum(w), 1e-8)
+        return c + jnp.clip(step, -4.0, 4.0), it + 1
+
+    c0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
+    ll0 = jnp.sum(response.terms(offset + c0, aux)[0])
+    return c0, ll0
+
+
+@partial(jax.jit, static_argnames=("response", "n_iter", "background", "degree"))
+def glm_profile_map(op, aux, offset, prior_variance, response: ResponseModel = Bernoulli(),
+                    n_iter: int = 60, tol: float = 1e-8, background: str = "exact",
+                    degree: int = 40):
+    """Per-column MAP with a PROFILED per-feature intercept (b0_j, b_j): a 2-D Newton
+    on (b0, b) per feature, split into the all-rows intercept background + the
+    support-only correction. Generic over `response`; reduces to `local_irls_centered`
+    for Bernoulli. Returns (b, b0, var, laplace_log_bf).
+
+    Only the x^0 terms (intercept score g0, curvature H00, evidence ll) use the
+    background; everything with an x factor (gb, H0b, Hbb) is support-only, so on a
+    sparse `op` the correction is O(nnz) and only the background sees all rows."""
+    aux = jnp.asarray(aux)
+    offset = jnp.asarray(offset)
+    aux_e = op.broadcast_rows(aux)
+    off_e = op.broadcast_rows(offset)
+    inv_pv = 1.0 / prior_variance
+
+    def _bg(b0):
+        return _background(response, offset, aux, b0, background, degree)
+
+    def newton(b, b0):
+        b0_e = op.broadcast_cols(b0)
+        eta = off_e + b0_e + op.column_linpred(b)  # support entries carry x*b
+        eta0 = off_e + b0_e  # b = 0 background config
+        _, g, w = response.terms(eta, aux_e)
+        _, g0, w0 = response.terms(eta0, aux_e)
+        BGw, BGg, _ = _bg(b0)
+        H00 = BGw + op.local_moment(0, w - w0)  # all rows (bg) + support correction
+        H0b = op.local_moment(1, w)  # support (x factor)
+        Hbb = op.local_moment(2, w) + inv_pv  # support
+        gb0 = BGg + op.local_moment(0, g - g0)  # all-rows intercept score
+        gb = op.local_moment(1, g) - inv_pv * b  # support effect score
+        return H00, H0b, Hbb, gb0, gb
+
+    c0, ll_null = _profile_null(response, offset, aux)
+
+    def body(state):
+        b, b0, _, it = state
+        H00, H0b, Hbb, gb0, gb = newton(b, b0)
+        det = H00 * Hbb - H0b**2
+        db0 = jnp.clip((Hbb * gb0 - H0b * gb) / det, -4.0, 4.0)
+        db = jnp.clip((H00 * gb - H0b * gb0) / det, -4.0, 4.0)
+        resid = jnp.maximum(jnp.max(jnp.abs(db)), jnp.max(jnp.abs(db0)))
+        return b + db, b0 + db0, resid, it + 1
+
+    b, b0, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol), body,
+        (jnp.zeros(op.p), jnp.full(op.p, c0), jnp.inf, 0),
+    )
+    ok = jnp.isfinite(b) & jnp.isfinite(b0)
+    b = jnp.where(ok, b, 0.0)
+    b0 = jnp.where(ok, b0, c0)
+
+    H00, H0b, Hbb, _, _ = newton(b, b0)
+    schur = Hbb - H0b**2 / H00  # profiled curvature (includes the prior in Hbb)
+    var = 1.0 / schur
+    _, _, BGll = _bg(b0)
+    eta = off_e + op.broadcast_cols(b0) + op.column_linpred(b)
+    eta0 = off_e + op.broadcast_cols(b0)
+    ll_alt = BGll + op.local_moment(0, response.terms(eta, aux_e)[0]
+                                    - response.terms(eta0, aux_e)[0])
+    log_bf = (ll_alt - ll_null) - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * schur)
+    return b, b0, var, log_bf
 
 
 def build_ser_state(mu, var, feature_log_evidence, coefficient_kl, prior_variance,

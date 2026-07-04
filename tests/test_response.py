@@ -7,8 +7,8 @@ from jax.experimental import sparse
 
 from gibss.operators import BCOOOperator, CenteredOperator, DenseOperator
 from gibss.response import Bernoulli, Gaussian, Poisson, TwoGroupMarginal
-from gibss.response_ser import glm_ser
-from gibss.ser_ops import quadrature_ser
+from gibss.response_ser import glm_profile_map, glm_ser
+from gibss.ser_ops import local_irls_centered, quadrature_ser
 
 
 @pytest.mark.parametrize(
@@ -165,6 +165,58 @@ def test_centered_sparse_per_column_raises():
     # per-row interface (message / global-Gaussian) is unaffected, stays matrix-free
     assert cop.matvec(jnp.ones(p)).shape == (n,)
     assert cop.moment(2, jnp.ones(n)).shape == (p,)
+
+
+@pytest.mark.parametrize("opkind", ["dense", "bcoo"])
+@pytest.mark.parametrize("background", ["exact", "chebyshev"])
+def test_glm_profile_map_matches_local_irls_centered(opkind, background):
+    # the response-generic profiled MAP reproduces the Bernoulli reference kernel
+    # (local_irls_centered) on dense/sparse and exact/chebyshev background.
+    rng = np.random.default_rng(0)
+    n, p = 300, 10
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.5 + 2.0  # nonzero offset exercises the intercept
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-2 + 1.5 * X[:, 3]))), n).astype(float)
+    op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
+          else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
+    gen = glm_profile_map(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), background=background)
+    ref = local_irls_centered(op, jnp.asarray(y), jnp.asarray(off), 1.0, background=background, offset_var=None)
+    for u, v in zip(gen, ref):
+        np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
+
+
+@pytest.mark.parametrize("resp,mk", [
+    (Bernoulli(), lambda X, rng: rng.binomial(1, 1 / (1 + np.exp(-(-1 + 1.2 * X[:, 2]))), X.shape[0]).astype(float)),
+    (Poisson(), lambda X, rng: rng.poisson(np.exp(0.3 + 0.7 * X[:, 2])).astype(float)),
+])
+def test_glm_profile_map_offset_shift_invariant(resp, mk):
+    # profiling makes the logBF invariant to a constant offset shift (b0 absorbs it) --
+    # the property the shared-intercept quadrature does NOT have.
+    rng = np.random.default_rng(1)
+    n, p = 400, 8
+    X = rng.normal(size=(n, p))
+    op = DenseOperator(jnp.asarray(X))
+    y = mk(X, rng)
+    a = glm_profile_map(op, jnp.asarray(y), jnp.zeros(n), 1.0, resp)
+    b = glm_profile_map(op, jnp.asarray(y), jnp.full(n, 4.0), 1.0, resp)
+    np.testing.assert_allclose(np.asarray(a[3]), np.asarray(b[3]), atol=1e-8)  # logBF unchanged
+    assert int(np.argmax(np.asarray(a[3]))) == 2  # recovers the signal feature
+
+
+def test_glm_profile_map_dense_sparse_and_exact_cheb_agree():
+    rng = np.random.default_rng(2)
+    n, p = 300, 10
+    X = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.4)
+    off = rng.normal(size=n) * 0.4
+    y = rng.binomial(1, 1 / (1 + np.exp(-(X[:, 1]))), n).astype(float)
+    dense = glm_profile_map(DenseOperator(jnp.asarray(X)), jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli())
+    sparse_op = BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X)))
+    bcoo = glm_profile_map(sparse_op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli())
+    cheb = glm_profile_map(sparse_op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), background="chebyshev")
+    for u, v in zip(dense, bcoo):
+        np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
+    for u, v in zip(bcoo, cheb):  # chebyshev background reproduces exact here
+        np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-6)
 
 
 def test_glm_ser_dense_sparse_parity():
