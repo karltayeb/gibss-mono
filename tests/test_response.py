@@ -151,6 +151,22 @@ def test_centering_profiles_intercept_one_step():
     assert np.asarray(cen[2])[0] > np.asarray(raw[2]).max()
 
 
+def test_centered_sparse_per_column_raises():
+    # per-column centering over a sparse base would densify + miscount, so it raises
+    # (the per-ROW interface stays fine on BCOO -- that's the message path).
+    rng = np.random.default_rng(7)
+    n, p = 100, 5
+    X = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.5)
+    Xs = sparse.BCOO.fromdense(jnp.asarray(X))
+    cop = CenteredOperator.from_weights(BCOOOperator(Xs), jnp.ones(n))
+    with pytest.raises(NotImplementedError):
+        glm_ser(cop, jnp.asarray(rng.binomial(1, 0.5, n).astype(float)),
+                jnp.zeros(n), 1.0, Bernoulli(), order=5)
+    # per-row interface (message / global-Gaussian) is unaffected, stays matrix-free
+    assert cop.matvec(jnp.ones(p)).shape == (n,)
+    assert cop.moment(2, jnp.ones(n)).shape == (p,)
+
+
 def test_glm_ser_dense_sparse_parity():
     rng = np.random.default_rng(3)
     n, p = 300, 10

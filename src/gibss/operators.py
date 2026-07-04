@@ -99,6 +99,15 @@ class DesignOperator:
     def p(self) -> int:
         return self.shape[1]
 
+    @property
+    def full_grid_entries(self) -> bool:
+        """True if the per-column (entry) interface spans all n*p cells.
+
+        Dense operators do; sparse ones carry only the nnz support. Per-column
+        CENTERING needs the full grid (the zeros become -c_j), so it is only correct
+        over a full-grid base -- see CenteredOperator's per-column methods."""
+        return False
+
 
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
@@ -148,6 +157,10 @@ class DenseOperator(DesignOperator):
     @property
     def entry_x(self):
         return self.X
+
+    @property
+    def full_grid_entries(self) -> bool:
+        return True
 
     def with_gram(self) -> "DenseOperator":
         return DenseOperator(self.X, self.X.T @ self.X)
@@ -318,10 +331,25 @@ class CenteredOperator(DesignOperator):
     # values shift by -c_j, so every primitive is the base's plus a rank-1 (binomial)
     # correction, exactly like `moment` above.
     #
-    # CAVEAT: this assumes a FULL-GRID entry space (dense base). On a sparse base the
-    # off-support entries (x_ij = 0) become -c_j != 0, so the fit densifies and
-    # base.local_moment(0, .) -- which counts support only -- would undercount. Center
-    # for per-column fits only over a dense base (as_operator on a dense array).
+    # DENSE BASE ONLY. On a sparse base the off-support entries (x_ij = 0) become
+    # -c_j != 0, so a correct centered per-column fit needs all n*p entries (each with
+    # its own weight w(eta_ij)) -- it is genuinely dense, and base.local_moment(0, .),
+    # which counts support only, silently undercounts. The per-ROW interface (matvec /
+    # matvec_sq / moment -- the message and global-Gaussian SER) has per-row weights,
+    # stays matrix-free on BCOO, and is unaffected by this. We guard the per-column
+    # methods so a sparse base raises instead of returning wrong numbers.
+    @property
+    def full_grid_entries(self) -> bool:
+        return self.base.full_grid_entries
+
+    def _require_full_grid(self):
+        if not self.base.full_grid_entries:
+            raise NotImplementedError(
+                "per-column centering needs a full-grid (dense) base: centering fills "
+                "the zeros, so the fit is O(n*p). Center over a dense operator, or keep "
+                "the sparse design raw and let the intercept (in the offset) absorb the "
+                "column location."
+            )
 
     def broadcast_rows(self, v):
         return self.base.broadcast_rows(v)  # row lift is unaffected by centering
@@ -331,10 +359,12 @@ class CenteredOperator(DesignOperator):
 
     def column_linpred(self, b):
         # (x_ij - c_j) b_j = base.column_linpred(b) - broadcast_cols(c * b)
+        self._require_full_grid()
         return self.base.column_linpred(b) - self.base.broadcast_cols(self.c * b)
 
     def local_moment(self, k, W):
         # sum_i (x_ij - c_j)^k W_ij = sum_r C(k,r) (-c)^r base.local_moment(k-r, W)
+        self._require_full_grid()
         total = jnp.zeros(self.shape[1])
         for r in range(k + 1):
             total = total + comb(k, r) * (-self.c) ** r * self.base.local_moment(k - r, W)
@@ -342,6 +372,7 @@ class CenteredOperator(DesignOperator):
 
     @property
     def entry_x(self):
+        self._require_full_grid()
         return self.base.entry_x - self.base.broadcast_cols(self.c)
 
     def recenter(self, w) -> "CenteredOperator":
