@@ -69,10 +69,33 @@ Gaussian:   loglik = -(y-eta)^2/2v, grad = (y-eta)/v, weight = 1/v. The per-effe
 5. [done] `glm.py`: generic GLM-SER engine family parameterized by a ResponseModel.
    Logistic = GLM(Bernoulli), Poisson = GLM(Poisson), one code path (`test_glm.py`).
    The glm_ser -> BaseSERState adapter is shared (`response_ser.build_ser_state`).
-6. [open] Offset/variance integration in glm_ser (GH-over-o), then fold
+6. [done] Profiling (per-feature intercept) is response-generic: `glm_profile_map`
+   (MAP) + `glm_profile_ser` (GH tail), reproducing `local_irls_centered` /
+   `profile_ser` to ~1e-14 across dense/sparse x exact/chebyshev x linear/newton.
+   Wired into the `glm` family (`profile`/`background`/`node_intercept`); matches
+   `logistic_localtaylor` profile mode end-to-end. See "Profiling" below.
+7. [open] Offset/variance integration in glm_ser (GH-over-o), then fold
    `logistic_localtaylor` onto it. Retire the EM `twogrouplocaljj`/localjj path once
    the marginal is the default. Not done -- localtaylor still carries the per-row-var
    message that glm_ser doesn't yet.
+
+## Profiling = background + correction (the sparse-centering story)
+A profiled per-column fit (`offset + b0_j + x_ij b_j`, b0 profiled out -> offset-shift
+invariant) splits every reduction into:
+  - **background (l_d)**: the x^0 intercept terms `Sum_i grad`, `Sum_i weight`,
+    `Sum_i loglik` at the b=0 config `eta0 = offset + b0`. Depends only on the scalar
+    b0, shared across features/nodes. `_background`: "exact" O(n*p) or "chebyshev"
+    O(n*D + D*p) surrogate of `c -> Sum_i f(offset+c)`.
+  - **correction (l_s)**: everything with an x factor (gb, H0b, Hbb, the loglik
+    support diff). Off-support rows cancel -> pure support -> **O(nnz)** on BCOO.
+"exact vs chebyshev" is purely the background's treatment; the correction is always
+the direct support reduction. This is why sparse profiling exploits sparsity: only the
+scalar-intercept background sees all rows, and even that is O(nD) under chebyshev.
+
+Centering is the fused-exact special case: `CenteredOperator.moment`'s binomial folds
+background (the k=0/all-rows term) + correction into one call (dense; on BCOO the
+per-ENTRY interface is guarded off since centering densifies -- use the background
+split instead).
 
 ## The intercept degeneracy (two-group marginal) -- the one real subtlety
 The marginal loglik `softplus(eta+llr) - softplus(eta) -> llr` as `eta -> +inf`, so at
