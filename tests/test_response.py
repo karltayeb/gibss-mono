@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from jax.experimental import sparse
 
-from gibss.operators import BCOOOperator, DenseOperator
+from gibss.operators import BCOOOperator, CenteredOperator, DenseOperator
 from gibss.response import Bernoulli, Gaussian, Poisson, TwoGroupMarginal
 from gibss.response_ser import glm_ser
 from gibss.ser_ops import quadrature_ser
@@ -113,6 +113,42 @@ def test_gaussian_glm_ser_matches_closed_form():
     logbf_cf = 0.5 * (xty**2 / prec) + 0.5 * np.log(1.0 / pv) - 0.5 * np.log(prec)
     np.testing.assert_allclose(np.asarray(g[0]), mu_cf, atol=1e-10)
     np.testing.assert_allclose(np.asarray(g[2]), logbf_cf, atol=1e-9)
+
+
+def test_glm_ser_centered_operator_matches_dense():
+    # A CenteredOperator (dense base) fits offset + (x_ij - c_j) b_j; through glm_ser
+    # it equals a manually pre-centered dense design, to machine precision.
+    rng = np.random.default_rng(5)
+    n, p = 200, 6
+    X = rng.normal(size=(n, p)) + 3.0  # off-center columns
+    off = np.zeros(n)
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-9 + 3 * X[:, 0]))), n).astype(float)
+    c = X.mean(0)
+    manual = DenseOperator(jnp.asarray(X - c))
+    centered = CenteredOperator.from_weights(DenseOperator(jnp.asarray(X)), jnp.ones(n))
+    for resp, order in [(Bernoulli(), 1), (Bernoulli(), 15), (Gaussian(variance=0.5), 9)]:
+        a = glm_ser(manual, jnp.asarray(y), jnp.asarray(off), 1.0, resp, order=order)
+        b = glm_ser(centered, jnp.asarray(y), jnp.asarray(off), 1.0, resp, order=order)
+        for u, v in zip(a, b):
+            np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-10)
+
+
+def test_centering_profiles_intercept_one_step():
+    # Centering decorrelates b from the intercept: a single Newton step at b0=0 then
+    # already finds the signal, where the raw (uncentered) one-step misses it.
+    rng = np.random.default_rng(6)
+    n, p = 200, 6
+    X = rng.normal(size=(n, p)) + 3.0
+    off = np.zeros(n)
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-9 + 3 * X[:, 0]))), n).astype(float)
+    c = X.mean(0)
+    raw = glm_ser(DenseOperator(jnp.asarray(X)), jnp.asarray(y), jnp.asarray(off), 1.0,
+                  Bernoulli(), order=1, n_iter=1)
+    cen = glm_ser(DenseOperator(jnp.asarray(X - c)), jnp.asarray(y), jnp.asarray(off), 1.0,
+                  Bernoulli(), order=1, n_iter=1)
+    # centered one-step certifies feature 0; raw one-step does not
+    assert int(np.argmax(np.asarray(cen[2]))) == 0
+    assert np.asarray(cen[2])[0] > np.asarray(raw[2]).max()
 
 
 def test_glm_ser_dense_sparse_parity():

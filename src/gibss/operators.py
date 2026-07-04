@@ -312,6 +312,38 @@ class CenteredOperator(DesignOperator):
     def gram_matvec(self, v):
         return self.rmatvec(self.matvec(v))  # centered gram, matrix-free
 
+    # --- per-column ("local") interface -------------------------------------
+    # Centering a per-column fit (offset + (x_ij - c_j) b_j) profiles out the
+    # intercept: one Newton step is then already intercept-decorrelated. The entry
+    # values shift by -c_j, so every primitive is the base's plus a rank-1 (binomial)
+    # correction, exactly like `moment` above.
+    #
+    # CAVEAT: this assumes a FULL-GRID entry space (dense base). On a sparse base the
+    # off-support entries (x_ij = 0) become -c_j != 0, so the fit densifies and
+    # base.local_moment(0, .) -- which counts support only -- would undercount. Center
+    # for per-column fits only over a dense base (as_operator on a dense array).
+
+    def broadcast_rows(self, v):
+        return self.base.broadcast_rows(v)  # row lift is unaffected by centering
+
+    def broadcast_cols(self, b):
+        return self.base.broadcast_cols(b)
+
+    def column_linpred(self, b):
+        # (x_ij - c_j) b_j = base.column_linpred(b) - broadcast_cols(c * b)
+        return self.base.column_linpred(b) - self.base.broadcast_cols(self.c * b)
+
+    def local_moment(self, k, W):
+        # sum_i (x_ij - c_j)^k W_ij = sum_r C(k,r) (-c)^r base.local_moment(k-r, W)
+        total = jnp.zeros(self.shape[1])
+        for r in range(k + 1):
+            total = total + comb(k, r) * (-self.c) ** r * self.base.local_moment(k - r, W)
+        return total
+
+    @property
+    def entry_x(self):
+        return self.base.entry_x - self.base.broadcast_cols(self.c)
+
     def recenter(self, w) -> "CenteredOperator":
         """New centered view with offsets from weights `w` (base reused)."""
         return CenteredOperator.from_weights(self.base, w)
