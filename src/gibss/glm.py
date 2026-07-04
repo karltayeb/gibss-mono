@@ -32,7 +32,7 @@ from .engine import (
 from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
 from .operators import as_operator
 from .response import Bernoulli, ResponseModel
-from .response_ser import build_ser_state, glm_ser
+from .response_ser import build_ser_state, glm_profile_ser, glm_ser
 
 __all__ = [
     "GLMFamilyState",
@@ -51,15 +51,30 @@ class GLMFamilyState:
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
     quadrature_order: int = 15
+    # profiling: a per-feature intercept b0_j is profiled out inside the kernel
+    # (offset-shift invariant), instead of a single shared `intercept`. `background`
+    # is the treatment of the all-rows intercept term: "exact" O(n*p) / "chebyshev"
+    # O(n*D + D*p) (for sparse / large p). node_intercept: "linear" | "newton".
+    profile: bool = False
+    background: str = "exact"
+    node_intercept: str = "linear"
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
 
 
-def _fit_effect(data, response, offset, prior_variance, order):
+def _fit_effect(data, fs, offset, prior_variance, order):
     aux = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
-    mu, var, log_bf, coefficient_kl = glm_ser(op, aux, offset, prior_variance, response, order=order)
+    if fs.profile:
+        mu, var, log_bf, coefficient_kl, _, _ = glm_profile_ser(
+            op, aux, offset, prior_variance, fs.response, order=order,
+            background=fs.background, node_intercept=fs.node_intercept,
+        )
+    else:
+        mu, var, log_bf, coefficient_kl = glm_ser(
+            op, aux, offset, prior_variance, fs.response, order=order
+        )
     # log_bf is relative to the b=0 fit at `offset`; alpha only needs the relative
     # feature evidence, so use log_bf directly (the shared baseline cancels).
     return build_ser_state(mu, var, log_bf, coefficient_kl, prior_variance)
@@ -95,16 +110,18 @@ def estimate_intercept(data, state):
 
 def estimate_intercept_step(data, state):
     fs = state.family_state
-    if not fs.estimate_intercept:
-        return state
+    if fs.profile or not fs.estimate_intercept:
+        return state  # profiled path has no shared intercept (b0 is per-feature)
     return replace(state, family_state=replace(fs, intercept=estimate_intercept(data, state)))
 
 
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
     fs = state.family_state
-    offset = fs.intercept + state.total_message.mean
-    new_effect = _fit_effect(data, fs.response, offset, effect.prior_variance, fs.quadrature_order)
+    # profiled: offset is the leave-one-out message only (b0 profiled per feature);
+    # shared-intercept: add the estimated intercept.
+    offset = state.total_message.mean if fs.profile else fs.intercept + state.total_message.mean
+    new_effect = _fit_effect(data, fs, offset, effect.prior_variance, fs.quadrature_order)
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
