@@ -21,7 +21,7 @@ from .operators import DesignOperator
 from .response import Bernoulli, ResponseModel
 from .ser_ops import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
-__all__ = ["glm_ser", "build_ser_state", "glm_profile_map"]
+__all__ = ["glm_ser", "build_ser_state", "glm_profile_map", "glm_profile_ser"]
 
 
 def _background(response, offset, aux, c, mode: str = "exact", degree: int = 40):
@@ -45,8 +45,10 @@ def _background(response, offset, aux, c, mode: str = "exact", degree: int = 40)
         aw, ag, al = P @ jnp.sum(w, 0), P @ jnp.sum(g, 0), P @ jnp.sum(ll, 0)
         t = (2.0 * c - (c_hi + c_lo)) / (c_hi - c_lo)  # map to [-1, 1]
         return _clenshaw(aw, t), _clenshaw(ag, t), _clenshaw(al, t)
-    eta0 = offset[:, None] + c[None, :]  # (n, p)
-    ll, g, w = response.terms(eta0, aux[:, None])
+    # exact: sum over rows at eta = offset + c, for c of any shape ((p,) or (order, p))
+    lead = (-1,) + (1,) * c.ndim
+    eta0 = offset.reshape(lead) + c[None, ...]  # (n, *c.shape)
+    ll, g, w = response.terms(eta0, aux.reshape(lead))
     return jnp.sum(w, 0), jnp.sum(g, 0), jnp.sum(ll, 0)
 
 
@@ -131,6 +133,78 @@ def glm_profile_map(op, aux, offset, prior_variance, response: ResponseModel = B
                                     - response.terms(eta0, aux_e)[0])
     log_bf = (ll_alt - ll_null) - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * schur)
     return b, b0, var, log_bf
+
+
+@partial(jax.jit, static_argnames=("response", "order", "n_iter", "background",
+                                   "node_intercept", "node_newton"))
+def glm_profile_ser(op, aux, offset, prior_variance, response: ResponseModel = Bernoulli(),
+                    order: int = 15, n_iter: int = 30, background: str = "exact",
+                    node_intercept: str = "linear", node_newton: int = 4):
+    """Per-column profiled-intercept SER: glm_profile_map mode + a GH tail over b with
+    per-node intercept. Response-generic form of `ser_ops.profile_ser`.
+
+    node_intercept: 'linear' (Cox-Reid one step) or 'newton' (re-profile b0 at each
+    node via the row-background -- more accurate in the tails, cheap under chebyshev).
+    Returns (mu, var, feature_log_bf, coefficient_kl, b0_hat, precision)."""
+    aux = jnp.asarray(aux)
+    offset = jnp.asarray(offset)
+    aux_e = op.broadcast_rows(aux)
+    off_e = op.broadcast_rows(offset)
+
+    b_hat, b0_hat, var_lap, _ = glm_profile_map(
+        op, aux, offset, prior_variance, response, n_iter, background=background, degree=40
+    )
+    sigma = jnp.sqrt(var_lap)
+
+    def _ll_g_w(b, b0):
+        b0e = op.broadcast_cols(b0)
+        return response.terms(off_e + b0e + op.column_linpred(b), aux_e)
+
+    # Cox-Reid re-centering slope c = H0b / H00 at the mode
+    _, _, w = _ll_g_w(b_hat, b0_hat)
+    _, _, w0 = response.terms(off_e + op.broadcast_cols(b0_hat), aux_e)
+    BGw, _, _ = _background(response, offset, aux, b0_hat, background)
+    H00 = BGw + op.local_moment(0, w - w0)
+    c_slope = op.local_moment(1, w) / H00
+
+    c0, ll_null = _profile_null(response, offset, aux)
+
+    nodes_np, log_w_np = _gh_rule(order)
+    nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
+    b_nodes = b_hat[None, :] + jnp.sqrt(2.0) * sigma[None, :] * nodes[:, None]  # (order, p)
+    b0_nodes = b0_hat[None, :] - c_slope[None, :] * (b_nodes - b_hat[None, :])  # Cox-Reid
+
+    def _supp_gw(b, b0):  # per-node support corrections to the intercept score/curv
+        _, s, wf = _ll_g_w(b, b0)
+        _, s0, w0f = response.terms(off_e + op.broadcast_cols(b0), aux_e)
+        return op.local_moment(0, s - s0), op.local_moment(0, wf - w0f)
+
+    if node_intercept == "newton":
+        for _ in range(node_newton):  # fully profile b0 at each node
+            BGw_n, BGg, _ = _background(response, offset, aux, b0_nodes, background)
+            sg, sw = jax.vmap(_supp_gw)(b_nodes, b0_nodes)
+            b0_nodes = b0_nodes + jnp.clip((BGg + sg) / (BGw_n + sw), -4.0, 4.0)
+
+    _, _, BGll = _background(response, offset, aux, b0_nodes, background)  # (order, p)
+
+    def node_term(node, lw, b, b0, bgll):
+        b0e = op.broadcast_cols(b0)
+        ll = response.terms(off_e + b0e + op.column_linpred(b), aux_e)[0]
+        ll0 = response.terms(off_e + b0e, aux_e)[0]
+        supp = op.local_moment(0, ll - ll0)
+        dll = bgll + supp - ll_null  # node loglik rel the profiled null
+        logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
+            jnp.sqrt(2.0) * sigma
+        )
+        return logint, dll
+
+    logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, b0_nodes, BGll)
+    log_norm = jax.nn.logsumexp(logint, axis=0)
+    pw = jnp.exp(logint - log_norm)
+    mu = jnp.sum(pw * b_nodes, axis=0)
+    var = jnp.sum(pw * b_nodes**2, axis=0) - mu**2
+    coefficient_kl = jnp.sum(pw * dll_nodes, axis=0) - log_norm
+    return mu, var, log_norm, coefficient_kl, b0_hat, 1.0 / var_lap
 
 
 def build_ser_state(mu, var, feature_log_evidence, coefficient_kl, prior_variance,

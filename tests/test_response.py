@@ -7,8 +7,8 @@ from jax.experimental import sparse
 
 from gibss.operators import BCOOOperator, CenteredOperator, DenseOperator
 from gibss.response import Bernoulli, Gaussian, Poisson, TwoGroupMarginal
-from gibss.response_ser import glm_profile_map, glm_ser
-from gibss.ser_ops import local_irls_centered, quadrature_ser
+from gibss.response_ser import glm_profile_map, glm_profile_ser, glm_ser
+from gibss.ser_ops import local_irls_centered, profile_ser, quadrature_ser
 
 
 @pytest.mark.parametrize(
@@ -217,6 +217,50 @@ def test_glm_profile_map_dense_sparse_and_exact_cheb_agree():
         np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
     for u, v in zip(bcoo, cheb):  # chebyshev background reproduces exact here
         np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-6)
+
+
+@pytest.mark.parametrize("opkind", ["dense", "bcoo"])
+@pytest.mark.parametrize("background", ["exact", "chebyshev"])
+@pytest.mark.parametrize("node_intercept", ["linear", "newton"])
+def test_glm_profile_ser_matches_profile_ser(opkind, background, node_intercept):
+    # response-generic profiled SER (GH tail + per-node intercept) reproduces the
+    # Bernoulli reference profile_ser across dense/sparse, exact/cheb, linear/newton.
+    rng = np.random.default_rng(0)
+    n, p = 300, 10
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.5 + 1.5
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-2 + 1.5 * X[:, 3]))), n).astype(float)
+    op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
+          else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
+    gen = glm_profile_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(),
+                          order=15, background=background, node_intercept=node_intercept)
+    ref = profile_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, order=15,
+                      background=background, node_intercept=node_intercept, offset_var=None)
+    for u, v in zip(gen[:4], ref[:4]):
+        np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
+
+
+def test_glm_profile_ser_order1_equals_map():
+    # order=1 GH tail = the Laplace evidence from glm_profile_map
+    rng = np.random.default_rng(3)
+    n, p = 200, 6
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.3
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.8 * X[:, 1]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    ser = glm_profile_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=1)
+    mp = glm_profile_map(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli())
+    np.testing.assert_allclose(np.asarray(ser[2]), np.asarray(mp[3]), atol=1e-9)
+
+
+def test_glm_profile_ser_poisson_recovers():
+    rng = np.random.default_rng(4)
+    n, p = 400, 8
+    X = rng.normal(size=(n, p))
+    y = rng.poisson(np.exp(0.3 + 0.7 * X[:, 5])).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    g = glm_profile_ser(op, jnp.asarray(y), jnp.zeros(n), 1.0, Poisson(), order=15)
+    assert int(np.argmax(np.asarray(g[2]))) == 5
 
 
 def test_glm_ser_dense_sparse_parity():
