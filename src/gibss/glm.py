@@ -58,11 +58,16 @@ class GLMFamilyState:
     profile: bool = False
     background: str = "exact"
     node_intercept: str = "linear"
+    # integrate_offset: treat the leave-one-out message as random (o ~ N(mean, var))
+    # and integrate the response over it (nested GH, offset_order nodes), instead of
+    # using the mean only. Consumes the message variance the SER already computes.
+    integrate_offset: bool = False
+    offset_order: int = 5
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
 
 
-def _fit_effect(data, fs, offset, prior_variance, order):
+def _fit_effect(data, fs, offset, offset_var, prior_variance, order):
     aux = jnp.asarray(data.y)
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
@@ -70,10 +75,12 @@ def _fit_effect(data, fs, offset, prior_variance, order):
         mu, var, log_bf, coefficient_kl, _, _ = glm_profile_ser(
             op, aux, offset, prior_variance, fs.response, order=order,
             background=fs.background, node_intercept=fs.node_intercept,
+            offset_var=offset_var, offset_order=fs.offset_order,
         )
     else:
         mu, var, log_bf, coefficient_kl = glm_ser(
-            op, aux, offset, prior_variance, fs.response, order=order
+            op, aux, offset, prior_variance, fs.response, order=order,
+            offset_var=offset_var, offset_order=fs.offset_order,
         )
     # log_bf is relative to the b=0 fit at `offset`; alpha only needs the relative
     # feature evidence, so use log_bf directly (the shared baseline cancels).
@@ -121,7 +128,8 @@ def update_effect_index_step(data, l, state):
     # profiled: offset is the leave-one-out message only (b0 profiled per feature);
     # shared-intercept: add the estimated intercept.
     offset = state.total_message.mean if fs.profile else fs.intercept + state.total_message.mean
-    new_effect = _fit_effect(data, fs, offset, effect.prior_variance, fs.quadrature_order)
+    offset_var = state.total_message.var if fs.integrate_offset else None
+    new_effect = _fit_effect(data, fs, offset, offset_var, effect.prior_variance, fs.quadrature_order)
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 

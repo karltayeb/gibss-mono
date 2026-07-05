@@ -96,6 +96,23 @@ def test_glm_profile_dense_sparse_cheb_parity():
     np.testing.assert_allclose(np.asarray(dense.alpha), np.asarray(sparse_cheb.alpha), atol=1e-6)
 
 
+@pytest.mark.parametrize("kw", [
+    {"integrate_offset": True},
+    {"profile": True, "integrate_offset": True},
+])
+def test_glm_integrate_offset_runs_and_recovers(kw):
+    # the family consumes the message variance (o ~ N(mean, var), nested GH) and still
+    # recovers the signal, shared-intercept and profiled.
+    rng = np.random.default_rng(0)
+    n, p, causal = 500, 12, 4
+    X = rng.normal(size=(n, p))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + 1.5 * X[:, causal]))), n).astype(float)
+    d = glm.prep_data(X, y)
+    st = fit_ibss(d, glm.initialize_state(d, L=2, response=Bernoulli(), family_state_kwargs=kw),
+                  glm.default_schedule(), max_iter=50)
+    assert _feat_pip(st, causal) > 0.9
+
+
 def test_glm_dense_sparse_parity():
     # full engine loop agrees on dense vs BCOO input (intercept-Newton accumulation
     # over sweeps keeps this slightly looser than the kernel-level 1e-9 parity)
