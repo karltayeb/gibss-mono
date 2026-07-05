@@ -282,6 +282,26 @@ def test_glm_ser_offset_integration_matches_quadrature(offset_order):
     np.testing.assert_allclose(np.asarray(g[2]), np.asarray(q[2]), atol=1e-10)
 
 
+@pytest.mark.parametrize("opkind", ["dense", "bcoo"])
+@pytest.mark.parametrize("background", ["exact", "chebyshev"])
+def test_glm_profile_ser_offset_integration_matches_profile_ser(opkind, background):
+    # profiled offset integration reproduces profile_ser's offset-integrated path.
+    rng = np.random.default_rng(0)
+    n, p = 250, 8
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.5
+    ov = np.abs(rng.normal(size=n)) * 0.4 + 0.1
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + X[:, 2]))), n).astype(float)
+    op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
+          else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
+    g = glm_profile_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15,
+                        background=background, offset_var=jnp.asarray(ov), offset_order=5)
+    q = profile_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, order=15,
+                    background=background, offset_var=jnp.asarray(ov), offset_integration=5)
+    for u, v in zip(g[:4], q[:4]):
+        np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
+
+
 def test_glm_ser_offset_var_none_is_mean_only():
     # offset_var=None leaves the mean-only result exactly unchanged.
     rng = np.random.default_rng(1)
