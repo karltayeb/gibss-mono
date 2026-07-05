@@ -79,17 +79,44 @@ def test_pre_centering_is_noop_for_profile():
     np.testing.assert_allclose(bf(True), bf(False), atol=1e-3)
 
 
-def test_bcoo_default_off_node_methods_reject_sparse_center():
+@pytest.mark.parametrize("profile", [False, True])
+def test_localtaylor_sparse_center_matches_dense(profile):
+    # profile=False fits (x-c) via the background on sparse; profile=True ignores the
+    # centering (location-invariant). Either way, sparse pre-centered == dense.
+    rng = np.random.default_rng(3)
+    n, p, feat = 500, 20, 7
+    X = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.4) + 0.5
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + 1.8 * X[:, feat]))), n).astype(float)
+
+    def run(Xin):
+        d = LT.prep_data(Xin, jnp.asarray(y), center=True)
+        st = fit_ibss(d, LT.initialize_state(d, L=2, family_state_kwargs={"profile": profile}),
+                      LT.default_schedule(), max_iter=40)
+        e = st.single_effects[0]
+        return np.asarray(e.mu), np.asarray(e.alpha)
+
+    md, ad = run(jnp.asarray(X))                       # dense (eager centering)
+    ms, as_ = run(sparse.BCOO.fromdense(jnp.asarray(X)))  # sparse (implicit via background)
+    assert int(np.argmax(ad)) == feat
+    np.testing.assert_allclose(md, ms, atol=1e-8)
+    np.testing.assert_allclose(ad, as_, atol=1e-8)
+
+
+def test_bcoo_default_off_localtaylor_supports_sparse_center():
+    import gibss.localjj as ljj
     rng = np.random.default_rng(2)
     Xs = sparse.BCOO.fromdense(jnp.asarray(rng.normal(size=(40, 5))))
     y = rng.binomial(1, 0.5, 40).astype(float)
-    # default (None) -> off for sparse, no cbar stored
+    # default (None) -> off for sparse, no column_center stored
     assert LT.prep_data(Xs, y).column_center is None
-    # explicit center=True -> prep stores cbar; node-based methods reject it at init
+    # explicit center=True -> prep stores the means; local-taylor now SUPPORTS it
+    # (profile=False fits (x-c) via the background; profile=True ignores it).
     d = LT.prep_data(Xs, y, center=True)
     assert d.column_center is not None
+    LT.initialize_state(d, L=1)  # no longer raises
+    # localjj (JJ family) does not yet wire sparse pre-centering -> still rejects
     with pytest.raises(NotImplementedError):
-        LT.initialize_state(d, L=1)
+        ljj.initialize_state(ljj.prep_data(Xs, y, center=True), L=1)
 
 
 @pytest.mark.parametrize("mod_name", ["linear", "irls", "globaljj"])

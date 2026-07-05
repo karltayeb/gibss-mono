@@ -141,9 +141,10 @@ def global_gaussian_ser(
     return mu, var, log_bf
 
 
-@partial(jax.jit, static_argnames=("n_iter", "offset_integration"))
+@partial(jax.jit, static_argnames=("n_iter", "offset_integration", "background", "degree"))
 def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-8,
-               offset_var=None, offset_integration="taylor"):
+               offset_var=None, offset_integration="taylor", center=None,
+               background: str = "exact", degree: int = 40):
     """Per-column univariate logistic MAP (shared intercept in `offset`) + Laplace.
 
     The minimal per-column ("univariate") kernel: a vectorized Newton over all
@@ -157,6 +158,13 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
     `_smooth_cumulant`): sigmoid/weight/softplus become their offset-integrated
     `s~`/`w~`/`A~`. `offset_var=None` (or 0) is the mean-only kernel unchanged.
 
+    With `center=c` (per-column means) the design is column-centered, eta = offset
+    + (x_ij - c_j) b_j -- the SHARED-intercept fit on a pre-centered design. The
+    (x - c) reductions expand binomially in c; the x^0 (all-rows) term is the
+    intercept row-background (exact or Chebyshev), everything else is support-only. So
+    a pre-centered SPARSE design is fit at O(nnz + nD) without densifying -- this is
+    what lets profile=False run on centered BCOO data. `center=None` -> raw fit.
+
     Returns per-feature (mode, var, laplace_log_bf).
     """
     y = jnp.asarray(y)
@@ -165,33 +173,92 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
     off_e = op.broadcast_rows(offset)
     if offset_var is None:
         offset_integration = "none"  # no var -> skip the convolution machinery
-    ov_e = 0.0 if offset_var is None else op.broadcast_rows(jnp.asarray(offset_var))
+    ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
+    ov_e = 0.0 if offset_var is None else op.broadcast_rows(ov)
     inv_pv = 1.0 / prior_variance
+
+    if center is None:  # ---- raw shared-intercept fit (unchanged) ----
+        def body(state):
+            b, _, it = state
+            eta = off_e + op.column_linpred(b)
+            _, s, w = _smooth_cumulant(eta, ov_e, offset_integration)
+            grad = op.local_moment(1, y_e - s) - inv_pv * b
+            curv = op.local_moment(2, w) + inv_pv
+            step = grad / curv
+            return b + step, jnp.max(jnp.abs(step)), it + 1
+
+        b, _, _ = jax.lax.while_loop(
+            lambda s: (s[2] < n_iter) & (s[1] > tol), body, (jnp.zeros(op.p), jnp.inf, 0)
+        )
+        b = jnp.where(jnp.isfinite(b), b, 0.0)  # non-finite feature -> null effect
+
+        eta = off_e + op.column_linpred(b)
+        A, _, w = _smooth_cumulant(eta, ov_e, offset_integration)
+        A0 = _smooth_A_only(off_e, ov_e, offset_integration)
+        precision = op.local_moment(2, w) + inv_pv
+        var = 1.0 / precision
+        # data loglik difference vs b=0 (support-only; off-support terms cancel). The
+        # y*eta term is linear -> offset-integration leaves it, only A -> A~.
+        dll = op.local_moment(0, (y_e * eta - A) - (y_e * off_e - A0))
+        log_bf = dll - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * precision)
+        return b, var, log_bf
+
+    # ---- pre-centered shared-intercept fit: eta = offset + (x - c) b ----
+    c = jnp.asarray(center)  # (p,)
+
+    def _bg(s):  # all-rows intercept row-background at eta = offset + s (shift s=-c*b)
+        if background == "chebyshev":
+            return _intercept_background_cheb(offset, s, y, degree, ov, offset_integration)
+        return _intercept_background(offset, s, y, ov, offset_integration)
+
+    def _centered_grad_curv(b):
+        s = -c * b  # (p,) per-feature shift from the fixed centering
+        s_e = op.broadcast_cols(s)
+        eta = off_e + s_e + op.column_linpred(b)  # offset + (x-c)b on support
+        _, sig, w = _smooth_cumulant(eta, ov_e, offset_integration)
+        eta0 = off_e + s_e  # background config (b's x-term dropped)
+        _, sig0, w0 = _smooth_cumulant(eta0, ov_e, offset_integration)
+        BGw, BGg, _ = _bg(s)
+        M0w = BGw + op.local_moment(0, w - w0)  # sum_all w
+        M1w = op.local_moment(1, w)  # sum_support x w
+        M2w = op.local_moment(2, w)  # sum_support x^2 w
+        curv = M2w - 2.0 * c * M1w + c * c * M0w + inv_pv  # sum (x-c)^2 w + 1/pv
+        M0g = BGg + op.local_moment(0, sig0 - sig)  # sum_all (y - sig)
+        M1g = op.local_moment(1, y_e - sig)  # sum_support x (y - sig)
+        grad = (M1g - c * M0g) - inv_pv * b  # sum (x-c)(y-sig) - b/pv
+        return grad, curv
 
     def body(state):
         b, _, it = state
-        eta = off_e + op.column_linpred(b)
-        _, s, w = _smooth_cumulant(eta, ov_e, offset_integration)
-        grad = op.local_moment(1, y_e - s) - inv_pv * b
-        curv = op.local_moment(2, w) + inv_pv
+        grad, curv = _centered_grad_curv(b)
         step = grad / curv
         return b + step, jnp.max(jnp.abs(step)), it + 1
 
     b, _, _ = jax.lax.while_loop(
         lambda s: (s[2] < n_iter) & (s[1] > tol), body, (jnp.zeros(op.p), jnp.inf, 0)
     )
-    b = jnp.where(jnp.isfinite(b), b, 0.0)  # non-finite feature -> null effect
-
-    eta = off_e + op.column_linpred(b)
-    A, _, w = _smooth_cumulant(eta, ov_e, offset_integration)
-    A0 = _smooth_A_only(off_e, ov_e, offset_integration)
-    precision = op.local_moment(2, w) + inv_pv
+    b = jnp.where(jnp.isfinite(b), b, 0.0)
+    _, precision = _centered_grad_curv(b)
     var = 1.0 / precision
-    # data loglik difference vs b=0 (support-only; off-support terms cancel). The
-    # y*eta term is linear -> offset-integration leaves it, only A -> A~.
-    dll = op.local_moment(0, (y_e * eta - A) - (y_e * off_e - A0))
-    log_bf = dll - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance * precision)
+    log_bf = _centered_log_bf(op, y, offset, b, c, var, prior_variance, _bg, ov_e, offset_integration)
     return b, var, log_bf
+
+
+def _centered_log_bf(op, y, offset, b, c, var, prior_variance, bg_fn, ov_e, offset_integration):
+    """Laplace log-BF for the pre-centered fit at mode b: dll(all rows) - prior/curv."""
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+    s = -c * b
+    s_e = op.broadcast_cols(s)
+    eta = off_e + s_e + op.column_linpred(b)  # offset + (x-c)b
+    A = _smooth_A_only(eta, ov_e, offset_integration)
+    A0s = _smooth_A_only(off_e + s_e, ov_e, offset_integration)  # at background config
+    _, _, BGll_s = bg_fn(s)  # sum_all (y*(offset+s) - A(offset+s))
+    _, _, BGll_0 = bg_fn(jnp.zeros_like(c))  # sum_all (y*offset - A(offset)) baseline (b=0)
+    # sum_all loglik(eta) - loglik(offset):  background diff + support correction
+    supp = op.local_moment(0, (y_e * eta - A) - (y_e * (off_e + s_e) - A0s))
+    dll = (BGll_s - BGll_0) + supp
+    return dll - 0.5 * b**2 / prior_variance - 0.5 * jnp.log(prior_variance / var)
 
 
 def _null_intercept(offset, y, n_iter: int = 80, ov=0.0, offset_integration="taylor"):
@@ -513,9 +580,10 @@ def local_irls_centered(op, y, offset, prior_variance, n_iter: int = 60, tol: fl
     return b, b0, var, log_bf
 
 
-@partial(jax.jit, static_argnames=("order", "n_iter", "offset_integration"))
+@partial(jax.jit, static_argnames=("order", "n_iter", "offset_integration", "background", "degree"))
 def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int = 30,
-                   offset_var=None, offset_integration="taylor"):
+                   offset_var=None, offset_integration="taylor", center=None,
+                   background: str = "exact", degree: int = 40):
     """Per-column exact-ish logistic SER: local_irls mode + Gauss-Hermite tail.
 
     = quadrature (shared intercept). Finds each feature's MAP + Laplace scale
@@ -528,6 +596,10 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     `_smooth_cumulant`); the mode-find inherits it too. `offset_var=None` -> the
     mean-only kernel. This is the {b} x {o} product-quadrature: GH over b, an
     offset-convolution over each o_i (analytic "taylor" or nested GH order-{int}).
+
+    With `center=c` the design is column-centered (eta = offset + (x-c) b), so a
+    pre-centered SPARSE design fits at O(nnz + nD): the node loglik's all-rows term is
+    the intercept row-background (`background` exact/chebyshev), the rest support-only.
     """
     y = jnp.asarray(y)
     offset = jnp.asarray(offset)
@@ -536,6 +608,7 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     b_hat, var_lap, _ = local_irls(
         op, y, offset, prior_variance, n_iter,
         offset_var=offset_var, offset_integration=offset_integration,
+        center=center, background=background, degree=degree,
     )
     sigma = jnp.sqrt(var_lap)
 
@@ -544,19 +617,45 @@ def quadrature_ser(op, y, offset, prior_variance, order: int = 15, n_iter: int =
     log_w = jnp.asarray(log_w_np)
     y_e = op.broadcast_rows(y)
     off_e = op.broadcast_rows(offset)
-    ov_e = 0.0 if offset_var is None else op.broadcast_rows(jnp.asarray(offset_var))
+    ov = 0.0 if offset_var is None else jnp.asarray(offset_var)
+    ov_e = 0.0 if offset_var is None else op.broadcast_rows(ov)
     A0 = _smooth_A_only(off_e, ov_e, offset_integration)
     null_e = y_e * off_e - A0  # per-entry null loglik (b=0), offset-integrated
 
-    def node_term(node, lw):
-        b = b_hat + jnp.sqrt(2.0) * sigma * node  # (p,)
-        eta = off_e + op.column_linpred(b)
-        A = _smooth_A_only(eta, ov_e, offset_integration)
-        dll = op.local_moment(0, (y_e * eta - A) - null_e)  # (p,)
-        logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
-            jnp.sqrt(2.0) * sigma
-        )
-        return logint, b, dll
+    if center is None:
+        def node_term(node, lw):
+            b = b_hat + jnp.sqrt(2.0) * sigma * node  # (p,)
+            eta = off_e + op.column_linpred(b)
+            A = _smooth_A_only(eta, ov_e, offset_integration)
+            dll = op.local_moment(0, (y_e * eta - A) - null_e)  # (p,)
+            logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
+                jnp.sqrt(2.0) * sigma
+            )
+            return logint, b, dll
+    else:
+        c = jnp.asarray(center)
+
+        def _bg(s):
+            if background == "chebyshev":
+                return _intercept_background_cheb(offset, s, y, degree, ov, offset_integration)
+            return _intercept_background(offset, s, y, ov, offset_integration)
+
+        _, _, BGll_0 = _bg(jnp.zeros_like(c))  # all-rows b=0 baseline (eta=offset)
+
+        def node_term(node, lw):
+            b = b_hat + jnp.sqrt(2.0) * sigma * node
+            s = -c * b
+            s_e = op.broadcast_cols(s)
+            eta = off_e + s_e + op.column_linpred(b)  # offset + (x-c)b
+            A = _smooth_A_only(eta, ov_e, offset_integration)
+            A0s = _smooth_A_only(off_e + s_e, ov_e, offset_integration)
+            _, _, BGll_s = _bg(s)
+            supp = op.local_moment(0, (y_e * eta - A) - (y_e * (off_e + s_e) - A0s))
+            dll = (BGll_s - BGll_0) + supp  # all-rows loglik(eta) - loglik(offset)
+            logint = lw + node**2 + dll + _normal_logpdf(b, prior_variance) + jnp.log(
+                jnp.sqrt(2.0) * sigma
+            )
+            return logint, b, dll
 
     logint, b_nodes, dll_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p) x3
     log_norm = jax.nn.logsumexp(logint, axis=0)  # (p,)  marginal - shared null

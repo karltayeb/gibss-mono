@@ -45,7 +45,6 @@ from .linear import (
     LinearData,
     is_bcoo,
     prep_data,
-    reject_sparse_precenter,
     update_prior_variance_index_step,
 )
 from .operators import as_operator
@@ -121,9 +120,16 @@ def _fit_effect(data, offset, prior_variance, fs, offset_var, offset_integration
         )
         feature_log_evidence = log_bf + null_ll  # log_bf is rel the profiled null
     else:
+        # profile=False: shared intercept. A pre-centered sparse design arrives as a
+        # raw op + column_center; pass it as `center` so quadrature_ser fits
+        # (x - c) via the background (no densifying). Dense pre-centering is eager
+        # (column_center is None, X already centered) -> center=None, unchanged.
+        center = getattr(data, "column_center", None)
         mu, var, log_bf, coefficient_kl = quadrature_ser(
             op, y, offset, prior_variance, order=fs.quadrature_order,
             offset_var=offset_var, offset_integration=offset_integration,
+            center=center,
+            background=(fs.background_mode if is_bcoo(data.X) else "exact"),
         )
         # quadrature_ser's log_bf is rel the b=0-at-offset null; add that baseline to
         # get the absolute marginal (cancels in alpha; the reported null is profiled).
@@ -177,7 +183,9 @@ def initialize_state(
     data: LocalTaylorData, L: int = 1, quadrature_order: int = 15,
     family_state_kwargs: dict | None = None,
 ) -> GIBSSState[LocalTaylorFamilyState, Message]:
-    reject_sparse_precenter(data)
+    # sparse pre-centering is supported now: profile=False fits (x-c) via the
+    # background (see quadrature_ser `center`); profile=True re-profiles the
+    # intercept per feature and is location-invariant, so it ignores the centering.
     p = data.X.shape[1]
     n = data.X.shape[0]
     kwargs = {} if family_state_kwargs is None else dict(family_state_kwargs)
