@@ -263,6 +263,39 @@ def test_glm_profile_ser_poisson_recovers():
     assert int(np.argmax(np.asarray(g[2]))) == 5
 
 
+@pytest.mark.parametrize("offset_order", [3, 5, 9])
+def test_glm_ser_offset_integration_matches_quadrature(offset_order):
+    # nested-GH offset integration over o ~ N(offset, offset_var) reproduces the
+    # logistic quadrature_ser's offset-integrated path (Bernoulli).
+    rng = np.random.default_rng(0)
+    n, p = 250, 8
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.5
+    ov = np.abs(rng.normal(size=n)) * 0.4 + 0.1
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + X[:, 2]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    g = glm_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15,
+                offset_var=jnp.asarray(ov), offset_order=offset_order)
+    q = quadrature_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, order=15,
+                       offset_var=jnp.asarray(ov), offset_integration=offset_order)
+    np.testing.assert_allclose(np.asarray(g[0]), np.asarray(q[0]), atol=1e-10)
+    np.testing.assert_allclose(np.asarray(g[2]), np.asarray(q[2]), atol=1e-10)
+
+
+def test_glm_ser_offset_var_none_is_mean_only():
+    # offset_var=None leaves the mean-only result exactly unchanged.
+    rng = np.random.default_rng(1)
+    n, p = 200, 6
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.4
+    y = rng.binomial(1, 1 / (1 + np.exp(-(X[:, 0]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    a = glm_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15)
+    b = glm_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15, offset_var=None)
+    for u, v in zip(a, b):
+        np.testing.assert_array_equal(np.asarray(u), np.asarray(v))
+
+
 def test_glm_ser_dense_sparse_parity():
     rng = np.random.default_rng(3)
     n, p = 300, 10
