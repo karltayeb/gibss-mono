@@ -74,10 +74,16 @@ Gaussian:   loglik = -(y-eta)^2/2v, grad = (y-eta)/v, weight = 1/v. The per-effe
    `profile_ser` to ~1e-14 across dense/sparse x exact/chebyshev x linear/newton.
    Wired into the `glm` family (`profile`/`background`/`node_intercept`); matches
    `logistic_localtaylor` profile mode end-to-end. See "Profiling" below.
-7. [open] Offset/variance integration in glm_ser (GH-over-o), then fold
-   `logistic_localtaylor` onto it. Retire the EM `twogrouplocaljj`/localjj path once
-   the marginal is the default. Not done -- localtaylor still carries the per-row-var
-   message that glm_ser doesn't yet.
+7. [done] Offset/variance integration: `_int_terms` = nested GH over o ~ N(offset,
+   offset_var), response-generic (no new ResponseModel API -- just re-evaluates
+   `terms` at the GH-shifted eta and averages). Threaded through glm_ser +
+   glm_profile_map/ser (mode, background, null, GH-over-b tail) and the `glm` family
+   (`integrate_offset`/`offset_order`). Reproduces quadrature_ser / profile_ser's
+   offset-integrated path to ~1e-13 across dense/sparse x exact/cheb x linear/newton;
+   offset_var=None is byte-identical to mean-only.
+8. [open] Fold `logistic_localtaylor` onto the generic kernels and retire the EM
+   `twogrouplocaljj`/localjj path once the marginal is the default. (taylor2 offset
+   mode would need a f''' hook on ResponseModel; nested GH covers it generically.)
 
 ## Profiling = background + correction (the sparse-centering story)
 A profiled per-column fit (`offset + b0_j + x_ij b_j`, b0 profiled out -> offset-shift
