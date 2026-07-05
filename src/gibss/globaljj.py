@@ -48,10 +48,10 @@ class GlobalJJFamilyState:
     elbo_tolerance: float = 1e-3
     elbo_history: list[float] = field(default_factory=lambda: [-np.inf])
     xi: Any = 0.0
-    # Weighted column centering (tau-weighted), orthogonalizing intercept/features.
-    # Opt-in (globaljj has a reference-parity contract); reparameterizes the
-    # intercept, so results differ from the non-centered default.
-    center: bool = False
+    # Intercept profiling via weighted (tau-weighted) column centering, orthogonalizing
+    # intercept/features. Opt-in (globaljj has a reference-parity contract);
+    # reparameterizes the intercept, so results differ from the non-profiled default.
+    profile: bool = False
     cbar: Any = None  # (tau @ X)/sum(tau), shape (p,)
     weight_sum: float = 0.0  # W = sum(tau)
 
@@ -165,7 +165,7 @@ def update_xi(data, state) -> np.ndarray:
 def update_xi_step(data, state):
     fs = state.family_state
     new_xi = update_xi(data, state)
-    if fs.center:
+    if fs.profile:
         tau = 2.0 * _lambda_xi(new_xi)
         cbar, W = _weighted_colmeans(data.X, tau)
         family_state = replace(fs, xi=new_xi, cbar=cbar, weight_sum=W)
@@ -175,15 +175,15 @@ def update_xi_step(data, state):
 
 
 def fit_global_jj_ser(
-    data, y, xi, offset, prior_variance, cbar=None, weight_sum=0.0, center=False,
+    data, y, xi, offset, prior_variance, cbar=None, weight_sum=0.0, profile=False,
     offset_var=None,
 ) -> BaseSERState:
     X = data.X
     p = X.shape[1]
 
-    if center:
-        # weighted centering = a CenteredOperator at the tau-weighted mean `cbar`
-        # (recomputed per xi in update_xi_step).
+    if profile:
+        # profiling = weighted centering = a CenteredOperator at the tau-weighted mean
+        # `cbar` (recomputed per xi in update_xi_step).
         op = CenteredOperator.from_offsets(as_operator(X), cbar)
     else:
         op = data.op  # raw, or CenteredOperator when pre-centered (column_center)
@@ -210,7 +210,7 @@ def fit_global_jj_ser(
         null_log_likelihood=float(null_ll),
         kl=float(kl),
     )
-    if center:
+    if profile:
         return GlobalJJCenteredEffect(**fields, cbar=cbar)
     return BaseSERState(**fields)
 
@@ -227,7 +227,7 @@ def update_effect_index_step(data, l, state):
         effect.prior_variance,
         cbar=fs.cbar,
         weight_sum=fs.weight_sum,
-        center=fs.center,
+        profile=fs.profile,
         offset_var=state.total_message.var,
     )
     return replace_effect_in_gibss_state(state, l, new_effect)

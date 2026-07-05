@@ -99,9 +99,9 @@ class IRLSFamilyState:
     # variance (message type drives it -- Message integrates, MeanMessage doesn't).
     #   "none" | "taylor" (default, free) | int k (Gauss-Hermite order-k)
     offset_integration: str | int = "taylor"
-    # Weighted column centering: orthogonalize the intercept and each feature
-    # under the working weights (implicit, sparsity-preserving).
-    center: bool = True
+    # Intercept profiling via weighted column centering: orthogonalize the intercept
+    # and each feature under the working weights (implicit, sparsity-preserving).
+    profile: bool = True
     cbar: Any = None  # weighted column means (w @ X)/W, shape (p,)
     weight_sum: float = 0.0  # W = sum(w)
     # current IRLS working data (recomputed before each sweep)
@@ -213,7 +213,7 @@ def check_convergence_step(data, state):
 def update_centering_step(data, state):
     """Outer step: weighted column means c = (w @ X)/W from the current weights."""
     fs = state.family_state
-    if not fs.center:
+    if not fs.profile:
         return state
     tau = 1.0 / jnp.asarray(fs.v_work)  # working weights w (residual scale fixed at 1)
     cbar, W = _weighted_colmeans(data, tau)
@@ -271,7 +271,7 @@ def update_effect_index_step(data, l, state):
     wd = _working_data(data, fs)
     tau = 1.0 / np.asarray(fs.v_work)  # residual_variance fixed at 1 => tau = w
     offset = fs.intercept + state.total_message.mean
-    if fs.center:
+    if fs.profile:
         new_effect = _fit_centered_ser(
             wd, tau, offset, effect.prior_variance, fs.cbar, fs.weight_sum
         )
@@ -324,7 +324,7 @@ def initialize_state(
     kwargs.setdefault("v_work", jnp.ones(n))
     family_state = IRLSFamilyState(**kwargs)
     zero_message = Message(np.zeros(n), np.zeros(n))
-    if family_state.center:
+    if family_state.profile:
         empty = [_empty_centered_effect(p) for _ in range(L)]
     else:
         empty = [linear._empty_effect(p, 1.0) for _ in range(L)]

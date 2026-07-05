@@ -97,9 +97,9 @@ def test_centered_and_uncentered_recover_same_signal():
     X, y = _sim(rng, n, p, 8, signal=2.0)
     Xs = sparse.BCOO.fromdense(jnp.asarray(X))
 
-    def run(center):
+    def run(profile):
         data = irls.prep_data(Xs, y)
-        st = irls.initialize_state(data, L=1, family_state_kwargs={"center": center})
+        st = irls.initialize_state(data, L=1, family_state_kwargs={"profile": profile})
         return fit_ibss(data, st, irls.default_schedule(), max_iter=100)
 
     c = run(True)
