@@ -295,6 +295,12 @@ def update_effect_index_step(data, l, state):
 
 
 def _relogistic_null(effect, data, fs, message_mean, offset_var=0.0, offset_integration="none"):
+    # NOTE: the reported evidence/marginal is up to an additive constant. The
+    # fixed-quadratic ELBO carries a predictor-second-moment term -1/2 sum_i w0_i V[o_i]
+    # (offset variance of the OTHER effects); it's a per-row constant, identical in the
+    # alternative and the null, so it cancels in every BF_j and in ser_log_bayes_factor
+    # / PIPs. We don't add it back, so marginal_log_likelihood is that ELBO minus this
+    # constant. Inference (BF, PIPs, CS) is exact; only the absolute marginal is offset.
     p = np.asarray(effect.mu).shape[0]
     log_bf = np.asarray(effect.feature_log_evidence) - float(effect.null_log_likelihood)
     glm_eta = jnp.asarray(fs.glm_offset) + jnp.asarray(message_mean)  # b=0 GLM predictor
