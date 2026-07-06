@@ -95,10 +95,18 @@ class IRLSFamilyState:
     intercept: float = 0.0
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
-    # offset integration: convolve the working weight/mean over the predictor
-    # variance (message type drives it -- Message integrates, MeanMessage doesn't).
-    #   "none" | "taylor" (default, free) | int k (Gauss-Hermite order-k)
-    offset_integration: str | int = "taylor"
+    # Offset integration = convolve the working weight/mean over the predictor
+    # variance. DEFAULT "none": global taylor is a fixed quadratic expanded at the
+    # posterior MEAN, so it uses the raw cumulant A (weight w0 = A''(eta_mean)); the
+    # predictor second moment enters only the ELBO (via -1/2 w0 V[eta]), a per-row
+    # constant that cancels in the relative BF -> it does NOT move the effect
+    # estimates. Opt-in "taylor"/k convolves the weight (A -> A~, the globaljj xi
+    # analog); that's a Gaussian-offset approximation and the offset is a non-Gaussian
+    # mixture of the other effects, so it's not justified for a fixed quadratic --
+    # its PIP effect is the O(1/n) leverage artifact. Message type is moot under
+    # "none" (both Message and MeanMessage use the raw weight).
+    #   "none" (default) | "taylor" | int k (Gauss-Hermite order-k)
+    offset_integration: str | int = "none"
     # Intercept profiling via weighted column centering: orthogonalize the intercept
     # and each feature under the working weights (implicit, sparsity-preserving).
     profile: bool = True
