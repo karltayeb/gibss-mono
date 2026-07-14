@@ -212,12 +212,13 @@ def fit_glm_susie(
     response, kernel = _resolve(cfg)
 
     # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
-    # (every kernel), but sparse (BCOO) X only the quad Laplace kernel consumes (via
-    # glm_center_ser's row background); the linear/vi/jj kernels' entry-space reductions
-    # would drop the off-support fill-in. center=None -> on wherever supported (so the
-    # default centers everything it can without crashing a method sweep); an EXPLICIT
-    # center=True on an unsupported sparse+non-quad combo is a clear error, not a fit.
-    center_supported = (not is_bcoo(X)) or kernel == "quad"
+    # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row
+    # background) and linear (row-wise exact through a CenteredOperator) consume it; the
+    # vi/jj kernels' per-entry variance/tilt would drop the off-support fill-in.
+    # center=None -> on wherever supported (so the default centers everything it can
+    # without crashing a method sweep); an EXPLICIT center=True on an unsupported
+    # sparse + vi/jj combo is a clear error, not a fit.
+    center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear")
     if center is None:
         center = center_supported
     elif center and not center_supported:

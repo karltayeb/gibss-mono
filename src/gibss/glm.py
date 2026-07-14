@@ -31,7 +31,7 @@ from .engine import (
     to_numpy_state_step,
 )
 from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
-from .operators import as_operator
+from .operators import CenteredOperator, as_operator
 from .response import Bernoulli, ResponseModel, Smoothed
 from .response_ser import (
     build_ser_state,
@@ -190,24 +190,30 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     center = getattr(data, "column_center", None)
     if center is not None and not profiled:
         # sparse (BCOO) implicit pre-centering: eta = offset + (x_ij - c_j) b_j with c_j
-        # fixed. The exact per-feature Laplace consumes it via glm_center_ser (off-support
-        # fill-in through the row background). Profiled is invariant to column shifts, so it
-        # ignores `center`. The other kernels' entry-space reductions would silently drop
-        # the fill-in and fit the UNCENTERED model, so they are still refused.
-        if fs.kernel != "quad":
-            raise NotImplementedError(
-                "sparse (BCOO) pre-centering is implemented for kernel='quad' (exact "
-                f"per-feature Laplace); kernel={fs.kernel!r} would silently fit the "
-                "UNCENTERED model. Pass center=False, use kernel='quad', or use "
-                "intercept='profiled' (invariant to column shifts)."
+        # fixed. Profiled is invariant to column shifts, so it ignores `center`.
+        if fs.kernel == "quad":
+            # nonlinear per-feature Laplace: the off-support fill-in is the 1-D row
+            # background (glm_center_ser). column_center is BCOO-only (dense is centered
+            # eagerly), so exact O(n*p) defeats the sparsity -> default exact to chebyshev.
+            bg = "chebyshev" if fs.background == "exact" else fs.background
+            return glm_center_ser(
+                op, aux, offset, center, prior_variance, fs.response,
+                order=order, background=bg,
             )
-        # column_center is BCOO-only (dense is centered eagerly in prep_data), so exact
-        # O(n*p) would defeat the sparsity -- default the shared "exact" field to chebyshev.
-        bg = "chebyshev" if fs.background == "exact" else fs.background
-        return glm_center_ser(
-            op, aux, offset, center, prior_variance, fs.response,
-            order=order, background=bg,
-        )
+        if fs.kernel == "linear":
+            # quadratic response: w is constant, so centering is EXACT and row-wise --
+            # a CenteredOperator's rank-1 rmatvec/moment(2) corrections carry it (O(nnz)
+            # on BCOO, no background). Wrap the op and fall through to the linear branch.
+            op = CenteredOperator.from_offsets(op, center)
+        else:  # vi, jj: the entry-space per-entry variance/tilt (x^2 v) becomes a SECOND
+            # per-feature parameter under centering (c_j^2 v_j), which the 1-D background
+            # can't express -- a 2-D surrogate is a follow-up.
+            raise NotImplementedError(
+                "sparse (BCOO) pre-centering is implemented for kernel='quad' and "
+                f"'linear'; kernel={fs.kernel!r} would silently fit the UNCENTERED model "
+                "(its per-entry variance/tilt adds a second per-feature parameter). Pass "
+                "center=False, or use intercept='profiled' (invariant to column shifts)."
+            )
     if fs.kernel == "quad" and profiled:
         mu, var, log_bf, coefficient_kl, _, _ = glm_profile_ser(
             op, aux, offset, prior_variance, fs.response, order=order,

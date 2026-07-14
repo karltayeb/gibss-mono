@@ -123,6 +123,24 @@ def test_every_preset_runs_on_sparse(method):
     assert st.family_state.background == "chebyshev"
 
 
+def test_linear_kernel_sparse_centered_matches_dense():
+    # globaljj (kernel='linear') centers a sparse design exactly and row-wise, so the
+    # BCOO fit matches the dense (eager-centered) fit to machine precision -- unlike the
+    # quad kernel's ~1e-5 chebyshev tolerance, this path has no approximation.
+    import jax
+    from jax.experimental import sparse
+    rng = np.random.default_rng(4)
+    n, p, causal = 400, 10, 3
+    X = (rng.normal(size=(n, p)) + 2.0) * (rng.random((n, p)) < 0.4)  # off-center, sparse
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-3 + 2 * X[:, causal]))), n).astype(float)
+    Xs = sparse.BCOO.fromdense(jax.numpy.asarray(X))
+    dense = fit_glm_susie(X, y, L=2, method="globaljj", max_iter=50)
+    sp = fit_glm_susie(Xs, y, L=2, method="globaljj", max_iter=50)
+    assert dense.family_state.kernel == "linear"
+    assert causal in _tops(dense)
+    np.testing.assert_allclose(np.asarray(dense.alpha), np.asarray(sp.alpha), atol=1e-9)
+
+
 def test_explicit_center_true_unsupported_sparse_raises():
     # an EXPLICIT center=True on a sparse + non-quad kernel is a clear front-door error,
     # not a deep NotImplementedError from the dispatch.

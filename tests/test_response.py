@@ -186,6 +186,27 @@ def test_glm_center_ser_sparse_matches_dense():
             np.testing.assert_allclose(np.asarray(ch), np.asarray(g), atol=1e-6)
 
 
+def test_glm_linear_ser_sparse_centered_matches_dense():
+    # the quadratic (linear) kernel centers a SPARSE base exactly and row-wise: a
+    # CenteredOperator over a BCOO base equals the manually pre-centered dense design to
+    # machine precision -- no background needed (constant weights -> moment/rmatvec).
+    from gibss.operators import CenteredOperator
+    rng = np.random.default_rng(9)
+    n, p = 300, 8
+    X = (rng.normal(size=(n, p)) + 2.0) * (rng.random((n, p)) < 0.3)  # off-center, sparse
+    off = rng.normal(size=n) * 0.2
+    y = rng.normal(size=n) + 0.5 * X[:, 0]
+    c = X.mean(0)
+    base = BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X)))
+    centered_sparse = CenteredOperator.from_offsets(base, jnp.asarray(c))
+    manual_dense = DenseOperator(jnp.asarray(X - c))
+    for resp in [Gaussian(variance=0.7), Gaussian(variance=1.0)]:
+        a = glm_linear_ser(manual_dense, jnp.asarray(y), jnp.asarray(off), 1.0, resp)
+        b = glm_linear_ser(centered_sparse, jnp.asarray(y), jnp.asarray(off), 1.0, resp)
+        for u, v in zip(a, b):
+            np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-10)
+
+
 def test_glm_center_ser_dense_reduces_to_glm_ser():
     # on a full-grid (dense) op the off-support set is empty, so glm_center_ser's
     # background correction cancels and it equals glm_ser on the centered design.

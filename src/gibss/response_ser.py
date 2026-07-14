@@ -425,12 +425,15 @@ def glm_linear_ser(op, aux, offset, prior_variance, response: ResponseModel):
     _require_quadratic("glm_linear_ser", response)
     aux = _tmap(jnp.asarray, aux)
     offset = jnp.asarray(offset)
-    aux_e = _tmap(op.broadcast_rows, aux)
-    off_e = op.broadcast_rows(offset)
     inv_pv = 1.0 / prior_variance
-    _, g0, w = response.terms(off_e, aux_e)  # g linear in eta, w constant
-    S = op.local_moment(1, g0)  # d/db of sum ll at b = 0
-    S2w = op.local_moment(2, w)  # constant curvature
+    # Quadratic response -> w is constant in eta, so g0/w are per-ROW (evaluated once at
+    # b = 0, eta = offset) and the reductions are the row-weighted moments rmatvec / moment(2),
+    # NOT the entry-space local_moment. This is what lets centering be exact and matrix-free:
+    # pass a CenteredOperator and its rank-1 rmatvec/moment corrections carry it (row-wise,
+    # O(nnz) on BCOO -- no background), where the entry-space form would fill the zeros.
+    _, g0, w = response.terms(offset, aux)  # row space: g linear in eta, w constant
+    S = op.rmatvec(g0)  # d/db of sum ll at b = 0
+    S2w = op.moment(2, w)  # constant curvature
     prec = inv_pv + S2w
     v = 1.0 / prec
     m = v * S
