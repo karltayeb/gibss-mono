@@ -7,9 +7,9 @@ from jax.experimental import sparse
 jax.config.update("jax_enable_x64", True)
 
 import gibss.linear as lin
-from gibss._jj import lambda_xi
+from gibss.legacy._jj import lambda_xi
 from gibss.operators import BCOOOperator, DenseOperator, LowRankOperator
-from gibss.ser_ops import global_gaussian_ser
+from gibss.linear import global_gaussian_ser
 
 
 def _ops(Xd):

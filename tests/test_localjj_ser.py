@@ -7,7 +7,7 @@ from jax.experimental import sparse
 jax.config.update("jax_enable_x64", True)
 
 from gibss.operators import BCOOOperator, DenseOperator
-from gibss.ser_ops import localjj_ser
+from gibss.legacy.ser_ops import localjj_ser
 
 
 def _ops(Xd):

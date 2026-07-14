@@ -18,13 +18,17 @@ The generic equivalents (see notes/response_kernel_tables.md):
     legacy.logistic_localtaylor == kernel="quad" (GH tail over b; profile mode ==
                                    intercept="profiled")
 
-NOT moved here (they cannot be, yet): `ser_ops` and `_jj`. `ser_ops` mixes the
-legacy logistic KERNELS (quadrature_ser, profile_ser, localjj_ser,
-localjj_centered_ser, local_irls, local_irls_centered, local_gaussian_ser --
-which these modules import) with genuinely CORE utilities that `gibss.linear`
-and `gibss.response_ser` depend on (global_gaussian_ser, _gh_rule,
-_normal_logpdf, _cheb_fit_matrix, _clenshaw). Splitting that core/legacy seam is
-the next step of the retirement (Tier 2 proper); until then `ser_ops` and its
-helper `_jj` stay in the core package and these modules reach up to them via
-`from ..ser_ops import ...`.
+`legacy.ser_ops` and `legacy._jj` also live here: the legacy logistic KERNELS
+(quadrature_ser, profile_ser, localjj_ser, localjj_centered_ser, local_irls,
+local_irls_centered, local_gaussian_ser) and the Jaakkola-Jordan helpers these
+modules import. The five genuinely CORE utilities that used to share
+`ser_ops` were extracted so the core does not depend on legacy:
+`global_gaussian_ser` -> `gibss.linear`, and the numeric primitives `_gh_rule`,
+`_normal_logpdf`, `_cheb_fit_matrix`, `_clenshaw` -> `gibss._numerics`.
+`legacy.ser_ops` re-imports those from core for the kernels' use.
+
+What remains for full retirement: repoint the parity tests from
+generic-vs-legacy to generic-vs-brute-force (the brute integrals already exist
+in test_response / test_quadrature_ser), after which this whole subpackage can
+be deleted.
 """

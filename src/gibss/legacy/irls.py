@@ -27,7 +27,8 @@ import numpy as np
 
 from .. import linear
 from ..operators import as_operator, CenteredOperator
-from ..ser_ops import global_gaussian_ser, _smooth_cumulant, profiled_logistic_null
+from ..linear import global_gaussian_ser
+from .ser_ops import _smooth_cumulant, profiled_logistic_null
 from ..engine import (
     BaseSERState,
     GIBSSState,

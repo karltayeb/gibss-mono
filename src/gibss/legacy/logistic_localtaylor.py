@@ -48,7 +48,7 @@ from ..linear import (
     update_prior_variance_index_step,
 )
 from ..operators import as_operator
-from ..ser_ops import (
+from .ser_ops import (
     profile_ser,
     profiled_logistic_null,
     quadrature_ser,
@@ -228,7 +228,7 @@ def estimate_intercept(data, state) -> float:
     total_mean = jnp.asarray(tm.mean)
     ov = 0.0 if isinstance(tm, MeanMessage) else jnp.asarray(tm.var)
     oi = "none" if isinstance(tm, MeanMessage) else fs.offset_integration
-    from ..ser_ops import _smooth_cumulant
+    from .ser_ops import _smooth_cumulant
     y = jnp.asarray(data.y)
 
     def body(state_):

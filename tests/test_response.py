@@ -28,7 +28,7 @@ from gibss.response_ser import (
     glm_vi_profile_ser,
     glm_vi_ser,
 )
-from gibss.ser_ops import (
+from gibss.legacy.ser_ops import (
     local_irls_centered,
     localjj_centered_ser,
     localjj_ser,

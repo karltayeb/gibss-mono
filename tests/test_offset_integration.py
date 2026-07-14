@@ -14,7 +14,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 from gibss.operators import DenseOperator, as_operator
-from gibss.ser_ops import (
+from gibss.legacy.ser_ops import (
     _smooth_cumulant,
     local_irls,
     local_irls_centered,

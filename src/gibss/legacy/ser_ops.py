@@ -13,7 +13,7 @@ higher global moments with a per-feature Vandermonde in the effect `m` (see
 
 from __future__ import annotations
 
-from functools import lru_cache, partial
+from functools import partial
 from typing import Any
 
 import jax
@@ -21,10 +21,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._jj import lambda_xi, jj_profiled_null_log_likelihood
-from .operators import DesignOperator, vandermonde
+from ..operators import DesignOperator, vandermonde
+from ..linear import global_gaussian_ser  # moved to core; re-exported for the kernels
+from .._numerics import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
 __all__ = [
-    "global_gaussian_ser",
     "local_gaussian_ser",
     "local_irls",
     "local_irls_centered",
@@ -34,17 +35,6 @@ __all__ = [
     "localjj_centered_ser",
     "profiled_logistic_null",
 ]
-
-
-@lru_cache(maxsize=None)
-def _gh_rule(order: int):
-    """Gauss-Hermite nodes + log-weights (weight exp(-x^2)). numpy (jit-safe cache)."""
-    nodes, weights = np.polynomial.hermite.hermgauss(order)
-    return nodes, np.log(weights)
-
-
-def _normal_logpdf(b, prior_variance):
-    return -0.5 * (b**2 / prior_variance + jnp.log(2.0 * jnp.pi * prior_variance))
 
 
 def _smooth_cumulant(eta, ov, offset_integration="taylor"):
@@ -118,27 +108,6 @@ def profiled_logistic_null(y, offset, n_iter: int = 50, offset_var=None,
 
     b0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (0.0, 0))
     return jnp.sum(y * (offset + b0) - _smooth_A_only(offset + b0, ov, offset_integration))
-
-
-def global_gaussian_ser(
-    op: DesignOperator,
-    tau: Any,
-    r: Any,
-    prior_variance: Any,
-) -> tuple[Any, Any, Any]:
-    """Global (shared-weight) Gaussian SER: per-feature (mu, var, log_bf).
-
-    curvature  x2_j = moment(2, tau)_j = sum_i tau_i x_ij^2
-    gradient   num_j = rmatvec(r)_j    = sum_i x_ij r_i
-    Centering (pre or weighted) is carried by the operator: pass a CenteredOperator
-    and moment(2)/rmatvec already include the rank-1 correction."""
-    x2 = op.moment(2, tau)
-    num = op.rmatvec(r)
-    inv_pv = 1.0 / prior_variance
-    var = 1.0 / (inv_pv + x2)
-    mu = var * num
-    log_bf = 0.5 * (jnp.log(var / prior_variance) + mu**2 / var)
-    return mu, var, log_bf
 
 
 @partial(jax.jit, static_argnames=("n_iter", "offset_integration", "background", "degree"))
@@ -458,25 +427,6 @@ def _intercept_background(offset, b0, y, ov=0.0, offset_integration="taylor"):
         jnp.sum(yb - mu0, 0),
         jnp.sum(yb * eta0 - A0, 0),
     )  # BGw, BGg, BGll
-
-
-@lru_cache(maxsize=None)
-def _cheb_fit_matrix(degree: int):
-    """CGL nodes on [-1,1] and the inverse-Vandermonde (samples->Chebyshev coeffs)."""
-    k = np.arange(degree + 1)
-    x = np.cos(np.pi * k / degree)  # Chebyshev-Gauss-Lobatto nodes
-    V = np.cos(np.outer(np.arccos(x), np.arange(degree + 1)))  # V[k,j]=T_j(x_k)
-    return x, np.linalg.inv(V)  # exact interpolant on CGL nodes
-
-
-def _clenshaw(coeffs, t):
-    """sum_j coeffs[j] T_j(t) at t (any shape). coeffs (D+1,) static length."""
-    b1 = jnp.zeros_like(t)
-    b2 = jnp.zeros_like(t)
-    for k in range(coeffs.shape[0] - 1, 0, -1):
-        b0 = coeffs[k] + 2.0 * t * b1 - b2
-        b2, b1 = b1, b0
-    return coeffs[0] + t * b1 - b2
 
 
 @partial(jax.jit, static_argnames=("degree", "offset_integration"))

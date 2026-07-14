@@ -7,7 +7,7 @@ from jax.experimental import sparse
 jax.config.update("jax_enable_x64", True)
 
 from gibss.operators import BCOOOperator, CenteredOperator, DenseOperator
-from gibss.ser_ops import global_gaussian_ser
+from gibss.linear import global_gaussian_ser
 
 
 def _bases(Xd):

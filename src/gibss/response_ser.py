@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from .engine import BaseSERState
 from .operators import DesignOperator
 from .response import GH, Bernoulli, JJFixed, ResponseModel, Smoothed
-from .ser_ops import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
+from ._numerics import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
 __all__ = [
     "glm_ser",

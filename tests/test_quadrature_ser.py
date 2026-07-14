@@ -8,7 +8,7 @@ from scipy.special import logsumexp
 jax.config.update("jax_enable_x64", True)
 
 from gibss.operators import BCOOOperator, DenseOperator
-from gibss.ser_ops import local_irls, quadrature_ser
+from gibss.legacy.ser_ops import local_irls, quadrature_ser
 
 
 def _ops(Xd):

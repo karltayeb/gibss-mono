@@ -8,8 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse
 
-from .operators import as_operator, CenteredOperator
-from .ser_ops import global_gaussian_ser
+from .operators import as_operator, CenteredOperator, DesignOperator
 from .engine import (
     BaseSERState,
     GIBSSState,
@@ -23,6 +22,29 @@ from .engine import (
 
 def is_bcoo(X: Any) -> bool:
     return isinstance(X, sparse.BCOO)
+
+
+def global_gaussian_ser(
+    op: DesignOperator,
+    tau: Any,
+    r: Any,
+    prior_variance: Any,
+) -> tuple[Any, Any, Any]:
+    """Global (shared-weight) Gaussian SER: per-feature (mu, var, log_bf).
+
+    curvature  x2_j = moment(2, tau)_j = sum_i tau_i x_ij^2
+    gradient   num_j = rmatvec(r)_j    = sum_i x_ij r_i
+    Centering (pre or weighted) is carried by the operator: pass a CenteredOperator
+    and moment(2)/rmatvec already include the rank-1 correction. The Gaussian
+    closed-form single-effect regression behind linear SuSiE (and, via the legacy
+    kernels, the working-model globaljj / irls fits)."""
+    x2 = op.moment(2, tau)
+    num = op.rmatvec(r)
+    inv_pv = 1.0 / prior_variance
+    var = 1.0 / (inv_pv + x2)
+    mu = var * num
+    log_bf = 0.5 * (jnp.log(var / prior_variance) + mu**2 / var)
+    return mu, var, log_bf
 
 
 LinearEffect = BaseSERState

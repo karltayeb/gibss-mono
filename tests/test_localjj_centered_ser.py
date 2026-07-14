@@ -6,9 +6,9 @@ from jax.experimental import sparse
 
 jax.config.update("jax_enable_x64", True)
 
-from gibss._jj import jj_profiled_null_log_likelihood
+from gibss.legacy._jj import jj_profiled_null_log_likelihood
 from gibss.operators import BCOOOperator, DenseOperator
-from gibss.ser_ops import localjj_centered_ser
+from gibss.legacy.ser_ops import localjj_centered_ser
 
 
 def _ops(Xd):
@@ -92,7 +92,7 @@ def test_localjj_centered_offset_shift_invariance():
 def test_localjj_offset_var_backward_compat_and_effect():
     # offset_var=None == offset_var=0 (identity); a real offset_var changes the JJ
     # tuning (E[eta^2] += offset_var) and stays finite -- both centered + not.
-    from gibss.ser_ops import localjj_ser, localjj_centered_ser
+    from gibss.legacy.ser_ops import localjj_ser, localjj_centered_ser
     rng = np.random.default_rng(7)
     n, p = 300, 12
     Xd = rng.normal(size=(n, p))

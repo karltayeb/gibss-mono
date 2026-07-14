@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from ..operators import as_operator, CenteredOperator
-from ..ser_ops import global_gaussian_ser
-from .._jj import (
+from ..linear import global_gaussian_ser
+from ._jj import (
     lambda_xi as _lambda_xi,
     jj_bound_null_log_likelihood as _jj_bound_null_log_likelihood,
     jj_null_log_likelihood as _jj_null_log_likelihood,
