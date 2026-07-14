@@ -252,20 +252,22 @@ def _freeze_null_intercept(data, state):
     return replace(state, family_state=replace(state.family_state, intercept_var=v0))
 
 
-def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_state_kwargs=None):
+def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_state_kwargs=None,
+                     prior_variance=1.0):
     from .linear import _empty_effect
     p = data.X.shape[1]
     n = data.X.shape[0]
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
     state = GIBSSState(
-        single_effects=[_empty_effect(p, 1.0) for _ in range(L)],
+        single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=Message(jnp.zeros(n), jnp.zeros(n)),
         family_state=GLMFamilyState(**kw),
     )
     return _freeze_null_intercept(data, state)
 
 
-def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli(), family_state_kwargs=None):
+def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli(), family_state_kwargs=None,
+                                  prior_variance=1.0):
     """Mean-only variant: the state carries a `MeanMessage`, whose add/subtract DROP
     the incoming variance, so `total_message.var` is identically zero and every
     `Smoothed` scheme sees ov = 0 -- the working model of A itself, no offset
@@ -278,7 +280,7 @@ def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli
     n = data.X.shape[0]
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
     state = GIBSSState(
-        single_effects=[_empty_effect(p, 1.0) for _ in range(L)],
+        single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=MeanMessage(jnp.zeros(n)),
         family_state=GLMFamilyState(**kw),
     )
