@@ -5,7 +5,7 @@ likelihood; this module wraps it as a `gibss` engine family so a full SuSiE runs
 *any* `ResponseModel`. Logistic SuSiE is `GLM(Bernoulli())`, Poisson SuSiE is
 `GLM(Poisson())` -- the same code path, only the response differs.
 
-The two-group marginal has its own module (`twogroup_marginal`) because it needs an
+The two-group enrichment model has its own module (`twogroup`) because it needs an
 outer f0/f1 M-step and the special after-effects intercept ordering (its intercept is
 degenerate at b=0). For the log-concave families here the intercept is well behaved,
 so it is estimated the usual way, before the effects.
@@ -183,6 +183,16 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     """(kernel, intercept) dispatch, returning the raw per-feature (mu, var, log_bf,
     coefficient_kl) so wrappers (e.g. cox_poisson's partial-likelihood read-out)
     can adjust before assembling the SER state."""
+    if getattr(data, "column_center", None) is not None:
+        # sparse implicit pre-centering (LinearData.column_center) is consumed via
+        # data.op by the linear family only; these kernels read data.X directly and
+        # would silently fit the UNCENTERED model. (Profiled kernels don't need
+        # centering -- the per-feature intercept absorbs any column shift.)
+        raise NotImplementedError(
+            "sparse (BCOO) pre-centering is not consumed by the glm kernels; "
+            "pass center=False (or use intercept='profiled', which is invariant "
+            "to column shifts)."
+        )
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
     profiled = fs.intercept == "profiled"

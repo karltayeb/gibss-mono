@@ -1,431 +1,386 @@
-from dataclasses import dataclass, field, replace
-from importlib import import_module
-from types import SimpleNamespace
+"""Two-group enrichment SuSiE: the marginalized family, first-class on glm machinery.
+
+Per observation: a summary statistic `bhat_i (se_i)`, a latent membership
+`z_i ~ Bernoulli(sigmoid(eta_i))` with `eta = b0 + X (sum_l b_l gamma_l)`, and a
+normal-means observation model `bhat | z ~ (f_z * N(0, se^2))`. `z` is integrated
+out ANALYTICALLY (`response.TwoGroupMarginal`): the per-observation marginal is
+
+    loglik_i(eta) = softplus(eta + llr_i) - softplus(eta)   (+ log f0, eta-free),
+    llr_i = log f1(bhat_i; se_i) - log f0(bhat_i; se_i),
+
+so there is no E-step over z in any effect fit -- each per-feature fit is an SER
+on the exact z-marginal via the ordinary glm kernels. The family-specific coupling
+(f0/f1 and the llr they induce) is quarantined into engine-refreshed per-row state,
+the same pattern as cox_poisson's Breslow offset: `llr` lives on the family state
+in the slot glm fills with `data.y`, refreshed by `update_mixture_step` whenever
+f0/f1 move. No inner/outer state nesting, no response injection, no schedule
+wrapping (this module replaces the old wrapper + twogroup_marginal +
+twogrouplocaljj trio).
+
+Every approximation, named (details in `notes/twogroup rework.md`):
+
+  1. z-marginalization: EXACT (closed form).
+  2. b per feature: GH quadrature on the exact marginal (`glm_ser`), centered at
+     the MM stationary point with the majorizer-Laplace width. The marginal in b
+     is non-log-concave (its curvature `w(eta) - w(eta+llr)` is indefinite;
+     `weight = w(eta)` is the monotone majorizer), so the mode is local and the
+     GH tail captures only mass inside the (conservatively wide) proposal.
+  3. Across effects: gIBSS -- each effect sees the leave-one-out posterior MEAN.
+     `Smoothed(TwoGroupMarginal(), GH(k))` additionally integrates the LOO
+     message as a random offset o ~ N(mean, var) (the only valid smoother here:
+     Taylor needs an exact cumulant curvature, JJ needs Bernoulli).
+  4. f0/f1: generalized EM -- ONE M-step per sweep with plug-in
+     Ez = sigmoid(eta + llr) at the posterior-mean predictor (GH-averaged over
+     the message variance under a Smoothed response, matching the fit).
+  5. Intercept: one EM coordinate update per sweep, AFTER the effects. The
+     marginal saturates (-> llr as eta -> +inf), so the b0-alone objective is
+     maximized on the boundary b0 -> +inf ("everything enriched") and the
+     interior optimum is only local: the scheme is a deliberate local ascent
+     (E-step frozen at the current b0, concave logistic M-step, once per sweep,
+     effects first). `intercept="profiled"`/`"null"` are refused -- both hit the
+     same boundary mode.
+  6. Init: covariate-free two-group EB EM (f0/f1 M-steps alternating with the
+     exact no-covariate intercept M-step b0 = logit(mean Ez)), so the sweeps
+     start from the classic two-group fit and add covariate moderation.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
 from typing import Any
+
 import jax
-
-from .operators import as_operator
 import jax.numpy as jnp
-from jax.experimental import sparse
+import numpy as np
 
-from gibss.engine import Schedule, GIBSSState, add_step, delete_step
+from . import glm
+from .distributions import Normal, PointMass
+from .engine import (
+    GIBSSState,
+    Message,
+    Schedule,
+    add_message_index_step,
+    check_alpha_skl_convergence_step,
+    fit_ibss,
+    replace_effect_in_gibss_state,
+    snapshot_state_step,
+    subtract_message_index_step,
+    to_numpy_state_step,
+)
+from .linear import LinearData, _empty_effect, update_prior_variance_index_step
+from .response import Smoothed, TwoGroupMarginal
+
+__all__ = [
+    "TwoGroupData",
+    "TwoGroupFamilyState",
+    "prep_data",
+    "initialize_state",
+    "fit",
+    "compute_Ez",
+    "log_likelihood",
+    "update_effect_index_step",
+    "update_intercept_step",
+    "update_mixture_step",
+    "default_schedule",
+]
 
 
-@dataclass(frozen=True, slots=True)
-class TwoGroupData:
-    X: Any
-    bhat: jnp.ndarray
-    se: jnp.ndarray
-    X_sq: Any = None
+@dataclass(frozen=True)
+class TwoGroupData(LinearData):
+    # X, y, obs_variance, column_center (and the `op` property: dense pre-centering /
+    # sparse implicit centering) come from LinearData. `y` is a placeholder the
+    # family never reads back -- the response slot is `family_state.llr`.
+    bhat: Any = None
+    se: Any = None
 
 
-def _normalize_two_group_response(
-    y: Any = None,
-    *,
-    bhat: Any = None,
-    se: Any = None,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+def prep_data(X, y=None, *, bhat=None, se=None, center=None) -> TwoGroupData:
+    """Package (X, summary statistics) for the engine. The response is
+    `y = (n, 2) [bhat, se]` or separate `bhat=`/`se=` arrays; the design is handled
+    exactly like `glm.prep_data` (dense pre-centering etc.)."""
     if y is not None:
         if bhat is not None or se is not None:
             raise ValueError("Pass either y or bhat and se, not both.")
         y = jnp.asarray(y)
         if jnp.ndim(y) != 2 or y.shape[1] != 2:
             raise ValueError("y must have shape (n, 2) with columns [bhat, se].")
-        return y[:, 0], y[:, 1]
-
+        bhat, se = y[:, 0], y[:, 1]
     if bhat is None or se is None:
         raise ValueError("bhat and se must both be provided when y is omitted.")
-
     bhat = jnp.asarray(bhat)
     se = jnp.asarray(se)
-    if bhat.ndim != 1 or se.ndim != 1:
-        raise ValueError("bhat and se must both be one-dimensional.")
-    if bhat.shape != se.shape:
-        raise ValueError("bhat and se must have the same shape.")
-    return bhat, se
-
-
-def prep_data(
-    X: Any,
-    y: Any = None,
-    *,
-    bhat: Any = None,
-    se: Any = None,
-) -> TwoGroupData:
-    """
-    Prepare data for TwoGroup model.
-    Response may be passed as y[:, [bhat, se]] or as separate bhat and se arrays.
-    """
-    bhat, se = _normalize_two_group_response(y, bhat=bhat, se=se)
-
-    X_sq = None
-    if not isinstance(X, sparse.BCOO):
-        X_sq = jnp.square(X)
-
-    return TwoGroupData(X=X, bhat=bhat, se=se, X_sq=X_sq)
+    if bhat.ndim != 1 or bhat.shape != se.shape:
+        raise ValueError("bhat and se must be 1D arrays of the same shape.")
+    ld = glm.prep_data(X, jnp.zeros_like(bhat), center=center)
+    return TwoGroupData(
+        X=ld.X, y=ld.y, obs_variance=ld.obs_variance, column_center=ld.column_center,
+        bhat=bhat, se=se,
+    )
 
 
 @dataclass(frozen=True, slots=True)
-class TwoGroupFamilyState:
-    """
-    Holds the state for the Two-Group enrichment model, wrapping
-    the inner family state (e.g., LocalJJFamilyState) used for the
-    SuSiE latent target regression.
+class TwoGroupFamilyState(glm.GLMFamilyState):
+    """glm family state + the two-group mixture. `llr` is the engine-refreshed
+    per-row response (the slot glm fills with `data.y`); f0/f1 own their update
+    flags (`estimate_*` on the distribution objects), so `update_mixture_step`
+    needs no switches here."""
 
-    The stored latent quantity is the per-observation log-likelihood ratio
-    ``llr = log f1 - log f0`` (a function of ``f0``/``f1`` and the data only,
-    recomputed whenever ``f0``/``f1`` change). The enrichment probability
-    ``Ez = sigmoid(eta + llr)`` is always derived on demand via ``compute_Ez``
-    since it also depends on the linear predictor ``eta`` held on the GIBSS
-    total message.
-    """
+    f0: Any = None
+    f1: Any = None
+    llr: Any = None
+    init_em_iters: int = 20
 
-    llr: jnp.ndarray
-    f0: Any  # Component distribution (e.g., Normal/PointMass)
-    f1: Any  # Component distribution
-    inner_family_state: Any
-    update_f0: bool = True
-    update_f1: bool = True
-    n_null_iter: int = 10
-    n_intercept_iter: int = 5
-    # Optional fixed clamp on the enrichment probability, set only by the
-    # hard/lfdr thresholding steps. When not None, ``compute_Ez`` returns it
-    # verbatim and ignores both ``eta`` and ``llr``.
-    Ez_override: Any = None
+    def __post_init__(self):
+        # explicit base call: dataclass(slots=True) recreates the class, so the
+        # zero-arg super() would bind the stale pre-slots class cell
+        glm.GLMFamilyState.__post_init__(self)
+        base = self.response.base if isinstance(self.response, Smoothed) else self.response
+        if not isinstance(base, TwoGroupMarginal):
+            raise ValueError(
+                f"TwoGroupFamilyState needs a TwoGroupMarginal response (or a "
+                f"Smoothed elaboration of one); got {self.response!r}."
+            )
+        if self.intercept != "shared":
+            raise ValueError(
+                f"intercept={self.intercept!r} is degenerate for the two-group "
+                f"marginal: the b0-alone objective is maximized at b0 -> +inf "
+                f"(loglik -> llr), so both the per-feature profile and the b = 0 "
+                f"null fit run to the boundary. Only 'shared' (the after-effects "
+                f"EM update) is supported."
+            )
+        if self.kernel == "vi" and not isinstance(self.response, Smoothed):
+            raise ValueError(
+                "kernel='vi' needs a Smoothed response (the scheme is the "
+                "variational expectation operator): use "
+                "Smoothed(TwoGroupMarginal(), GH(k))."
+            )
+
+
+def _llr(f0, f1, data):
+    return jnp.asarray(
+        f1.log_likelihood_nm(data.bhat, data.se)
+        - f0.log_likelihood_nm(data.bhat, data.se)
+    )
+
+
+def _aux(data, state, include_intercept_var=True):
+    """Kernel aux: the llr (the family's response); a Smoothed response adds the
+    random-offset variance, exactly as glm._aux does for data.y."""
+    fs = state.family_state
+    llr = jnp.asarray(fs.llr)
+    if not isinstance(fs.response, Smoothed):
+        return llr
+    return llr, glm._offset_var(state, include_intercept_var)
+
+
+def compute_Ez(state, include_intercept_var=True):
+    """Posterior enrichment probability E[z_i | bhat, eta] = sigmoid(eta_i + llr_i).
+
+    Plug-in at the posterior-mean predictor; under a Smoothed response the
+    plug-in is replaced by the GH average over the message-variance offset
+    o ~ N(0, ov) -- the same integration the effect fits use, so the E-step and
+    the fits see one model."""
+    fs = state.family_state
+    eta = fs.intercept_value + fs.glm_offset + jnp.asarray(state.total_message.mean)
+    llr = jnp.asarray(fs.llr)
+    if not isinstance(fs.response, Smoothed):
+        return jax.nn.sigmoid(eta + llr)
+    ov = glm._offset_var(state, include_intercept_var)
+    order = getattr(fs.response.smoother, "order", fs.quadrature_order)
+    nodes_np, wts_np = np.polynomial.hermite.hermgauss(order)
+    nodes = jnp.asarray(nodes_np)[:, None]
+    wts = jnp.asarray(wts_np / np.sqrt(np.pi))[:, None]
+    sd = jnp.sqrt(2.0 * jnp.maximum(jnp.asarray(ov), 0.0))
+    return jnp.sum(wts * jax.nn.sigmoid(eta + sd * nodes + llr), axis=0)
+
+
+def update_mixture_step(data, state):
+    """f0/f1 M-steps + llr refresh: one generalized-EM iteration per sweep.
+
+    `update_nm` maximizes the Ez-weighted expected complete-data loglik (exact
+    M-step); the approximation is the plug-in E-step (see compute_Ez) and the
+    single step per sweep. Distributions that estimate nothing return themselves,
+    so a fixed f0 (e.g. PointMass) is simply never touched."""
+    fs = state.family_state
+    ez = compute_Ez(state)
+    f0 = fs.f0.update_nm(data.bhat, data.se, 1.0 - ez)
+    f1 = fs.f1.update_nm(data.bhat, data.se, ez)
+    if f0 is fs.f0 and f1 is fs.f1:
+        return state
+    return replace(
+        state, family_state=replace(fs, f0=f0, f1=f1, llr=_llr(f0, f1, data))
+    )
+
+
+def estimate_intercept(data, state):
+    """One EM coordinate update for the enrichment intercept (E-step frozen at the
+    current b0, CONCAVE logistic M-step run to convergence). Always finite: the
+    M-step is a logistic MLE on the soft label Ez in (0,1). Deliberately not
+    iterated -- each full EM step monotonically increases the marginal, whose
+    global max in b0 alone is the boundary mode b0 -> +inf; the single update per
+    sweep (after the effects have structured eta) stays at the interior fixed
+    point. Returns (b0, v0) with v0 = 1/sum w from the M-step curvature --
+    complete-data information, an UNDERestimate of the intercept's variance,
+    entering only as an O(1/n) term in the Smoothed ov."""
+    fs = state.family_state
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset
+    # mean-field self-exclusion: the intercept's own variance stays out of its
+    # E-step (matches glm.estimate_intercept's ov handling)
+    ez = compute_Ez(state, include_intercept_var=False)
+
+    def mstep(s):
+        c, it = s
+        mu = jax.nn.sigmoid(c + total_mean)
+        g = jnp.sum(ez - mu)
+        h = jnp.maximum(jnp.sum(mu * (1.0 - mu)), 1e-8)
+        return c + jnp.clip(g / h, -2.0, 2.0), it + 1
+
+    b0, _ = jax.lax.while_loop(
+        lambda s: s[1] < 30, mstep, (jnp.asarray(fs.intercept_value), 0)
+    )
+    mu = jax.nn.sigmoid(b0 + total_mean)
+    v0 = 1.0 / jnp.maximum(jnp.sum(mu * (1.0 - mu)), 1e-8)
+    return float(b0), float(v0)
+
+
+def update_intercept_step(data, state):
+    # Runs in after_sweep, NOT before the effects: at weakly structured eta the
+    # intercept objective is degenerate (see estimate_intercept / module docstring).
+    fs = state.family_state
+    if not fs.estimate_intercept:
+        return state
+    b0, v0 = estimate_intercept(data, state)
+    return replace(
+        state, family_state=replace(fs, intercept_value=b0, intercept_var=v0)
+    )
+
+
+def update_effect_index_step(data, l, state):
+    effect = state.single_effects[l]
+    fs = state.family_state
+    offset = glm._effect_offset(fs, state)  # LOO mean + intercept (+ glm_offset)
+    new_effect = glm._fit_effect(
+        data, fs, _aux(data, state), offset, effect.prior_variance,
+        fs.quadrature_order,
+    )
+    return replace_effect_in_gibss_state(state, l, new_effect)
+
+
+def log_likelihood(data, state):
+    """Plug-in marginal log-likelihood at the posterior-mean predictor (an
+    evaluation diagnostic, NOT the evidence: b and the message are not
+    integrated). Includes the eta-free log f0 base measure, so values are
+    comparable across f0/f1 updates."""
+    fs = state.family_state
+    eta = fs.intercept_value + fs.glm_offset + jnp.asarray(state.total_message.mean)
+    ll = TwoGroupMarginal().terms(eta, jnp.asarray(fs.llr))[0]
+    return float(jnp.sum(ll + fs.f0.log_likelihood_nm(data.bhat, data.se)))
+
+
+def _init_em(data, state):
+    """Covariate-free two-group EB warm start: alternate f0/f1 M-steps with the
+    exact no-covariate intercept M-step b0 = logit(mean Ez) (prior enrichment =
+    mixing weight). The sweeps then start from the classic two-group fit. Shares
+    the usual two-group EB caveat: with f0 AND f1 both fully free the likelihood
+    also has an everything-enriched mode; anchoring f0 (PointMass / fixed null)
+    is standard and the default."""
+    fs = state.family_state
+    f0, f1, llr = fs.f0, fs.f1, jnp.asarray(fs.llr)
+    b0 = fs.intercept_value
+    for _ in range(fs.init_em_iters):
+        ez = jax.nn.sigmoid(b0 + llr)  # no effects yet: eta = b0
+        f0 = f0.update_nm(data.bhat, data.se, 1.0 - ez)
+        f1 = f1.update_nm(data.bhat, data.se, ez)
+        llr = _llr(f0, f1, data)
+        if fs.estimate_intercept:
+            pbar = jnp.clip(jnp.mean(jax.nn.sigmoid(b0 + llr)), 1e-6, 1.0 - 1e-6)
+            b0 = float(jnp.log(pbar) - jnp.log1p(-pbar))
+    mu = jax.nn.sigmoid(b0)
+    n = llr.shape[0]
+    v0 = 1.0 / max(float(n * mu * (1.0 - mu)), 1e-8)
+    return replace(
+        state,
+        family_state=replace(
+            fs, f0=f0, f1=f1, llr=llr, intercept_value=b0, intercept_var=v0
+        ),
+    )
 
 
 def initialize_state(
-    data: TwoGroupData,
-    inner_state: GIBSSState,
-    f0: Any,
-    f1: Any,
-    n_null_iter: int = 10,
-    n_intercept_iter: int = 5,
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    """
-    Initialize TwoGroup state by wrapping an existing SuSiE state.
-    """
-    llr = f1.log_likelihood_nm(data.bhat, data.se) - f0.log_likelihood_nm(
-        data.bhat, data.se
-    )
-    tg_fs = TwoGroupFamilyState(
-        llr=llr,
-        f0=f0,
-        f1=f1,
-        inner_family_state=inner_state.family_state,
-        n_null_iter=int(n_null_iter),
-        n_intercept_iter=int(n_intercept_iter),
-    )
-    return replace(inner_state, family_state=tg_fs)
-
-
-def hard_threshold_Ez_step(
-    data: Any, state: GIBSSState[TwoGroupFamilyState, Any], threshold: float = 3.0
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    """
-    Sets Ez = 1 if abs(z-score) > threshold, else 0.
-    Expects data.y to be [bhat, se] or [z-score, ...].
-    If se is provided, z = bhat / se.
-    """
-    z = jnp.abs(data.bhat / data.se)
-    new_Ez = (z > threshold).astype(jnp.float64)
-    new_family = replace(state.family_state, Ez_override=new_Ez)
-    return replace(state, family_state=new_family)
-
-
-def lfdr_threshold_Ez_step(
-    data: Any, state: GIBSSState[TwoGroupFamilyState, Any], threshold: float = 0.05
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    """
-    Sets Ez = 1 if lfdr < threshold, else 0.
-    lfdr = P(z=0 | data, f0, f1) = L0 / (L0 + L1)
-    """
-    family = state.family_state
-    log_L0 = family.f0.log_likelihood_nm(data.bhat, data.se)
-    log_L1 = family.f1.log_likelihood_nm(data.bhat, data.se)
-
-    # log(lfdr) = log_L0 - log(L0 + L1) = -log(1 + exp(log_L1 - log_L0))
-    # Or just use Ez = sigmoid(log_L1 - log_L0) and check Ez > (1 - threshold)
-    # Ez = P(z=1 | data, f0, f1) = L1 / (L0 + L1) = 1 - lfdr
-    # So lfdr < threshold <=> 1 - Ez < threshold <=> Ez > 1 - threshold
-    diff = log_L1 - log_L0
-    ez_no_enrichment = jax.nn.sigmoid(diff)
-    new_Ez = (ez_no_enrichment > (1.0 - threshold)).astype(jnp.float64)
-
-    new_family = replace(state.family_state, Ez_override=new_Ez)
-    return replace(state, family_state=new_family)
-
-
-def compute_llr(data: Any, state: GIBSSState[TwoGroupFamilyState, Any]) -> jnp.ndarray:
-    """
-    Per-observation log-likelihood ratio ``llr = log f1 - log f0``.
-
-    Depends only on ``f0``/``f1`` and the data, so it is recomputed whenever the
-    component distributions change (not every sweep).
-    """
-    family = state.family_state
-    log_L0 = family.f0.log_likelihood_nm(data.bhat, data.se)
-    log_L1 = family.f1.log_likelihood_nm(data.bhat, data.se)
-    return log_L1 - log_L0
-
-
-def update_llr_step(
-    data: Any, state: GIBSSState[TwoGroupFamilyState, Any]
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    """Recompute and store ``llr`` from the current ``f0``/``f1``."""
-    new_family = replace(state.family_state, llr=compute_llr(data, state))
-    return replace(state, family_state=new_family)
-
-
-def compute_Ez(data: Any, state: GIBSSState[TwoGroupFamilyState, Any]) -> jnp.ndarray:
-    """
-    Calculate E[z] = P(z=1 | data, model) = sigmoid(eta + llr).
-
-    Reads the stored ``llr`` instead of recomputing the component
-    log-likelihoods. If a fixed ``Ez_override`` clamp is set (thresholding
-    modes), it is returned verbatim.
-    """
-    family = state.family_state
-    if family.Ez_override is not None:
-        return jnp.asarray(family.Ez_override)
-
-    # SuSiE prediction (linear predictor for enrichment)
-    eta = jnp.asarray(state.total_message.mean)
-    if hasattr(family.inner_family_state, "intercept"):
-        eta = eta + family.inner_family_state.intercept
-
-    return jax.nn.sigmoid(eta + jnp.asarray(family.llr))
-
-
-def _inner_response_step(state: GIBSSState[TwoGroupFamilyState, Any]):
-    """
-    Pick the response injector matching what the inner base model expects.
-
-    A base module may declare ``TWOGROUP_RESPONSE = "llr"`` to receive the
-    log-likelihood ratio (it performs the E-step internally). Otherwise the
-    derived enrichment probability ``Ez`` is injected.
-    """
-    inner_family = state.family_state.inner_family_state
-    module = import_module(inner_family.__class__.__module__)
-    if getattr(module, "TWOGROUP_RESPONSE", "Ez") == "llr":
-        return use_llr_as_response_step
-    return use_Ez_as_response_step
-
-
-def _run_inner_intercept_step(
-    data: Any,
-    state: GIBSSState[TwoGroupFamilyState, Any],
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    intercept_step = _resolve_inner_intercept_step(state)
-    if intercept_step is None:
-        return state
-    return _inner_response_step(state)(intercept_step)(data, state)
-
-
-def _resolve_inner_intercept_step(
-    state: GIBSSState[TwoGroupFamilyState, Any],
+    data,
+    L=1,
+    f0=None,
+    f1=None,
+    response=None,
+    family_state_kwargs=None,
+    prior_variance=1.0,
 ):
-    family = state.family_state
-    inner_family = family.inner_family_state
-    module = import_module(inner_family.__class__.__module__)
-    intercept_step = getattr(module, "estimate_intercept_step", None)
-    if not hasattr(inner_family, "intercept") or intercept_step is None:
-        return None
-    return intercept_step
-
-
-def estimate_intercept_step(
-    data: Any,
-    state: GIBSSState[TwoGroupFamilyState, Any],
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    if _resolve_inner_intercept_step(state) is None:
-        return state
-    # Each inner intercept step reads Ez fresh via compute_Ez (derived from the
-    # current intercept + llr), so no explicit Ez refresh is needed between
-    # iterations.
-    for _ in range(state.family_state.n_intercept_iter):
-        state = _run_inner_intercept_step(data, state)
-    return state
-
-
-def update_f0_step(
-    data: Any, state: GIBSSState[TwoGroupFamilyState, Any]
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    """
-    M-step: Update the null component distribution f0 using weights (1 - Ez).
-    """
-    family = state.family_state
-    if not family.update_f0:
-        return state
-
-    weights = 1.0 - compute_Ez(data, state)
-    new_f0 = family.f0.update_nm(data.bhat, data.se, weights)
-
-    new_family = replace(family, f0=new_f0)
-    return replace(state, family_state=new_family)
-
-
-def update_f1_step(
-    data: Any, state: GIBSSState[TwoGroupFamilyState, Any]
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    """
-    M-step: Update the alternative component distribution f1 using weights Ez.
-    """
-    family = state.family_state
-    if not family.update_f1:
-        return state
-
-    weights = compute_Ez(data, state)
-    new_f1 = family.f1.update_nm(data.bhat, data.se, weights)
-
-    new_family = replace(family, f1=new_f1)
-    return replace(state, family_state=new_family)
-
-
-def estimate_f_step(
-    data: Any, state: GIBSSState[TwoGroupFamilyState, Any]
-) -> GIBSSState[TwoGroupFamilyState, Any]:
-    """
-    Performs multiple EM steps to initialize f0 and f1 during before_fit.
-    When the inner model supports intercept updates, refresh the intercept/Ez
-    pair within the loop so poor f1 initialization does not lock in a bad Ez.
-    """
-    for _ in range(state.family_state.n_null_iter):
-        state = update_f0_step(data, state)
-        state = update_f1_step(data, state)
-        state = update_llr_step(data, state)
-        state = estimate_intercept_step(data, state)
-    return state
-
-
-def _use_response_step(step, response_fn):
-    """
-    Wrapper that replaces ``data.y`` with a per-observation response derived from
-    the TwoGroup state and unwraps ``inner_family_state`` so existing SuSiE steps
-    (like localjj) can be used without modification. ``response_fn(data, state)``
-    returns the response vector. Supports both Step(data, state) and
-    IndexStep(data, l, state).
-    """
-
-    def wrapped_step(data, *args):
-        # Determine if it's an IndexStep (data, l, state) or Step (data, state)
-        if len(args) == 2:
-            l, state = args
-        else:
-            l = None
-            state = args[0]
-
-        # 1. Swap data target from summary-stat response to the chosen response
-        # while preserving the base-model fields that wrapped steps expect.
-        response_data = SimpleNamespace(
-            X=data.X,
-            X_sq=data.X_sq,
-            y=response_fn(data, state),
-            op=as_operator(data.X),  # base SER message is operator-native now
-        )
-
-        # 2. Extract inner family state for the underlying SuSiE step
-        inner_state = replace(state, family_state=state.family_state.inner_family_state)
-
-        # 3. Call the unmodified step
-        if l is not None:
-            new_inner_state = step(response_data, l, inner_state)
-        else:
-            new_inner_state = step(response_data, inner_state)
-
-        # 4. Re-wrap the updated inner family state
-        new_family_state = replace(
-            state.family_state, inner_family_state=new_inner_state.family_state
-        )
-        return replace(new_inner_state, family_state=new_family_state)
-
-    return wrapped_step
-
-
-def use_Ez_as_response_step(step):
-    """Inject the derived enrichment probability ``Ez`` as the base response."""
-    return _use_response_step(step, compute_Ez)
-
-
-def use_llr_as_response_step(step):
-    """Inject the per-observation log-likelihood ratio ``llr`` as the base response.
-
-    Used for base models (e.g. ``twogrouplocaljj``) that consume ``llr`` as a
-    likelihood log-odds offset and perform the E-step (``ez = sigmoid(offset +
-    Xb + llr)``) internally.
-    """
-    return _use_response_step(
-        step, lambda data, state: jnp.asarray(state.family_state.llr)
+    """Engine state for the two-group family, warm-started by the covariate-free
+    two-group EM. `response` must be TwoGroupMarginal (default) or
+    `Smoothed(TwoGroupMarginal(), GH(k))` for LOO-message offset integration.
+    Defaults: f0 = PointMass(0) (fixed null), f1 = Normal(scale=2,
+    estimate_scale=True)."""
+    f0 = PointMass() if f0 is None else f0
+    f1 = Normal(scale=2.0, estimate_scale=True) if f1 is None else f1
+    response = TwoGroupMarginal() if response is None else response
+    p = data.X.shape[1]
+    n = data.bhat.shape[0]
+    kw = {
+        "response": response,
+        "f0": f0,
+        "f1": f1,
+        "llr": _llr(f0, f1, data),
+        **({} if family_state_kwargs is None else dict(family_state_kwargs)),
+    }
+    state = GIBSSState(
+        single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
+        total_message=Message(jnp.zeros(n), jnp.zeros(n)),
+        family_state=TwoGroupFamilyState(**kw),
     )
+    return _init_em(data, state)
 
 
-# Backwards-compatible alias (historical name).
-use_ez_as_y = use_Ez_as_response_step
-
-
-def _wrap_schedule_with(schedule: Schedule, response_step) -> Schedule:
-    return replace(
-        schedule,
-        before_fit=tuple(response_step(s) for s in schedule.before_fit),
-        before_sweep=tuple(response_step(s) for s in schedule.before_sweep),
-        before_effect_update=tuple(
-            response_step(s) for s in schedule.before_effect_update
-        ),
-        effect_update=tuple(response_step(s) for s in schedule.effect_update),
-        after_effect_update=tuple(
-            response_step(s) for s in schedule.after_effect_update
-        ),
-        after_sweep=tuple(response_step(s) for s in schedule.after_sweep),
-        # after_fit usually doesn't touch data.y
+def fit(
+    X,
+    bhat,
+    se,
+    f0=None,
+    f1=None,
+    L=5,
+    max_iter=50,
+    response=None,
+    family_state_kwargs=None,
+    prior_variance=1.0,
+    center=None,
+):
+    """One-call two-group enrichment SuSiE. Returns the fitted GIBSSState:
+    `state.single_effects[l].alpha` are the PIPs, `state.family_state.f0/f1` the
+    fitted components, `compute_Ez(state)` the posterior enrichment
+    probabilities."""
+    data = prep_data(X, bhat=bhat, se=se, center=center)
+    state = initialize_state(
+        data, L=L, f0=f0, f1=f1, response=response,
+        family_state_kwargs=family_state_kwargs, prior_variance=prior_variance,
     )
+    return fit_ibss(data, state, default_schedule(), max_iter=max_iter)
 
 
-def wrap_schedule_with_ez(schedule: Schedule) -> Schedule:
-    """Wraps all steps in a schedule to use ``Ez`` as the regression target."""
-    return _wrap_schedule_with(schedule, use_Ez_as_response_step)
-
-
-def wrap_schedule_with_llr(schedule: Schedule) -> Schedule:
-    """Wraps all steps in a schedule to use ``llr`` as the regression target."""
-    return _wrap_schedule_with(schedule, use_llr_as_response_step)
-
-
-def default_schedule(base_schedule: Schedule) -> Schedule:
-    """
-    Constructs a TwoGroup schedule by wrapping a base SuSiE schedule
-    (like localjj.default_schedule) and injecting the EM updates.
-    """
-    # 1. Wrap SuSiE kernels to use Ez (derived fresh via compute_Ez)
-    schedule = wrap_schedule_with_ez(base_schedule)
-
-    # 2. Inject Two-Group EM steps
-    schedule = add_step(schedule, before_fit=(estimate_f_step, 0))
-    schedule = add_step(schedule, before_fit=(estimate_intercept_step, 0))
-    schedule = add_step(schedule, after_sweep=(update_f0_step, 0))
-    schedule = add_step(schedule, after_sweep=(update_f1_step, 1))
-    schedule = add_step(schedule, after_sweep=(update_llr_step, 2))
-
-    return schedule
-
-
-def local_default_schedule(base_schedule: Schedule) -> Schedule:
-    """
-    Constructs a TwoGroup schedule for a *local* base model (e.g.
-    ``twogrouplocaljj``) that consumes ``llr`` as its response and performs the
-    per-covariate E-step internally.
-
-    Unlike :func:`default_schedule`, the base schedule is wrapped with the
-    ``llr`` injector and no global ``Ez`` refresh step is needed.
-    """
-    # 1. Wrap SuSiE kernels to use llr as the response
-    schedule = wrap_schedule_with_llr(base_schedule)
-
-    # 2. Inject Two-Group EM steps. f0/f1 M-steps (and the llr they feed) run
-    #    after each sweep; estimate_f_step initializes them before fitting.
-    schedule = add_step(schedule, before_fit=(estimate_f_step, 0))
-    schedule = add_step(schedule, before_fit=(estimate_intercept_step, 0))
-    schedule = add_step(schedule, after_sweep=(update_f0_step, 0))
-    schedule = add_step(schedule, after_sweep=(update_f1_step, 1))
-    schedule = add_step(schedule, after_sweep=(update_llr_step, 2))
-
-    return schedule
+def default_schedule() -> Schedule:
+    # Intercept and mixture updates run AFTER the effects (see approximation 5 in
+    # the module docstring): the effects structure eta, which pins the intercept
+    # to its interior value; the mixture M-step then sees the fresh b0.
+    return Schedule(
+        before_sweep=(snapshot_state_step,),
+        effect_update=(
+            subtract_message_index_step,
+            update_effect_index_step,
+            update_prior_variance_index_step,
+            add_message_index_step,
+        ),
+        after_sweep=(
+            update_intercept_step,
+            update_mixture_step,
+            check_alpha_skl_convergence_step,
+        ),
+        after_fit=(to_numpy_state_step,),
+    )
