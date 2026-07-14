@@ -97,9 +97,9 @@ def test_centered_and_uncentered_recover_same_signal():
     X, y = _sim(rng, n, p, 8, signal=2.0)
     Xs = sparse.BCOO.fromdense(jnp.asarray(X))
 
-    def run(center):
+    def run(profile):
         data = irls.prep_data(Xs, y)
-        st = irls.initialize_state(data, L=1, family_state_kwargs={"center": center})
+        st = irls.initialize_state(data, L=1, family_state_kwargs={"profile": profile})
         return fit_ibss(data, st, irls.default_schedule(), max_iter=100)
 
     c = run(True)
@@ -142,11 +142,12 @@ def test_irls_multi_effect():
 
 
 def test_irls_offset_integration():
-    # global-Taylor random offset: Message init integrates the working weights over
-    # the predictor variance (globaljj analog); MeanMessage init is fixed. Both
-    # recover the signals; dense == sparse under integration. (The alpha shift is
-    # small when well-powered -- the O(1/n) leverage finding -- so we don't assert
-    # a magnitude; correctness is recovery + dense/sparse agreement.)
+    # Offset integration is OPT-IN (offset_integration="taylor"); the default is the
+    # raw fixed-quadratic (A, not A~). With "taylor" the working weights are convolved
+    # over the predictor variance (globaljj analog). Both recover the signals; dense
+    # == sparse under integration. (The alpha shift is small when well-powered -- the
+    # O(1/n) leverage finding -- so we don't assert a magnitude; correctness is
+    # recovery + dense/sparse agreement.)
     import jax.numpy as jnp
     from jax.experimental import sparse
     rng = np.random.default_rng(9)
@@ -162,13 +163,13 @@ def test_irls_offset_integration():
         return st
 
     fixed = run(irls.initialize_state_mean_message, jnp.asarray(X))
-    integ = run(irls.initialize_state, jnp.asarray(X))
+    integ = run(irls.initialize_state, jnp.asarray(X), offset_integration="taylor")
     for st in (fixed, integ):
         assert {5, 20} <= {int(np.argmax(np.asarray(e.alpha))) for e in st.single_effects}
 
     # dense == sparse under integration (the centered message var is representation-
     # invariant, so the offset-integrated weights match)
-    integ_sp = run(irls.initialize_state, sparse.BCOO.fromdense(jnp.asarray(X)))
+    integ_sp = run(irls.initialize_state, sparse.BCOO.fromdense(jnp.asarray(X)), offset_integration="taylor")
     a_int = np.concatenate([np.asarray(e.alpha) for e in integ.single_effects])
     a_sp = np.concatenate([np.asarray(e.alpha) for e in integ_sp.single_effects])
     np.testing.assert_allclose(a_int, a_sp, rtol=1e-5, atol=1e-6)

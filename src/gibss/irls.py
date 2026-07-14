@@ -95,13 +95,21 @@ class IRLSFamilyState:
     intercept: float = 0.0
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
-    # offset integration: convolve the working weight/mean over the predictor
-    # variance (message type drives it -- Message integrates, MeanMessage doesn't).
-    #   "none" | "taylor" (default, free) | int k (Gauss-Hermite order-k)
-    offset_integration: str | int = "taylor"
-    # Weighted column centering: orthogonalize the intercept and each feature
-    # under the working weights (implicit, sparsity-preserving).
-    center: bool = True
+    # Offset integration = convolve the working weight/mean over the predictor
+    # variance. DEFAULT "none": global taylor is a fixed quadratic expanded at the
+    # posterior MEAN, so it uses the raw cumulant A (weight w0 = A''(eta_mean)); the
+    # predictor second moment enters only the ELBO (via -1/2 w0 V[eta]), a per-row
+    # constant that cancels in the relative BF -> it does NOT move the effect
+    # estimates. Opt-in "taylor"/k convolves the weight (A -> A~, the globaljj xi
+    # analog); that's a Gaussian-offset approximation and the offset is a non-Gaussian
+    # mixture of the other effects, so it's not justified for a fixed quadratic --
+    # its PIP effect is the O(1/n) leverage artifact. Message type is moot under
+    # "none" (both Message and MeanMessage use the raw weight).
+    #   "none" (default) | "taylor" | int k (Gauss-Hermite order-k)
+    offset_integration: str | int = "none"
+    # Intercept profiling via weighted column centering: orthogonalize the intercept
+    # and each feature under the working weights (implicit, sparsity-preserving).
+    profile: bool = True
     cbar: Any = None  # weighted column means (w @ X)/W, shape (p,)
     weight_sum: float = 0.0  # W = sum(w)
     # current IRLS working data (recomputed before each sweep)
@@ -213,7 +221,7 @@ def check_convergence_step(data, state):
 def update_centering_step(data, state):
     """Outer step: weighted column means c = (w @ X)/W from the current weights."""
     fs = state.family_state
-    if not fs.center:
+    if not fs.profile:
         return state
     tau = 1.0 / jnp.asarray(fs.v_work)  # working weights w (residual scale fixed at 1)
     cbar, W = _weighted_colmeans(data, tau)
@@ -271,7 +279,7 @@ def update_effect_index_step(data, l, state):
     wd = _working_data(data, fs)
     tau = 1.0 / np.asarray(fs.v_work)  # residual_variance fixed at 1 => tau = w
     offset = fs.intercept + state.total_message.mean
-    if fs.center:
+    if fs.profile:
         new_effect = _fit_centered_ser(
             wd, tau, offset, effect.prior_variance, fs.cbar, fs.weight_sum
         )
@@ -287,6 +295,12 @@ def update_effect_index_step(data, l, state):
 
 
 def _relogistic_null(effect, data, fs, message_mean, offset_var=0.0, offset_integration="none"):
+    # NOTE: the reported evidence/marginal is up to an additive constant. The
+    # fixed-quadratic ELBO carries a predictor-second-moment term -1/2 sum_i w0_i V[o_i]
+    # (offset variance of the OTHER effects); it's a per-row constant, identical in the
+    # alternative and the null, so it cancels in every BF_j and in ser_log_bayes_factor
+    # / PIPs. We don't add it back, so marginal_log_likelihood is that ELBO minus this
+    # constant. Inference (BF, PIPs, CS) is exact; only the absolute marginal is offset.
     p = np.asarray(effect.mu).shape[0]
     log_bf = np.asarray(effect.feature_log_evidence) - float(effect.null_log_likelihood)
     glm_eta = jnp.asarray(fs.glm_offset) + jnp.asarray(message_mean)  # b=0 GLM predictor
@@ -324,7 +338,7 @@ def initialize_state(
     kwargs.setdefault("v_work", jnp.ones(n))
     family_state = IRLSFamilyState(**kwargs)
     zero_message = Message(np.zeros(n), np.zeros(n))
-    if family_state.center:
+    if family_state.profile:
         empty = [_empty_centered_effect(p) for _ in range(L)]
     else:
         empty = [linear._empty_effect(p, 1.0) for _ in range(L)]
