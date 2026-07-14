@@ -224,8 +224,12 @@ def fit_glm_susie(
     elif center and not center_supported:
         raise ValueError(
             f"center=True is not supported for the resolved kernel={kernel!r} on a "
-            f"sparse (BCOO) design: only kernel='quad' consumes sparse pre-centering. "
-            f"Pass center=False, densify X, or use a quad-kernel method."
+            f"sparse (BCOO) design (only 'quad' and 'linear' consume sparse "
+            f"pre-centering; the vi/jj kernels' per-entry variance/tilt would drop the "
+            f"off-support fill-in). For the SAME intercept-decoupling benefit on sparse, "
+            f"use intercept='profiled' (a per-feature intercept, invariant to column "
+            f"shifts -- so centering is unnecessary). Otherwise pass center=False, or "
+            f"densify X."
         )
 
     data = glm.prep_data(X, y, center=center)
