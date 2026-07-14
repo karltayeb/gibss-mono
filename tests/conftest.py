@@ -9,22 +9,15 @@ from scipy.special import expit
 
 
 # The default maintained suite focuses on core package functionality and
-# correctness for gibss, reference, and gseasusie. Benchmark, legacy, analysis-
-# specific, and lab/workspace validation are quarantined from default runs.
+# correctness for gibss, reference, and gseasusie. These files are ALIVE but
+# deferred from default runs (analysis-specific / slow / plotting); tests for
+# packages absent from this repo (gibss2, benchmarks, logisticsusie, pipelines)
+# were deleted rather than quarantined.
 collect_ignore_glob = [
-    "benchmark_test_logisticsusie.py",
-    "legacy_test_logisticsusie_*.py",
-    "test_benchmarks_*.py",
     "test_gsea_covid_analysis.py",
     "test_gsea_from_deseq2.py",
-    "test_gibss2_*.py",
-    "test_gibss_plotting.py",
-    "test_logistic_comparison.py",
-    "test_pipeline_workflow.py",
     "test_quadrature_cleanup.py",
     "test_reference_susie.py",
-    "test_two_group_schedule.py",
-    "test_twogroup_*.py",
 ]
 
 
