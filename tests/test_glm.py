@@ -96,6 +96,29 @@ def test_glm_profile_dense_sparse_cheb_parity():
     np.testing.assert_allclose(np.asarray(dense.alpha), np.asarray(sparse_cheb.alpha), atol=1e-6)
 
 
+def test_glm_center_dense_sparse_parity():
+    # shared-intercept SuSiE with centering: sparse (BCOO, implicit center via
+    # glm_center_ser chebyshev background) reproduces dense (eager centering). This is
+    # the sparse center=True path that used to raise NotImplementedError.
+    import jax
+    from jax.experimental import sparse
+    rng = np.random.default_rng(2)
+    n, p, causal = 400, 10, 3
+    X = rng.normal(size=(n, p)) + 2.0  # off-center columns -> centering matters
+    X = X * (rng.random((n, p)) < 0.4)  # genuinely sparse
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-3 + 2 * X[:, causal]))), n).astype(float)
+
+    def run(Xin):
+        d = glm.prep_data(Xin, y, center=True)
+        return fit_ibss(d, glm.initialize_state(d, L=2, response=Bernoulli()),
+                        glm.default_schedule(), max_iter=50)
+
+    dense = run(X)
+    sparse_cheb = run(sparse.BCOO.fromdense(jax.numpy.asarray(X)))
+    assert causal in _tops(dense)
+    np.testing.assert_allclose(np.asarray(dense.alpha), np.asarray(sparse_cheb.alpha), atol=1e-5)
+
+
 @pytest.mark.parametrize("smoother,kw", [
     (GH(), {}),
     (GH(), {"kernel": "quad", "intercept": "profiled"}),

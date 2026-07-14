@@ -25,6 +25,7 @@ from ._numerics import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
 __all__ = [
     "glm_ser",
+    "glm_center_ser",
     "build_ser_state",
     "glm_profile_map",
     "glm_profile_ser",
@@ -729,4 +730,114 @@ def glm_ser(
         return logint, bb, dll
 
     logint, b_nodes, dll_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p) x3
+    return _posterior_moments(logint, b_nodes, dll_nodes)
+
+
+@partial(
+    jax.jit,
+    static_argnames=("response", "order", "n_iter", "background", "degree"),
+)
+def glm_center_ser(
+    op: DesignOperator,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """Per-column SER with the EXACT per-feature Laplace of `glm_ser`, but on a design
+    centered by a FIXED offset `center` (c_j): the single-effect model is
+    eta_i = offset_i + (x_ij - c_j) b_j with c_j GIVEN (unweighted mean, null-weighted,
+    or the leave-one-out null-weighted center when updating effect l -- computed by the
+    caller, NOT profiled here). Distinct from `glm_profile_ser`, which SOLVES a
+    per-feature intercept; here c_j is a fixed reparameterization.
+
+    On a sparse `op` centering fills the zeros (every off-support x_ij = 0 becomes
+    -c_j, whose weight depends on b_j), so a naive fit is dense O(n*p). Instead each
+    all-rows reduction splits into a support term (O(nnz), the real entries) plus the
+    off-support fill-in, whose sum over rows is the 1-D background B(s_j) = sum_i
+    f(offset_i + s_j) at the per-feature scalar shift s_j = -c_j b_j -- the SAME
+    `_background` primitive the profiled kernel uses, amortized by the Chebyshev
+    surrogate (O(n*D + D*p)). On a dense (full-grid) op the off-support set is empty
+    and the correction cancels, so this reduces to `glm_ser` on the centered design.
+
+    Returns (mu, var, feature_log_bf, coefficient_kl), the log-BF relative to the b=0
+    fit at `offset` (a feature-independent baseline that cancels in alpha)."""
+    aux = _tmap(jnp.asarray, aux)
+    offset = jnp.asarray(offset)
+    c = jnp.asarray(center)
+    aux_e = _tmap(op.broadcast_rows, aux)
+    off_e = op.broadcast_rows(offset)
+    x_e = op.entry_x
+    c_e = op.broadcast_cols(c)
+    xc_e = x_e - c_e  # (x_ij - c_j) at support entries
+    inv_pv = 1.0 / prior_variance
+
+    def _bg(s):
+        return _background(response, offset, aux, s, background, degree)
+
+    def _grad_curv(b):
+        # exact all-rows score/curvature of the centered single-effect fit: support
+        # entries carry (x_ij - c_j); the off-support fill-in is (-c_j)^k [B - support].
+        b_e = op.broadcast_cols(b)
+        s = -c * b  # (p,) off-support scalar shift
+        eta_e = off_e + xc_e * b_e  # support predictor
+        eta_bg_e = off_e - c_e * b_e  # offset + s at support rows (correction)
+        _, g_e, w_e = response.terms(eta_e, aux_e)
+        _, g_bg_e, w_bg_e = response.terms(eta_bg_e, aux_e)
+        BGw, BGg, _ = _bg(s)
+        grad = (
+            op.local_moment(0, xc_e * g_e)
+            - c * (BGg - op.local_moment(0, g_bg_e))
+            - inv_pv * b
+        )
+        curv = (
+            op.local_moment(0, xc_e**2 * w_e)
+            + c**2 * (BGw - op.local_moment(0, w_bg_e))
+            + inv_pv
+        )
+        return grad, curv
+
+    def body(state):
+        b, _, it = state
+        grad, curv = _grad_curv(b)
+        step = grad / curv  # MM/Fisher curvature (w >= 0) -> monotone
+        return b + step, jnp.max(jnp.abs(step)), it + 1
+
+    b, _, _ = jax.lax.while_loop(
+        lambda s: (s[2] < n_iter) & (s[1] > tol), body, (jnp.zeros(op.p), jnp.inf, 0)
+    )
+    b = jnp.where(jnp.isfinite(b), b, 0.0)
+
+    _, curv = _grad_curv(b)
+    sigma = jnp.sqrt(1.0 / curv)
+
+    ll_null = jnp.sum(response.terms(offset, aux)[0])  # all-rows b=0 loglik (scalar)
+
+    nodes_np, log_w_np = _gh_rule(order)
+    nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
+    b_nodes = b[None, :] + jnp.sqrt(2.0) * sigma[None, :] * nodes[:, None]  # (order, p)
+    _, _, BGll = _bg(-c[None, :] * b_nodes)  # (order, p) background loglik per node
+
+    def node_term(node, lw, bb, bgll):
+        b_e = op.broadcast_cols(bb)
+        ll_e = response.terms(off_e + xc_e * b_e, aux_e)[0]
+        ll_bg_e = response.terms(off_e - c_e * b_e, aux_e)[0]
+        ll_all = op.local_moment(0, ll_e) + (bgll - op.local_moment(0, ll_bg_e))
+        dll = ll_all - ll_null  # node loglik relative to the b=0 fit at offset
+        logint = (
+            lw
+            + node**2
+            + dll
+            + _normal_logpdf(bb, prior_variance)
+            + jnp.log(jnp.sqrt(2.0) * sigma)
+        )
+        return logint, dll
+
+    logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, BGll)
     return _posterior_moments(logint, b_nodes, dll_nodes)

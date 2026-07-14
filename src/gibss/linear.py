@@ -109,9 +109,11 @@ def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData
     It is a fixed reparameterization, distinct from the per-iteration *weighted*
     centering (family_state `center`).
 
-    center=None (default): on for dense, off for sparse (BCOO pre-centering is not
-    yet implemented; densifying is avoided to protect large sparse designs).
-    center=True forces it (raises on BCOO for now); center=False leaves X untouched.
+    center=None (default): on for dense, off for sparse (kept off by default to avoid
+    densifying large designs). center=True forces it: dense X is centered eagerly; for
+    BCOO X the column means are stored in `column_center` and applied implicitly (the
+    Gaussian SER via `data.op`, the glm quad kernel via glm_center_ser's row background).
+    center=False leaves X untouched.
     """
     if center is None:
         center = not is_bcoo(X)
@@ -244,10 +246,11 @@ def estimate_prior_variance(effect: BaseSERState) -> BaseSERState:
     new_v0 = float(np.sum(effect.alpha * (effect.mu**2 + effect.var)))
     new_v0 = max(new_v0, 1e-8)
     p = effect.alpha.size
+    # var can be a hair negative from E[b^2]-E[b]^2 cancellation on a sharply
+    # concentrated posterior; floor it (like new_v0) so the KL log stays real.
+    var = np.maximum(effect.var, 1e-8)
     kl_cat = np.sum(effect.alpha * (np.log(effect.alpha + 1e-30) - np.log(1.0 / p)))
-    kl_gauss = 0.5 * (
-        np.log(new_v0 / effect.var) + (effect.var + effect.mu**2) / new_v0 - 1.0
-    )
+    kl_gauss = 0.5 * (np.log(new_v0 / var) + (var + effect.mu**2) / new_v0 - 1.0)
     kl = float(kl_cat + np.sum(effect.alpha * kl_gauss))
     return replace(effect, prior_variance=new_v0, kl=kl)
 

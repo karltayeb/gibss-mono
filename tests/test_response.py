@@ -159,6 +159,51 @@ def test_glm_ser_centered_operator_matches_dense():
             np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-10)
 
 
+def test_glm_center_ser_sparse_matches_dense():
+    # glm_center_ser on a SPARSE (BCOO) base with a fixed center c reproduces the exact
+    # per-feature Laplace of glm_ser on the manually pre-centered DENSE design: the
+    # exact background matches to machine precision, the chebyshev background to ~1e-6.
+    from gibss.response_ser import glm_center_ser
+    rng = np.random.default_rng(7)
+    n, p = 300, 8
+    # a genuinely sparse design (~70% zeros), off-support cells become -c_j when centered
+    X = rng.normal(size=(n, p)) + 2.0
+    X = X * (rng.random((n, p)) < 0.3)
+    off = rng.normal(size=n) * 0.2
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-4 + 2 * X[:, 0]))), n).astype(float)
+    c = X.mean(0)
+    Xbcoo = BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X)))
+
+    for resp, order in [(Bernoulli(), 15), (Poisson(), 15)]:
+        gold = glm_ser(DenseOperator(jnp.asarray(X - c)), jnp.asarray(y),
+                       jnp.asarray(off), 1.0, resp, order=order)
+        exact = glm_center_ser(Xbcoo, jnp.asarray(y), jnp.asarray(off), jnp.asarray(c),
+                               1.0, resp, order=order, background="exact")
+        cheb = glm_center_ser(Xbcoo, jnp.asarray(y), jnp.asarray(off), jnp.asarray(c),
+                              1.0, resp, order=order, background="chebyshev")
+        for g, e, ch in zip(gold, exact, cheb):
+            np.testing.assert_allclose(np.asarray(e), np.asarray(g), atol=1e-9)
+            np.testing.assert_allclose(np.asarray(ch), np.asarray(g), atol=1e-6)
+
+
+def test_glm_center_ser_dense_reduces_to_glm_ser():
+    # on a full-grid (dense) op the off-support set is empty, so glm_center_ser's
+    # background correction cancels and it equals glm_ser on the centered design.
+    from gibss.response_ser import glm_center_ser
+    rng = np.random.default_rng(8)
+    n, p = 150, 5
+    X = rng.normal(size=(n, p)) + 3.0
+    off = np.zeros(n)
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-9 + 3 * X[:, 0]))), n).astype(float)
+    c = X.mean(0)
+    gold = glm_ser(DenseOperator(jnp.asarray(X - c)), jnp.asarray(y), jnp.asarray(off),
+                   1.0, Bernoulli(), order=15)
+    got = glm_center_ser(DenseOperator(jnp.asarray(X)), jnp.asarray(y), jnp.asarray(off),
+                         jnp.asarray(c), 1.0, Bernoulli(), order=15, background="exact")
+    for g, u in zip(gold, got):
+        np.testing.assert_allclose(np.asarray(u), np.asarray(g), atol=1e-9)
+
+
 def test_centering_profiles_intercept_one_step():
     # Centering decorrelates b from the intercept: a single Newton step at b0=0 then
     # already finds the signal, where the raw (uncentered) one-step misses it.

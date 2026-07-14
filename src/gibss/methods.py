@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from . import glm
 from .engine import fit_ibss
+from .linear import is_bcoo
 from .response import (
     GH,
     Bernoulli,
@@ -57,7 +58,8 @@ _DEFAULTS = {
     "offset_integration": "none",  # "none" | key of _SMOOTHERS
     "offset_quadrature_points": 15,
     "effect_quadrature_points": 15,
-    "background": "exact",  # "exact" | "chebyshev" (profiled intercept only)
+    "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
+    # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
     "_anchor": "update",  # taylor_fixed expansion anchor: "update" | "null"
     "_mean_message": False,  # working-model mode: drop the message variance
@@ -155,6 +157,7 @@ def fit_glm_susie(
     effect_quadrature_points=None,
     background=None,
     # plain values (no preset interaction, ordinary defaults)
+    center=None,  # pre-center columns; None = on wherever supported (see below)
     offset=0.0,  # fixed per-row offset (Poisson exposure, etc.)
     prior_variance=1.0,
     estimate_prior_variance=True,
@@ -195,11 +198,36 @@ def fit_glm_susie(
     }
     if method is not None and method not in PRESETS:
         raise ValueError(f"unknown method {method!r}; options: {sorted(PRESETS)}")
-    cfg = {**_DEFAULTS, **(PRESETS[method] if method else {}), **explicit}
+    # background is layout-adaptive when unspecified: chebyshev for sparse (BCOO), where
+    # the profiled/centered row background must avoid the O(n*p) exact sum, and exact for
+    # dense, where exact is free and avoids the surrogate's ~1e-6 approximation. A preset
+    # or explicit user value still overrides (merged after).
+    cfg = {
+        **_DEFAULTS,
+        "background": "chebyshev" if is_bcoo(X) else "exact",
+        **(PRESETS[method] if method else {}),
+        **explicit,
+    }
 
     response, kernel = _resolve(cfg)
 
-    data = glm.prep_data(X, y)
+    # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
+    # (every kernel), but sparse (BCOO) X only the quad Laplace kernel consumes (via
+    # glm_center_ser's row background); the linear/vi/jj kernels' entry-space reductions
+    # would drop the off-support fill-in. center=None -> on wherever supported (so the
+    # default centers everything it can without crashing a method sweep); an EXPLICIT
+    # center=True on an unsupported sparse+non-quad combo is a clear error, not a fit.
+    center_supported = (not is_bcoo(X)) or kernel == "quad"
+    if center is None:
+        center = center_supported
+    elif center and not center_supported:
+        raise ValueError(
+            f"center=True is not supported for the resolved kernel={kernel!r} on a "
+            f"sparse (BCOO) design: only kernel='quad' consumes sparse pre-centering. "
+            f"Pass center=False, densify X, or use a quad-kernel method."
+        )
+
+    data = glm.prep_data(X, y, center=center)
     init = (
         glm.initialize_state_mean_message if cfg["_mean_message"] else glm.initialize_state
     )

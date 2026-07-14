@@ -110,6 +110,23 @@ def test_dense_sparse_parity():
     np.testing.assert_allclose(np.asarray(ad), np.asarray(asp), atol=1e-9)
 
 
+def test_dense_sparse_centered_parity():
+    # center=True: dense (eager centering) vs BCOO (implicit centering via
+    # glm_center_ser's chebyshev background) agree. Two-group has no profiled
+    # intercept (degenerate), so this is its only intercept-decoupling route on sparse.
+    rng = np.random.default_rng(0)
+    n, p = 400, 10
+    Xd = (rng.normal(size=(n, p)) + 2.0) * (rng.random((n, p)) < 0.4)  # off-center, sparse
+    z = rng.binomial(1, 1 / (1 + np.exp(-(-1.0 + 2.0 * Xd[:, CAUSAL]))), n)
+    se = np.ones(n)
+    bhat = z * rng.normal(0, 2.0, n) + rng.normal(0, se)
+    Xs = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+    ad = _fit(Xd, bhat, se, center=True)
+    asp = _fit(Xs, bhat, se, center=True)
+    assert CAUSAL in _tops(ad)
+    np.testing.assert_allclose(np.asarray(ad.alpha), np.asarray(asp.alpha), atol=1e-5)
+
+
 def test_smoothed_response_recovers():
     # LOO-message offset integration through the ordinary Smoothed seam (GH is
     # the only valid smoother for this family; see module docstring).

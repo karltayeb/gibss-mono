@@ -35,6 +35,7 @@ from .operators import as_operator
 from .response import Bernoulli, ResponseModel, Smoothed
 from .response_ser import (
     build_ser_state,
+    glm_center_ser,
     glm_jj_ser,
     glm_linear_profile_ser,
     glm_linear_ser,
@@ -183,19 +184,30 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     """(kernel, intercept) dispatch, returning the raw per-feature (mu, var, log_bf,
     coefficient_kl) so wrappers (e.g. cox_poisson's partial-likelihood read-out)
     can adjust before assembling the SER state."""
-    if getattr(data, "column_center", None) is not None:
-        # sparse implicit pre-centering (LinearData.column_center) is consumed via
-        # data.op by the linear family only; these kernels read data.X directly and
-        # would silently fit the UNCENTERED model. (Profiled kernels don't need
-        # centering -- the per-feature intercept absorbs any column shift.)
-        raise NotImplementedError(
-            "sparse (BCOO) pre-centering is not consumed by the glm kernels; "
-            "pass center=False (or use intercept='profiled', which is invariant "
-            "to column shifts)."
-        )
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
     profiled = fs.intercept == "profiled"
+    center = getattr(data, "column_center", None)
+    if center is not None and not profiled:
+        # sparse (BCOO) implicit pre-centering: eta = offset + (x_ij - c_j) b_j with c_j
+        # fixed. The exact per-feature Laplace consumes it via glm_center_ser (off-support
+        # fill-in through the row background). Profiled is invariant to column shifts, so it
+        # ignores `center`. The other kernels' entry-space reductions would silently drop
+        # the fill-in and fit the UNCENTERED model, so they are still refused.
+        if fs.kernel != "quad":
+            raise NotImplementedError(
+                "sparse (BCOO) pre-centering is implemented for kernel='quad' (exact "
+                f"per-feature Laplace); kernel={fs.kernel!r} would silently fit the "
+                "UNCENTERED model. Pass center=False, use kernel='quad', or use "
+                "intercept='profiled' (invariant to column shifts)."
+            )
+        # column_center is BCOO-only (dense is centered eagerly in prep_data), so exact
+        # O(n*p) would defeat the sparsity -- default the shared "exact" field to chebyshev.
+        bg = "chebyshev" if fs.background == "exact" else fs.background
+        return glm_center_ser(
+            op, aux, offset, center, prior_variance, fs.response,
+            order=order, background=bg,
+        )
     if fs.kernel == "quad" and profiled:
         mu, var, log_bf, coefficient_kl, _, _ = glm_profile_ser(
             op, aux, offset, prior_variance, fs.response, order=order,
