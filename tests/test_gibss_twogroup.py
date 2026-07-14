@@ -147,6 +147,53 @@ def test_init_em_is_covariate_free_two_group():
     assert abs(fs.f1.scale - 1.0) > 0.1  # scale actually estimated
 
 
+def test_nullweight_biases_toward_null():
+    # ashr-style conservative pi0: nullweight > 1 adds null pseudo-counts to the
+    # base-rate estimate, lowering the intercept and the mean enrichment.
+    X, bhat, se = _sim(0)
+    liberal = _fit(X, bhat, se, nullweight=1.0)
+    conservative = _fit(X, bhat, se, nullweight=200.0)
+    assert (conservative.family_state.intercept_value
+            < liberal.family_state.intercept_value)
+    assert (np.asarray(TG.compute_Ez(conservative)).mean()
+            < np.asarray(TG.compute_Ez(liberal)).mean())
+
+
+def test_nullweight_one_is_plain_em():
+    # nullweight=1 (penalty 0) must reproduce the un-penalized base rate exactly:
+    # at the covariate-free warm start b0 = logit(mean Ez).
+    X, bhat, se = _sim(0)
+    data = TG.prep_data(X, bhat=bhat, se=se)
+    st = TG.initialize_state(data, L=2, nullweight=1.0,
+                             family_state_kwargs={"init_em_iters": 200})
+    ez = np.asarray(TG.compute_Ez(st))
+    b0 = float(st.family_state.intercept_value)
+    np.testing.assert_allclose(b0, np.log(ez.mean()) - np.log1p(-ez.mean()), atol=1e-3)
+
+
+def test_nullweight_covariate_free_matches_ashr_pseudocount():
+    # with no real effect the base rate must be the ashr penalized proportion
+    # pi1 = sum(ez) / (n + penalty), penalty = nullweight - 1.
+    X, bhat, se = _null_sim(7)
+    data = TG.prep_data(X, bhat=bhat, se=se)
+    nullweight = 50.0
+    st = TG.initialize_state(data, L=1, nullweight=nullweight,
+                             family_state_kwargs={"init_em_iters": 300})
+    fs = st.family_state
+    ez = 1 / (1 + np.exp(-(fs.intercept_value + np.asarray(fs.llr))))
+    n = len(ez)
+    pi1_expected = ez.sum() / (n + (nullweight - 1.0))
+    pi1_actual = 1 / (1 + np.exp(-fs.intercept_value))
+    np.testing.assert_allclose(pi1_actual, pi1_expected, rtol=1e-4)
+
+
+def test_nullweight_keeps_null_calibrated():
+    X, bhat, se = _null_sim(102)
+    st = _fit(X, bhat, se, nullweight=50.0)
+    maxpip = max(float(np.asarray(e.alpha).max()) for e in st.single_effects)
+    assert maxpip < 0.9
+
+
 def test_fixed_intercept_respected():
     X, bhat, se = _sim(0)
     st = _fit(

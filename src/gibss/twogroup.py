@@ -42,6 +42,14 @@ Every approximation, named (details in `notes/twogroup rework.md`):
   6. Init: covariate-free two-group EB EM (f0/f1 M-steps alternating with the
      exact no-covariate intercept M-step b0 = logit(mean Ez)), so the sweeps
      start from the classic two-group fit and add covariate moderation.
+
+Conservative null proportion (`nullweight`, ashr's): the null proportion here is
+the base enrichment rate set by the intercept (pi0 = mean(1 - sigmoid(eta))), so
+ashr's Dirichlet(nullweight, 1, ...) prior -- the (nullweight-1) log(pi0) penalty
+-- specializes to `nullweight - 1` pseudo-null observations on the base-rate M-step,
+biasing pi0 UP (b0 down). nullweight=1 is no penalty (the default); larger values
+are conservative for discovery (fewer confident enrichment calls, better null
+calibration). See `TwoGroupFamilyState.nullweight`.
 """
 
 from __future__ import annotations
@@ -129,6 +137,16 @@ class TwoGroupFamilyState(glm.GLMFamilyState):
     f1: Any = None
     llr: Any = None
     init_em_iters: int = 20
+    # nullweight: ashr-style conservative null-proportion penalty. In this model
+    # the null proportion is the base enrichment rate set by the intercept
+    # (pi0 = mean(1 - sigmoid(eta))), so the penalty lives on the intercept /
+    # base-rate estimation: `nullweight - 1` pseudo-null observations are added at
+    # the base rate, biasing pi0 UP (b0 down). nullweight=1.0 is no penalty (the
+    # default, the plain EM base rate); ashr's default is 10. Exactly ashr's
+    # Dirichlet(nullweight, 1, ...) prior -- the (nullweight-1) log(pi0) term --
+    # specialized to the two-group's single null component. Conservative for
+    # discovery: fewer confident enrichment calls.
+    nullweight: float = 1.0
 
     def __post_init__(self):
         # explicit base call: dataclass(slots=True) recreates the class, so the
@@ -221,25 +239,38 @@ def estimate_intercept(data, state):
     sweep (after the effects have structured eta) stays at the interior fixed
     point. Returns (b0, v0) with v0 = 1/sum w from the M-step curvature --
     complete-data information, an UNDERestimate of the intercept's variance,
-    entering only as an O(1/n) term in the Smoothed ov."""
+    entering only as an O(1/n) term in the Smoothed ov.
+
+    The ashr `nullweight` penalty enters here as `penalty = nullweight - 1`
+    pseudo-null observations sitting at the intercept-only base rate sigmoid(b0):
+    they add `-penalty * sigmoid(b0)` to the score, pulling b0 down (pi0 up). With
+    no effects this reproduces the classic penalized base rate
+    pi1 = sum(ez) / (n + penalty) exactly (ashr's Dirichlet null pseudo-count)."""
     fs = state.family_state
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset
     # mean-field self-exclusion: the intercept's own variance stays out of its
     # E-step (matches glm.estimate_intercept's ov handling)
     ez = compute_Ez(state, include_intercept_var=False)
+    penalty = fs.nullweight - 1.0
 
     def mstep(s):
         c, it = s
         mu = jax.nn.sigmoid(c + total_mean)
-        g = jnp.sum(ez - mu)
-        h = jnp.maximum(jnp.sum(mu * (1.0 - mu)), 1e-8)
+        s0 = jax.nn.sigmoid(c)  # base rate of a pseudo-null observation (no effects)
+        g = jnp.sum(ez - mu) - penalty * s0
+        h = jnp.maximum(
+            jnp.sum(mu * (1.0 - mu)) + penalty * s0 * (1.0 - s0), 1e-8
+        )
         return c + jnp.clip(g / h, -2.0, 2.0), it + 1
 
     b0, _ = jax.lax.while_loop(
         lambda s: s[1] < 30, mstep, (jnp.asarray(fs.intercept_value), 0)
     )
     mu = jax.nn.sigmoid(b0 + total_mean)
-    v0 = 1.0 / jnp.maximum(jnp.sum(mu * (1.0 - mu)), 1e-8)
+    s0 = jax.nn.sigmoid(b0)
+    v0 = 1.0 / jnp.maximum(
+        jnp.sum(mu * (1.0 - mu)) + penalty * s0 * (1.0 - s0), 1e-8
+    )
     return float(b0), float(v0)
 
 
@@ -279,25 +310,32 @@ def log_likelihood(data, state):
 
 def _init_em(data, state):
     """Covariate-free two-group EB warm start: alternate f0/f1 M-steps with the
-    exact no-covariate intercept M-step b0 = logit(mean Ez) (prior enrichment =
-    mixing weight). The sweeps then start from the classic two-group fit. Shares
-    the usual two-group EB caveat: with f0 AND f1 both fully free the likelihood
-    also has an everything-enriched mode; anchoring f0 (PointMass / fixed null)
-    is standard and the default."""
+    no-covariate intercept M-step (prior enrichment = mixing weight). The sweeps
+    then start from the classic two-group fit. Shares the usual two-group EB
+    caveat: with f0 AND f1 both fully free the likelihood also has an
+    everything-enriched mode; anchoring f0 (PointMass / fixed null) is standard
+    and the default.
+
+    The base-rate M-step is the ashr-penalized logit b0 = log(sum ez) -
+    log(sum(1-ez) + penalty), penalty = nullweight - 1 (penalty=0 -> the plain
+    logit(mean ez)); the `penalty` null pseudo-counts are exactly ashr's
+    conservative pi0 prior in the no-covariate case."""
     fs = state.family_state
     f0, f1, llr = fs.f0, fs.f1, jnp.asarray(fs.llr)
     b0 = fs.intercept_value
+    penalty = fs.nullweight - 1.0
     for _ in range(fs.init_em_iters):
         ez = jax.nn.sigmoid(b0 + llr)  # no effects yet: eta = b0
         f0 = f0.update_nm(data.bhat, data.se, 1.0 - ez)
         f1 = f1.update_nm(data.bhat, data.se, ez)
         llr = _llr(f0, f1, data)
         if fs.estimate_intercept:
-            pbar = jnp.clip(jnp.mean(jax.nn.sigmoid(b0 + llr)), 1e-6, 1.0 - 1e-6)
-            b0 = float(jnp.log(pbar) - jnp.log1p(-pbar))
+            ez = jax.nn.sigmoid(b0 + llr)
+            s1, s0 = jnp.sum(ez), jnp.sum(1.0 - ez)
+            b0 = float(jnp.log(jnp.maximum(s1, 1e-8)) - jnp.log(s0 + penalty))
     mu = jax.nn.sigmoid(b0)
     n = llr.shape[0]
-    v0 = 1.0 / max(float(n * mu * (1.0 - mu)), 1e-8)
+    v0 = 1.0 / max(float((n + penalty) * mu * (1.0 - mu)), 1e-8)
     return replace(
         state,
         family_state=replace(
@@ -314,12 +352,14 @@ def initialize_state(
     response=None,
     family_state_kwargs=None,
     prior_variance=1.0,
+    nullweight=1.0,
 ):
     """Engine state for the two-group family, warm-started by the covariate-free
     two-group EM. `response` must be TwoGroupMarginal (default) or
     `Smoothed(TwoGroupMarginal(), GH(k))` for LOO-message offset integration.
     Defaults: f0 = PointMass(0) (fixed null), f1 = Normal(scale=2,
-    estimate_scale=True)."""
+    estimate_scale=True). `nullweight` (ashr's) makes the null-proportion (base
+    enrichment rate) estimate conservative; 1.0 = no penalty."""
     f0 = PointMass() if f0 is None else f0
     f1 = Normal(scale=2.0, estimate_scale=True) if f1 is None else f1
     response = TwoGroupMarginal() if response is None else response
@@ -330,6 +370,7 @@ def initialize_state(
         "f0": f0,
         "f1": f1,
         "llr": _llr(f0, f1, data),
+        "nullweight": nullweight,
         **({} if family_state_kwargs is None else dict(family_state_kwargs)),
     }
     state = GIBSSState(
@@ -351,16 +392,19 @@ def fit(
     response=None,
     family_state_kwargs=None,
     prior_variance=1.0,
+    nullweight=1.0,
     center=None,
 ):
     """One-call two-group enrichment SuSiE. Returns the fitted GIBSSState:
     `state.single_effects[l].alpha` are the PIPs, `state.family_state.f0/f1` the
     fitted components, `compute_Ez(state)` the posterior enrichment
-    probabilities."""
+    probabilities. `nullweight` > 1 makes the null-proportion estimate
+    conservative (ashr-style); 1.0 = no penalty."""
     data = prep_data(X, bhat=bhat, se=se, center=center)
     state = initialize_state(
         data, L=L, f0=f0, f1=f1, response=response,
         family_state_kwargs=family_state_kwargs, prior_variance=prior_variance,
+        nullweight=nullweight,
     )
     return fit_ibss(data, state, default_schedule(), max_iter=max_iter)
 

@@ -115,6 +115,25 @@ with a SuSiE prior on the effects and empirical-Bayes f0/f1. Define
    information >= observed information, so this UNDERSTATES the intercept's
    variance. It only enters as an O(1/n) additive term in ov.
 
+9. **Conservative null proportion (`nullweight`, ashr's).** ashr makes pi0
+   conservative with a Dirichlet(nullweight, 1, ...) prior on the mixture
+   weights -- a `(nullweight - 1) log(pi0)` penalty, i.e. `nullweight - 1`
+   pseudo-null observations added to the null component. Here the null
+   proportion is not a free scalar; it is the base enrichment rate the
+   intercept sets, `pi0 = mean(1 - sigmoid(eta))`. So the penalty lands on the
+   base-rate (intercept) M-step: `penalty = nullweight - 1` pseudo-null
+   observations sitting at the intercept-only rate `sigmoid(b0)` add
+   `-penalty * sigmoid(b0)` to the score (and `penalty*sigmoid(b0)(1-sigmoid(b0))`
+   to the curvature), pulling b0 down / pi0 up. With no covariate effects this
+   reduces EXACTLY to ashr's penalized proportion `pi1 = sum(ez)/(n + penalty)`,
+   so `nullweight` here means what it means in ashr. `nullweight = 1` is no
+   penalty (the default = plain EM base rate); larger is conservative for
+   discovery. The knob raises pi0 monotonically; its protection shows up as
+   fewer confident false calls under the null (real signal can still sharpen
+   against a more-null background). Not applied to the f0/f1 component M-steps
+   -- those inherit the conservatism through the (now smaller) Ez weights, and
+   ashr's penalty is on the mixing weight, not the component shapes.
+
 ## Architecture
 
 `TwoGroupFamilyState(glm.GLMFamilyState)` -- a frozen subclass adding

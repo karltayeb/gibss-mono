@@ -743,6 +743,7 @@ def fit_gsea_susie_twogroup(
     f1: Any | None = None,
     prior_variance: float = 1.0,
     estimate_prior_variance: bool = True,
+    nullweight: float = 1.0,
     max_iter: int = 50,
     coverage: float = 0.95,
     normalize: bool = False,
@@ -758,6 +759,8 @@ def fit_gsea_susie_twogroup(
     thresholding is not a two-group method (binarize outside and use logistic
     SuSiE if you need it). `response_model` accepts a
     `Smoothed(TwoGroupMarginal(), GH(k))` for LOO-message offset integration.
+    `nullweight` (ashr's) makes the null-proportion estimate conservative
+    (1.0 = no penalty; larger = fewer confident enrichment calls).
     """
     prepared = _prepare_gsea_susie_twogroup_inputs(
         gene_sets,
@@ -799,6 +802,7 @@ def fit_gsea_susie_twogroup(
         max_iter=max_iter,
         response=response_model,
         prior_variance=prior_variance,
+        nullweight=nullweight,
         family_state_kwargs=fs_kwargs,
         center=False,
     )
