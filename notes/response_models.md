@@ -310,13 +310,17 @@ Gaussian:   loglik = -(y-eta)^2/2v, grad = (y-eta)/v, weight = 1/v. The per-effe
    would shift the JJ fixed point by O(v0)). Composition test: null intercept x
    {TaylorFixed(null/update), JJFixed} x kernel="linear" all hit logit(ybar) at
    1e-6 and stay frozen through the fit.
-25. [open] Fold `logistic_localtaylor` onto the generic kernels and retire the EM
-   `twogrouplocaljj`/localjj path once the marginal is the default; `ser_ops`'s
-   logistic-specific quadrature_ser/profile_ser become deletable (Bernoulli parity
-   holds at 1e-9..1e-12), and the dedicated localjj/globaljj modules AND the `irls` module are now
-   functionally subsumed (glm_jj_ser reproduces localjj_ser exactly; Smoothed JJEnvelope/JJFixed
-   cover the variational elaborations). Optionally wire glm_jj_ser into the glm
-   family as a kernel choice (a `kernel` field next to `profile`).
+25. [partly done] Retire the EM two-group path: DONE. The marginal is now the
+   only two-group method -- reworked into a first-class glm family (`twogroup.py`,
+   no wrapper/introspection/inner-state nesting), and `twogroup_marginal.py` +
+   `twogrouplocaljj.py` are deleted (see notes/twogroup rework.md). Still open:
+   fold `logistic_localtaylor` onto the generic kernels and retire the EM
+   `localjj` path; `ser_ops`'s logistic-specific quadrature_ser/profile_ser become
+   deletable (Bernoulli parity holds at 1e-9..1e-12), and the dedicated
+   localjj/globaljj/`irls` modules are functionally subsumed (glm_jj_ser
+   reproduces localjj_ser exactly; Smoothed JJEnvelope/JJFixed cover the
+   variational elaborations). glm_jj_ser is already wired into the glm family as
+   kernel="jj".
 
 ## Profiling = background + correction (the sparse-centering story)
 A profiled per-column fit (`offset + b0_j + x_ij b_j`, b0 profiled out -> offset-shift
