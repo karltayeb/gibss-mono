@@ -49,6 +49,37 @@ def test_every_preset_recovers(method):
     assert CAUSAL in _tops(st)
 
 
+def _valid_posterior(state):
+    for e in state.single_effects:
+        a, mu, var = np.asarray(e.alpha), np.asarray(e.mu), np.asarray(e.var)
+        assert np.isfinite(a).all() and (a >= -1e-9).all() and abs(a.sum() - 1) < 1e-4
+        assert np.isfinite(mu).all() and np.isfinite(var).all() and (var > 0).all()
+
+
+@pytest.mark.parametrize("method", ["logistic", "poisson", "globaljj", "irls", "score"])
+def test_sparse_center_valid_and_recovers(method):
+    # the center=True + sparse path must produce a VALID posterior (finite, alpha a
+    # simplex, var>0) and recover a strong causal -- guards against silent corruption
+    # from the centered kernels (glm_center_ser / CenteredOperator linear).
+    import jax
+    from jax.experimental import sparse
+    rng = np.random.default_rng(0)
+    n, p, causal = 500, 20, 3
+    X = (rng.normal(size=(n, p)) + 2.0) * (rng.random((n, p)) < 0.12)  # off-center, sparse
+    Xd = X.copy()
+    if method == "poisson":
+        xb = Xd[:, causal] * 0.8; xb -= xb.mean()
+        y = rng.poisson(np.exp(0.3 + xb)).astype(float)
+    else:
+        xb = Xd[:, causal] * 3.0; xb -= xb.mean()
+        y = rng.binomial(1, 1 / (1 + np.exp(-(-1.0 + xb))), n).astype(float)
+    Xs = sparse.BCOO.fromdense(jax.numpy.asarray(X))
+    st = fit_glm_susie(Xs, y, L=2, method=method, center=True, max_iter=60)
+    assert st.family_state.background == "chebyshev"
+    _valid_posterior(st)
+    assert causal in _tops(st)
+
+
 def test_preset_is_sugar_for_explicit_kwargs():
     X, y = _data("logistic")
     a = fit_glm_susie(X, y, L=2, method="localjj", max_iter=50)
