@@ -1,7 +1,7 @@
 import numpy as np
 
 from gibss.engine import fit_ibss
-from gibss.globaljj import default_schedule, initialize_state, prep_data
+from gibss.legacy.globaljj import default_schedule, initialize_state, prep_data
 from gibss_reference.logistic import logistic_susie_fit
 
 

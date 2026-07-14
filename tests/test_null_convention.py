@@ -10,10 +10,10 @@ from scipy.optimize import minimize_scalar
 
 jax.config.update("jax_enable_x64", True)
 
-import gibss.globaljj as G
-import gibss.localjj as L
-import gibss.logistic_localtaylor as P
-import gibss.logistic_localtaylor as Q
+import gibss.legacy.globaljj as G
+import gibss.legacy.localjj as L
+import gibss.legacy.logistic_localtaylor as P
+import gibss.legacy.logistic_localtaylor as Q
 from gibss.engine import fit_ibss
 
 
@@ -71,8 +71,8 @@ def test_ser_logbf_on_same_scale_as_profile():
 def test_irls_reports_logistic_scale_null():
     # irls null == the exact profiled logistic null (same as quadrature), not the
     # working-Gaussian null; BF unchanged (null cancels).
-    import gibss.irls as I
-    import gibss.logistic_localtaylor as Q
+    import gibss.legacy.irls as I
+    import gibss.legacy.logistic_localtaylor as Q
     X, y = _data()
     qn, _ = _fit(Q, X, y)
     inl, _ = _fit(I, X, y)

@@ -1,5 +1,19 @@
 # gibss
 
+> **NOTE (stale):** parts of this README predate the response-model rework and
+> are being updated. The current entry points are:
+> - `gibss.methods.fit_glm_susie(X, y, method=...)` -- one front door for logistic
+>   / Poisson / linear GLM SuSiE and the named variants (localjj, globaljj, irls,
+>   score, ...); see `gibss.methods.PRESETS`.
+> - `gibss.glm` -- the generic response-model engine (`GLMFamilyState(response=...,
+>   kernel=..., intercept=...)`) any `gibss.response.ResponseModel` runs through.
+> - `gibss.twogroup.fit(X, bhat, se, f0=, f1=, ...)` -- two-group enrichment SuSiE
+>   (marginalized, no wrapper/EM-label; the old `twogroup.default_schedule(base)` +
+>   inner-state wrapper API shown in the Two-group section below is REMOVED).
+> - `gibss.legacy.localjj / globaljj / irls / logistic_localtaylor` -- the old
+>   logistic-specific families, retained only as reference / parity oracles. Prefer
+>   the generic stack above for new code.
+
 `gibss` is a generic iterative engine for multi-effect sparse regression. Each family module provides a data-preparation function, a state initializer, and a default schedule. Shared engine logic lives in `gibss.engine.fit_ibss`.
 
 ## Core pattern
@@ -65,12 +79,12 @@ state = fit_ibss(
 
 ### Logistic
 
-Use [`localjj.py`](./localjj.py) as simplest logistic starting point.
+Use [`localjj.py`](./legacy/localjj.py) as simplest logistic starting point.
 
 ```python
 import numpy as np
 
-from gibss import localjj
+from gibss.legacy import localjj
 from gibss.engine import fit_ibss
 
 X = np.array([
@@ -100,8 +114,8 @@ state = fit_ibss(
 `y` should be a one-dimensional binary response vector of length `n`.
 
 Other logistic families use same engine pattern:
-- [`globaljj.py`](./globaljj.py) uses a global JJ bound.
-- [`logistic_localtaylor.py`](./logistic_localtaylor.py) uses quadrature-based updates.
+- [`globaljj.py`](./legacy/globaljj.py) uses a global JJ bound.
+- [`logistic_localtaylor.py`](./legacy/logistic_localtaylor.py) uses quadrature-based updates.
 
 ### Cox
 
@@ -147,14 +161,16 @@ Main Cox response inputs are:
 
 ### Two-group
 
-Use [`twogroup.py`](./twogroup.py) when you want a two-group wrapper around an existing base `gibss` model. This is different from the standalone families above: it wraps an already initialized inner state.
+Use [`twogroup.py`](./twogroup.py) for two-group enrichment on summary statistics
+`(bhat, se)`. It is a first-class family (the discrete membership `z` is
+marginalized analytically), not a wrapper around a base model -- `twogroup.fit`
+is the one-call entry point.
 
 ```python
 import numpy as np
 
-from gibss import localjj, twogroup
+from gibss import twogroup
 from gibss.distributions import Normal, PointMass
-from gibss.engine import fit_ibss
 
 X = np.array([
     [1.0, 0.0],
@@ -164,37 +180,22 @@ X = np.array([
 bhat = np.array([2.1, 0.1, 1.3])
 se = np.array([1.0, 1.0, 1.0])
 
-data = twogroup.prep_data(X, bhat=bhat, se=se)
-
-# The two-group wrapper replaces this target with Ez during fitting, so the
-# initial target only needs the correct shape.
-inner_data = localjj.prep_data(X, np.full(X.shape[0], 0.5))
-inner_state = localjj.initialize_state(
-    inner_data,
+state = twogroup.fit(
+    X, bhat, se,
+    f0=PointMass(),                        # null component (fixed)
+    f1=Normal(scale=1.0, estimate_scale=True),  # alternative (empirical Bayes)
     L=2,
-    family_state_kwargs={"estimate_prior_variance": False},
+    nullweight=1.0,                        # >1 = ashr-style conservative pi0
+    max_iter=50,
 )
-
-state = twogroup.initialize_state(
-    data,
-    inner_state=inner_state,
-    f0=PointMass(),
-    f1=Normal(scale=1.0),
-)
-schedule = twogroup.default_schedule(localjj.default_schedule())
-state = fit_ibss(
-    data,
-    init_state=state,
-    schedule=schedule,
-    max_iter=10,
-)
+# state.single_effects[l].alpha -> PIPs; twogroup.compute_Ez(state) -> P(enriched)
 ```
 
 Main two-group response inputs are:
 - `bhat`: one-dimensional array of summary effect estimates
 - `se`: one-dimensional array of standard errors
 
-`twogroup.prep_data(X, y=...)` also accepts a two-column response with columns `[bhat, se]`.
+`twogroup.prep_data(X, y=...)` also accepts a two-column response with columns `[bhat, se]` if you need the lower-level `prep_data` / `initialize_state` / `fit_ibss` flow.
 
 ## Family-state customization
 
@@ -223,10 +224,8 @@ cox.initialize_state(
 ```
 
 Some fields are initializer-owned and should not be treated as user-controlled:
-- `globaljj.initialize_state(...)` derives `xi` and `X_sq`
-- `logistic_localtaylor.initialize_state(...)` derives `quadrature_order` and `sparse_context`
-
-For `twogroup`, configure the inner family state before wrapping, because `twogroup.initialize_state(...)` does not construct the inner family state itself.
+- `legacy.globaljj.initialize_state(...)` derives `xi` and `X_sq`
+- `legacy.logistic_localtaylor.initialize_state(...)` derives `quadrature_order` and `sparse_context`
 
 ## Concepts and mental model
 
@@ -277,7 +276,7 @@ schedule = linear.default_schedule()
 Schedules are plain dataclasses. You can extend them with helpers like `add_step(...)`.
 
 ```python
-from gibss import localjj
+from gibss.legacy import localjj
 from gibss.engine import add_step, snapshot_state_step
 
 schedule = add_step(
@@ -334,15 +333,17 @@ The default schedules in each family module show those extra pieces.
 
 ## Practical guidance
 
-- Use `linear` for Gaussian outcomes.
-- Use `cox` for survival outcomes.
-- Use `localjj` as simplest logistic starting point.
-- Use `globaljj` or `logistic_localtaylor` when you specifically want those approximations.
-- Use `twogroup` when you want a two-group wrapper around an existing base model.
+- Use `methods.fit_glm_susie(X, y, method=...)` as the front door for logistic /
+  Poisson / linear GLM SuSiE and the named variants.
+- Use `linear` for Gaussian outcomes (or `method="linear"`).
+- Use `cox` for survival outcomes; `cox_poisson` for the offset-integrable
+  Poisson-Breslow reduction.
+- Use `twogroup.fit` for two-group enrichment on `(bhat, se)`.
+- Reach for `gibss.legacy.{localjj,globaljj,irls,logistic_localtaylor}` only for
+  reference / parity against the generic engine, not for new work.
 
 ## Common pitfalls
 
 - Passing the wrong response shape to `prep_data(...)`.
 - Modifying a schedule without understanding the update order.
-- Assuming `twogroup` behaves like a standalone family initializer.
 - Trying to override initializer-owned family-state fields.

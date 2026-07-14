@@ -13,7 +13,7 @@ from jax.experimental import sparse
 
 jax.config.update("jax_enable_x64", True)
 
-import gibss.logistic_localtaylor as LT
+import gibss.legacy.logistic_localtaylor as LT
 from gibss.engine import Message, MeanMessage, fit_ibss
 
 

@@ -5,7 +5,7 @@ from jax.experimental import sparse
 
 jax.config.update("jax_enable_x64", True)
 
-import gibss.globaljj as gjj
+import gibss.legacy.globaljj as gjj
 from gibss.engine import fit_ibss
 
 

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from gibss import glm
-from gibss import logistic_localtaylor as LT
+from gibss.legacy import logistic_localtaylor as LT
 from gibss.engine import fit_ibss
 from gibss.response import GH, Bernoulli, Gaussian, JJEnvelope, JJFixed, Poisson, Smoothed, Taylor, TaylorFixed
 
@@ -60,7 +60,7 @@ def test_glm_poisson_recovers(seed):
 def test_glm_profile_recovers_and_matches_localtaylor():
     # GLM(Bernoulli, profile=True) full SuSiE agrees with logistic_localtaylor's
     # profile mode on the selected features (per-feature profiled intercept).
-    from gibss import logistic_localtaylor as LT
+    from gibss.legacy import logistic_localtaylor as LT
     rng = np.random.default_rng(0)
     n, p, causal = 500, 12, 4
     X = rng.normal(size=(n, p))
@@ -160,7 +160,7 @@ def test_glm_taylor_fixed_matches_irls_tops():
     # logistic-only irls module on the selected features. (Not byte-identical: the
     # old module convolves the working data at the FULL predictor variance, the new
     # scheme smooths with the leave-one-out variance.)
-    from gibss import irls
+    from gibss.legacy import irls
     rng = np.random.default_rng(0)
     n, p, causal = 500, 12, 4
     X = rng.normal(size=(n, p))

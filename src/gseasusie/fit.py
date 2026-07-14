@@ -14,8 +14,8 @@ import gibss
 import gibss.engine
 import gibss.distributions
 import gibss.linear
-import gibss.localjj
-import gibss.logistic_localtaylor
+import gibss.legacy.localjj
+import gibss.legacy.logistic_localtaylor
 import gibss.cox
 import gibss.twogroup
 
@@ -501,8 +501,8 @@ def fit_gsea_susie_logistic(
     l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
 
     if variant == "local_jj":
-        data = gibss.localjj.prep_data(X_sparse, y_jax)
-        init_state = gibss.localjj.initialize_state(
+        data = gibss.legacy.localjj.prep_data(X_sparse, y_jax)
+        init_state = gibss.legacy.localjj.initialize_state(
             data,
             L=l_model,
             family_state_kwargs={
@@ -510,10 +510,10 @@ def fit_gsea_susie_logistic(
                 **family_kwargs,
             },
         )
-        schedule = gibss.localjj.default_schedule()
+        schedule = gibss.legacy.localjj.default_schedule()
     elif variant == "quadrature":
-        data = gibss.logistic_localtaylor.prep_data(X_sparse, y_jax)
-        init_state = gibss.logistic_localtaylor.initialize_state(
+        data = gibss.legacy.logistic_localtaylor.prep_data(X_sparse, y_jax)
+        init_state = gibss.legacy.logistic_localtaylor.initialize_state(
             data,
             L=l_model,
             family_state_kwargs={
@@ -521,7 +521,7 @@ def fit_gsea_susie_logistic(
                 **family_kwargs,
             },
         )
-        schedule = gibss.logistic_localtaylor.default_schedule()
+        schedule = gibss.legacy.logistic_localtaylor.default_schedule()
     else:
         raise ValueError(f"Unknown variant: {variant}")
 

@@ -3,7 +3,7 @@ import numpy as np
 from jax.experimental import sparse
 
 from gibss.engine import MeanMessage, fit_ibss
-from gibss.globaljj import (
+from gibss.legacy.globaljj import (
     default_schedule,
     initialize_state,
     initialize_state_mean_message,

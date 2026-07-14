@@ -3,7 +3,7 @@ from dataclasses import replace
 import numpy as np
 
 from gibss.engine import fit_ibss
-from gibss.globaljj import (
+from gibss.legacy.globaljj import (
     _jj_bound_null_log_likelihood,
     _lambda_xi,
     check_elbo_convergence_step,

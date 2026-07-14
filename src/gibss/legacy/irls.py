@@ -25,10 +25,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from . import linear
-from .operators import as_operator, CenteredOperator
-from .ser_ops import global_gaussian_ser, _smooth_cumulant, profiled_logistic_null
-from .engine import (
+from .. import linear
+from ..operators import as_operator, CenteredOperator
+from ..ser_ops import global_gaussian_ser, _smooth_cumulant, profiled_logistic_null
+from ..engine import (
     BaseSERState,
     GIBSSState,
     Message,
@@ -41,7 +41,7 @@ from .engine import (
     subtract_message_index_step,
     to_numpy_state_step,
 )
-from .linear import LinearData, is_bcoo, prep_data, update_prior_variance_index_step
+from ..linear import LinearData, is_bcoo, prep_data, update_prior_variance_index_step
 
 __all__ = [
     "prep_data",

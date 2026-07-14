@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from gibss.localjj import (
+from gibss.legacy.localjj import (
     _jj_bound_null_log_likelihood,
     _lambda_xi,
     default_schedule,

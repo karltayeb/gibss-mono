@@ -9,7 +9,7 @@ from jax.experimental import sparse
 
 jax.config.update("jax_enable_x64", True)
 
-import gibss.logistic_localtaylor as LT  # quadrature (center=False) + profile (center=True)
+import gibss.legacy.logistic_localtaylor as LT  # quadrature (center=False) + profile (center=True)
 from gibss.engine import fit_ibss
 
 
@@ -103,7 +103,7 @@ def test_localtaylor_sparse_center_matches_dense(profile):
 
 
 def test_bcoo_default_off_localtaylor_supports_sparse_center():
-    import gibss.localjj as ljj
+    import gibss.legacy.localjj as ljj
     rng = np.random.default_rng(2)
     Xs = sparse.BCOO.fromdense(jnp.asarray(rng.normal(size=(40, 5))))
     y = rng.binomial(1, 0.5, 40).astype(float)
@@ -122,7 +122,8 @@ def test_bcoo_default_off_localtaylor_supports_sparse_center():
 @pytest.mark.parametrize("mod_name", ["linear", "irls", "globaljj"])
 def test_gaussian_sparse_precenter_matches_dense(mod_name):
     import importlib
-    mod = importlib.import_module(f"gibss.{mod_name}")
+    prefix = "gibss.legacy." if mod_name in ("irls", "globaljj") else "gibss."
+    mod = importlib.import_module(f"{prefix}{mod_name}")
     rng = np.random.default_rng(0)
     n, p = 300, 40
     X = rng.normal(size=(n, p)) * rng.binomial(1, 0.3, size=(n, p)) + 0.4
