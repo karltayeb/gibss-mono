@@ -6,9 +6,35 @@ import pytest
 from jax.experimental import sparse
 
 from gibss.operators import BCOOOperator, CenteredOperator, DenseOperator
-from gibss.response import Bernoulli, Gaussian, Poisson, TwoGroupMarginal
-from gibss.response_ser import glm_profile_map, glm_profile_ser, glm_ser
-from gibss.ser_ops import local_irls_centered, profile_ser, quadrature_ser
+from gibss.response import (
+    GH,
+    Bernoulli,
+    Gaussian,
+    JJEnvelope,
+    JJFixed,
+    Poisson,
+    Smoothed,
+    Taylor,
+    TaylorFixed,
+    TwoGroupMarginal,
+)
+from gibss.response_ser import (
+    glm_jj_ser,
+    glm_linear_profile_ser,
+    glm_linear_ser,
+    glm_profile_map,
+    glm_profile_ser,
+    glm_ser,
+    glm_vi_profile_ser,
+    glm_vi_ser,
+)
+from gibss.ser_ops import (
+    local_irls_centered,
+    localjj_centered_ser,
+    localjj_ser,
+    profile_ser,
+    quadrature_ser,
+)
 
 
 @pytest.mark.parametrize(
@@ -265,8 +291,8 @@ def test_glm_profile_ser_poisson_recovers():
 
 @pytest.mark.parametrize("offset_order", [3, 5, 9])
 def test_glm_ser_offset_integration_matches_quadrature(offset_order):
-    # nested-GH offset integration over o ~ N(offset, offset_var) reproduces the
-    # logistic quadrature_ser's offset-integrated path (Bernoulli).
+    # the Smoothed(Bernoulli) family through the plain kernel reproduces the logistic
+    # quadrature_ser's offset-integrated path (o ~ N(offset, offset_var), nested GH).
     rng = np.random.default_rng(0)
     n, p = 250, 8
     X = rng.normal(size=(n, p))
@@ -274,8 +300,8 @@ def test_glm_ser_offset_integration_matches_quadrature(offset_order):
     ov = np.abs(rng.normal(size=n)) * 0.4 + 0.1
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + X[:, 2]))), n).astype(float)
     op = DenseOperator(jnp.asarray(X))
-    g = glm_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15,
-                offset_var=jnp.asarray(ov), offset_order=offset_order)
+    g = glm_ser(op, (jnp.asarray(y), jnp.asarray(ov)), jnp.asarray(off), 1.0,
+                Smoothed(Bernoulli(), GH(order=offset_order)), order=15)
     q = quadrature_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, order=15,
                        offset_var=jnp.asarray(ov), offset_integration=offset_order)
     np.testing.assert_allclose(np.asarray(g[0]), np.asarray(q[0]), atol=1e-10)
@@ -294,16 +320,16 @@ def test_glm_profile_ser_offset_integration_matches_profile_ser(opkind, backgrou
     y = rng.binomial(1, 1 / (1 + np.exp(-(-0.5 + X[:, 2]))), n).astype(float)
     op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
           else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
-    g = glm_profile_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15,
-                        background=background, offset_var=jnp.asarray(ov), offset_order=5)
+    g = glm_profile_ser(op, (jnp.asarray(y), jnp.asarray(ov)), jnp.asarray(off), 1.0,
+                        Smoothed(Bernoulli(), GH(order=5)), order=15, background=background)
     q = profile_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, order=15,
                     background=background, offset_var=jnp.asarray(ov), offset_integration=5)
     for u, v in zip(g[:4], q[:4]):
         np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
 
 
-def test_glm_ser_offset_var_none_is_mean_only():
-    # offset_var=None leaves the mean-only result exactly unchanged.
+def test_glm_ser_zero_variance_smoothing_is_mean_only():
+    # a Smoothed family with zero offset variance collapses to the plain kernel.
     rng = np.random.default_rng(1)
     n, p = 200, 6
     X = rng.normal(size=(n, p))
@@ -311,9 +337,270 @@ def test_glm_ser_offset_var_none_is_mean_only():
     y = rng.binomial(1, 1 / (1 + np.exp(-(X[:, 0]))), n).astype(float)
     op = DenseOperator(jnp.asarray(X))
     a = glm_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15)
-    b = glm_ser(op, jnp.asarray(y), jnp.asarray(off), 1.0, Bernoulli(), order=15, offset_var=None)
+    b = glm_ser(op, (jnp.asarray(y), jnp.zeros(n)), jnp.asarray(off), 1.0,
+                Smoothed(Bernoulli()), order=15)
     for u, v in zip(a, b):
-        np.testing.assert_array_equal(np.asarray(u), np.asarray(v))
+        np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
+
+
+@pytest.mark.parametrize("opkind", ["dense", "bcoo"])
+@pytest.mark.parametrize("with_ov", [False, True])
+def test_glm_jj_ser_matches_localjj(opkind, with_ov):
+    # the conjugate quadratic-bound kernel reproduces the classic localjj fixed point
+    # (ser_ops.localjj_ser, variational tilt), with and without a random offset.
+    rng = np.random.default_rng(0)
+    n, p = 300, 10
+    X = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.5)
+    off = rng.normal(size=n) * 0.5
+    ov = np.abs(rng.normal(size=n)) * 0.4 + 0.1
+    y = rng.binomial(1, 1 / (1 + np.exp(-(X[:, 2]))), n).astype(float)
+    op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
+          else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
+    yj, oj, ovj = jnp.asarray(y), jnp.asarray(off), jnp.asarray(ov)
+    aux = (yj, ovj) if with_ov else yj
+    got = glm_jj_ser(op, aux, oj, 1.0)
+    ref = localjj_ser(op, yj, oj, 1.0, offset_var=(ovj if with_ov else None))
+    for u, v in zip(got[:3], ref):
+        np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
+
+
+def test_glm_jj_ser_evidence_is_certified_lower_bound():
+    # the JJ ELBO lower-bounds the (smoothed) marginal evidence per feature; compare
+    # against the high-order quadrature evidence on the true cumulant.
+    rng = np.random.default_rng(1)
+    n, p = 250, 8
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.4
+    ov = np.abs(rng.normal(size=n)) * 0.5 + 0.1
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.8 * X[:, 1]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    yj, oj, ovj = jnp.asarray(y), jnp.asarray(off), jnp.asarray(ov)
+    jj = glm_jj_ser(op, (yj, ovj), oj, 1.0)
+    q = glm_ser(op, (yj, ovj), oj, 1.0, Smoothed(Bernoulli(), GH(order=15)), order=31)
+    assert np.all(np.asarray(jj[2]) <= np.asarray(q[2]) + 1e-6)
+    # fixed-offset case too
+    jj0 = glm_jj_ser(op, yj, oj, 1.0)
+    q0 = glm_ser(op, yj, oj, 1.0, Bernoulli(), order=31)
+    assert np.all(np.asarray(jj0[2]) <= np.asarray(q0[2]) + 1e-6)
+
+
+def test_glm_jj_ser_requires_fixed_tilt_response():
+    # the conjugate Gaussian update is exact only for a bound quadratic in eta, so
+    # any other response (including jj_envelope, whose tilt moves with eta) is refused.
+    rng = np.random.default_rng(2)
+    op = DenseOperator(jnp.asarray(rng.normal(size=(50, 3))))
+    y = jnp.asarray(rng.binomial(1, 0.5, 50).astype(float))
+    for resp in (Bernoulli(), Smoothed(Bernoulli(), JJEnvelope()), Smoothed(Bernoulli(), GH())):
+        with pytest.raises(TypeError, match="JJFixed"):
+            glm_jj_ser(op, y, jnp.zeros(50), 1.0, response=resp)
+
+
+def test_glm_vi_ser_gaussian_is_exact():
+    # for a Gaussian response the true per-feature posterior IS Gaussian, so the
+    # Gaussian-restricted VI is exact and matches glm_ser (which is also exact there):
+    # same m, v, and ELBO == log BF.
+    rng = np.random.default_rng(0)
+    n, p, v0, pv = 300, 6, 0.7, 1.5
+    X = rng.normal(size=(n, p))
+    y = 1.0 * X[:, 2] + rng.normal(0, np.sqrt(v0), n)
+    op = DenseOperator(jnp.asarray(X))
+    yj, oj = jnp.asarray(y), jnp.zeros(n)
+    vi = glm_vi_ser(op, yj, oj, pv, Smoothed(Gaussian(variance=v0), Taylor()))
+    q = glm_ser(op, yj, oj, pv, Gaussian(variance=v0), order=15)
+    np.testing.assert_allclose(np.asarray(vi[0]), np.asarray(q[0]), atol=1e-8)
+    np.testing.assert_allclose(np.asarray(vi[1]), np.asarray(q[1]), atol=1e-8)
+    np.testing.assert_allclose(np.asarray(vi[2]), np.asarray(q[2]), atol=1e-8)
+
+
+@pytest.mark.parametrize("with_ov", [False, True])
+def test_glm_vi_ser_jj_envelope_equals_conjugate_localjj(with_ov):
+    # E_q under N(m, v) turns JJEnvelope's pointwise tilt into xi^2 = eta^2 + x^2 v
+    # (+ ov) -- classic localjj's variational tilt. Same fixed point, same ELBO:
+    # the Gaussian-restricted VI kernel with JJEnvelope IS glm_jj_ser.
+    rng = np.random.default_rng(1)
+    n, p = 300, 8
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.4
+    ov = np.abs(rng.normal(size=n)) * 0.3 + 0.1
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.9 * X[:, 1]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    aux = (jnp.asarray(y), jnp.asarray(ov)) if with_ov else jnp.asarray(y)
+    vi = glm_vi_ser(op, aux, jnp.asarray(off), 1.0, Smoothed(Bernoulli(), JJEnvelope()))
+    jj = glm_jj_ser(op, aux, jnp.asarray(off), 1.0)
+    for a, b in zip(vi, jj):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-7)
+
+
+def test_glm_vi_ser_elbo_below_free_form_evidence():
+    # the Gaussian restriction can only lose evidence: per-feature ELBO <= the
+    # free-form (exact-posterior) log BF from the quadrature kernel.
+    rng = np.random.default_rng(2)
+    n, p = 250, 8
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.3
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.8 * X[:, 3]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    yj, oj = jnp.asarray(y), jnp.asarray(off)
+    vi = glm_vi_ser(op, yj, oj, 1.0, Smoothed(Bernoulli(), GH(15)))
+    q = glm_ser(op, yj, oj, 1.0, Bernoulli(), order=31)
+    assert np.all(np.asarray(vi[2]) <= np.asarray(q[2]) + 1e-6)
+
+
+def test_glm_vi_ser_requires_pointwise_scheme():
+    rng = np.random.default_rng(3)
+    op = DenseOperator(jnp.asarray(rng.normal(size=(50, 3))))
+    y = jnp.asarray(rng.binomial(1, 0.5, 50).astype(float))
+    for resp in (Bernoulli(), Smoothed(Bernoulli(), JJFixed())):
+        with pytest.raises(TypeError, match="POINTWISE"):
+            glm_vi_ser(op, y, jnp.zeros(50), 1.0, response=resp)
+
+
+def test_glm_vi_profile_ser_gaussian_centered_is_exact():
+    # Gaussian response + pre-centered columns: H0b = 0, so conditional == profiled
+    # variance and the Gaussian restriction is exact -- matches glm_profile_ser.
+    rng = np.random.default_rng(0)
+    n, p, v0, pv = 300, 6, 0.7, 1.5
+    X = rng.normal(size=(n, p))
+    X = X - X.mean(0)
+    y = 1.0 * X[:, 2] + rng.normal(0, np.sqrt(v0), n)
+    op = DenseOperator(jnp.asarray(X))
+    yj, oj = jnp.asarray(y), jnp.zeros(n)
+    vi = glm_vi_profile_ser(op, yj, oj, pv, Smoothed(Gaussian(variance=v0), Taylor()))
+    ref = glm_profile_ser(op, yj, oj, pv, Gaussian(variance=v0), order=15)
+    np.testing.assert_allclose(np.asarray(vi[0]), np.asarray(ref[0]), atol=1e-8)
+    np.testing.assert_allclose(np.asarray(vi[1]), np.asarray(ref[1]), atol=1e-8)
+    np.testing.assert_allclose(np.asarray(vi[2]), np.asarray(ref[2]), atol=1e-7)
+
+
+@pytest.mark.parametrize("opkind", ["dense", "bcoo"])
+@pytest.mark.parametrize("with_ov", [False, True])
+def test_glm_vi_profile_ser_jj_envelope_equals_centered_localjj(opkind, with_ov):
+    # profiled Gaussian VI with the JJ envelope IS the profiled classic localjj
+    # (ser_ops.localjj_centered_ser: "profiled mean, conditional variance").
+    rng = np.random.default_rng(1)
+    n, p = 300, 8
+    X = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.6)
+    off = rng.normal(size=n) * 0.4 + 1.0
+    ov = np.abs(rng.normal(size=n)) * 0.3 + 0.1
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.9 * X[:, 1]))), n).astype(float)
+    op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
+          else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
+    yj, oj = jnp.asarray(y), jnp.asarray(off)
+    aux = (yj, jnp.asarray(ov)) if with_ov else yj
+    vi = glm_vi_profile_ser(op, aux, oj, 1.0, Smoothed(Bernoulli(), JJEnvelope()))
+    ref = localjj_centered_ser(op, yj, oj, 1.0,
+                               offset_var=(jnp.asarray(ov) if with_ov else None))
+    np.testing.assert_allclose(np.asarray(vi[0]), np.asarray(ref[0]), atol=1e-7)  # m
+    np.testing.assert_allclose(np.asarray(vi[1]), np.asarray(ref[1]), atol=1e-7)  # v
+    np.testing.assert_allclose(np.asarray(vi[4]), np.asarray(ref[2]), atol=1e-7)  # b0
+    np.testing.assert_allclose(np.asarray(vi[2]), np.asarray(ref[3]), atol=1e-6)  # elbo
+
+
+def test_glm_vi_profile_ser_offset_shift_invariant():
+    # profiling b0 makes the evidence invariant to a constant offset shift -- the
+    # partial-likelihood property that motivates never modeling the intercept.
+    rng = np.random.default_rng(2)
+    n, p = 300, 6
+    X = rng.normal(size=(n, p))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(1.2 * X[:, 2]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    yj = jnp.asarray(y)
+    resp = Smoothed(Bernoulli(), GH(7))
+    a = glm_vi_profile_ser(op, yj, jnp.zeros(n), 1.0, resp)
+    b = glm_vi_profile_ser(op, yj, jnp.full(n, 4.0), 1.0, resp)
+    np.testing.assert_allclose(np.asarray(a[2]), np.asarray(b[2]), atol=1e-7)
+    np.testing.assert_allclose(np.asarray(a[0]), np.asarray(b[0]), atol=1e-7)
+
+
+def test_quadratic_flag_composes():
+    # quadraticity: a base property (Gaussian), a scheme property (fixed-parameter
+    # schemes), and preserved under composition -- the kernels use it to clamp the
+    # GH tail (exact from 2 nodes) without changing results.
+    assert Gaussian().quadratic
+    assert Smoothed(Gaussian(), GH(5)).quadratic
+    assert Smoothed(Gaussian(), Taylor()).quadratic
+    assert Smoothed(Bernoulli(), TaylorFixed()).quadratic
+    assert Smoothed(Bernoulli(), JJFixed()).quadratic
+    assert not Bernoulli().quadratic
+    assert not Smoothed(Bernoulli(), GH(5)).quadratic
+    assert not Smoothed(Bernoulli(), JJEnvelope()).quadratic
+
+
+def test_quadratic_gh_tail_exact_at_two_nodes():
+    # the clamp's justification, tested below the clamp floor: an EXPLICIT order=2
+    # tail already reproduces the closed-form Gaussian posterior and evidence.
+    rng = np.random.default_rng(4)
+    n, p, var, pv = 300, 6, 0.7, 1.5
+    X = rng.normal(size=(n, p))
+    y = 1.0 * X[:, 2] + rng.normal(0, np.sqrt(var), n)
+    op = DenseOperator(jnp.asarray(X))
+    g = glm_ser(op, jnp.asarray(y), jnp.zeros(n), pv, Gaussian(variance=var), order=2)
+    xtx = (X**2).sum(0) / var
+    xty = (X * y[:, None]).sum(0) / var
+    prec = xtx + 1.0 / pv
+    np.testing.assert_allclose(np.asarray(g[0]), xty / prec, atol=1e-10)          # mu
+    np.testing.assert_allclose(np.asarray(g[1]), 1.0 / prec, atol=1e-10)          # var
+    logbf = 0.5 * (xty**2 / prec) + 0.5 * np.log(1.0 / pv) - 0.5 * np.log(prec)
+    np.testing.assert_allclose(np.asarray(g[2]), logbf, atol=1e-9)
+
+
+def _quadratic_cases(rng, n):
+    off = jnp.asarray(rng.normal(size=n) * 0.4)
+    ov = jnp.asarray(np.abs(rng.normal(size=n)) * 0.3 + 0.1)
+    yb = jnp.asarray(rng.binomial(1, 0.5, n).astype(float))
+    yg = jnp.asarray(rng.normal(size=n))
+    xi = jnp.sqrt(off**2 + ov + 0.5)  # any positive tilt is a valid JJFixed param
+    zhat = off + 0.2  # any anchor is a valid TaylorFixed param
+    return off, [
+        (Gaussian(variance=0.7), yg),
+        (Smoothed(Bernoulli(), JJFixed()), (yb, ov, xi)),
+        (Smoothed(Bernoulli(), TaylorFixed()), (yb, ov, zhat)),
+    ]
+
+
+@pytest.mark.parametrize("opkind", ["dense", "bcoo"])
+def test_glm_linear_ser_matches_glm_ser(opkind):
+    # the closed-form weighted-linear-regression kernel == the Newton + GH kernel on
+    # every quadratic response, at any order -- one terms pass vs the full machinery.
+    rng = np.random.default_rng(0)
+    n, p = 250, 8
+    X = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.6 if opkind == "bcoo" else 1.0)
+    op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
+          else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
+    off, cases = _quadratic_cases(rng, n)
+    for resp, aux in cases:
+        lin = glm_linear_ser(op, aux, off, 1.0, resp)
+        ref = glm_ser(op, aux, off, 1.0, resp, order=15)
+        for a, b in zip(lin, ref):
+            np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-8)
+
+
+@pytest.mark.parametrize("opkind", ["dense", "bcoo"])
+def test_glm_linear_profile_ser_matches_glm_profile_ser(opkind):
+    # profiled closed form == profiled Newton + GH on quadratic responses (Cox-Reid
+    # re-centering is exact for a quadratic, so all six outputs agree).
+    rng = np.random.default_rng(1)
+    n, p = 250, 8
+    X = rng.normal(size=(n, p)) * (rng.random((n, p)) < 0.6 if opkind == "bcoo" else 1.0)
+    op = (DenseOperator(jnp.asarray(X)) if opkind == "dense"
+          else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
+    off, cases = _quadratic_cases(rng, n)
+    for resp, aux in cases:
+        lin = glm_linear_profile_ser(op, aux, off, 1.0, resp)
+        ref = glm_profile_ser(op, aux, off, 1.0, resp, order=15)
+        for a, b in zip(lin, ref):
+            np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-7)
+
+
+def test_linear_kernels_refuse_non_quadratic():
+    rng = np.random.default_rng(2)
+    op = DenseOperator(jnp.asarray(rng.normal(size=(50, 3))))
+    y = jnp.asarray(rng.binomial(1, 0.5, 50).astype(float))
+    for resp in (Bernoulli(), Smoothed(Bernoulli(), GH(5))):
+        with pytest.raises(TypeError, match="quadratic"):
+            glm_linear_ser(op, y, jnp.zeros(50), 1.0, resp)
+        with pytest.raises(TypeError, match="quadratic"):
+            glm_linear_profile_ser(op, y, jnp.zeros(50), 1.0, resp)
 
 
 def test_glm_ser_dense_sparse_parity():
