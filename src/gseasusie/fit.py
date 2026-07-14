@@ -18,7 +18,6 @@ import gibss.localjj
 import gibss.logistic_localtaylor
 import gibss.cox
 import gibss.twogroup
-import gibss.twogrouplocaljj
 
 from gseasusie.gene_data import (
     align,
@@ -740,21 +739,26 @@ def fit_gsea_susie_twogroup(
     min_set_size: int = 1,
     max_set_size: int | None = None,
     L: int | None = None,
-    base_method: str = "logistic",
-    variant: str = "local_jj",
-    threshold_method: str | None = None,
-    threshold: float | None = None,
     f0: Any | None = None,
     f1: Any | None = None,
     prior_variance: float = 1.0,
     estimate_prior_variance: bool = True,
     max_iter: int = 50,
-    tol: float = 1e-4,
     coverage: float = 0.95,
-    verbose: bool = False,
     normalize: bool = False,
-    **family_kwargs,
+    response_model: Any | None = None,
+    family_state_kwargs: dict | None = None,
 ) -> GSEASuSiEResult:
+    """Two-group enrichment SuSiE over gene sets (the marginalized family).
+
+    Rebuilt on `gibss.twogroup.fit`: z is integrated out analytically and each
+    per-set fit is an exact-marginal SER, so there is no inner base-model / EM
+    label plumbing. The old `base_method`/`variant`/`threshold_method` knobs are
+    gone -- they selected between the EM base models this method supersedes;
+    thresholding is not a two-group method (binarize outside and use logistic
+    SuSiE if you need it). `response_model` accepts a
+    `Smoothed(TwoGroupMarginal(), GH(k))` for LOO-message offset integration.
+    """
     prepared = _prepare_gsea_susie_twogroup_inputs(
         gene_sets,
         response,
@@ -762,77 +766,12 @@ def fit_gsea_susie_twogroup(
         max_set_size=max_set_size,
         normalize=normalize,
     )
-    X_dense = jnp.asarray(prepared["membership"], dtype=jnp.float32)
-    # The local two-group base is dense-only; other bases use sparse membership.
-    use_local_base = base_method == "twogroup_local"
-    X_model = X_dense if use_local_base else sparse.BCOO.fromdense(X_dense)
-    y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)
+    membership = jnp.asarray(prepared["membership"], dtype=jnp.float64)
+    X_model = sparse.BCOO.fromdense(membership)
+    y = np.asarray(prepared["y"], dtype=np.float64)
+    bhat, se = y[:, 0], y[:, 1]
     l_model = min(10, X_model.shape[1]) if L is None else int(L)
 
-    # Prepare TwoGroupData
-    tg_data = gibss.twogroup.prep_data(X_model, y_jax)
-
-    # 1. Initialize Base SuSiE State and Schedule
-    if base_method == "twogroup_local":
-        base_data = gibss.twogrouplocaljj.prep_data(X_model, y_jax[:, 0])  # dummy y
-        base_state = gibss.twogrouplocaljj.initialize_state(
-            base_data,
-            L=l_model,
-            family_state_kwargs={
-                "estimate_prior_variance": bool(estimate_prior_variance),
-                **family_kwargs,
-            },
-        )
-        base_schedule = gibss.twogrouplocaljj.default_schedule()
-    elif base_method == "logistic":
-        if variant == "local_jj":
-            base_data = gibss.localjj.prep_data(X_model, y_jax[:, 0])  # dummy y
-            base_state = gibss.localjj.initialize_state(
-                base_data,
-                L=l_model,
-                family_state_kwargs={
-                    "estimate_prior_variance": bool(estimate_prior_variance),
-                    **family_kwargs,
-                },
-            )
-            base_schedule = gibss.localjj.default_schedule()
-        elif variant == "quadrature":
-            base_data = gibss.logistic_localtaylor.prep_data(X_model, y_jax[:, 0])
-            base_state = gibss.logistic_localtaylor.initialize_state(
-                base_data,
-                L=l_model,
-                family_state_kwargs={
-                    "estimate_prior_variance": bool(estimate_prior_variance),
-                    **family_kwargs,
-                },
-            )
-            base_schedule = gibss.logistic_localtaylor.default_schedule()
-    elif base_method == "cox":
-        base_data = gibss.cox.prep_data(X_model, y_jax)
-        base_state = gibss.cox.initialize_state(
-            base_data,
-            L=l_model,
-            family_state_kwargs={
-                "estimate_prior_variance": bool(estimate_prior_variance),
-                **family_kwargs,
-            },
-        )
-        base_schedule = gibss.cox.default_schedule()
-    elif base_method == "linear":
-        base_data = gibss.linear.prep_data(X_model, y_jax[:, 0])
-        base_state = gibss.linear.initialize_state(
-            base_data,
-            L=l_model,
-            family_state_kwargs={
-                "estimate_prior_variance": bool(estimate_prior_variance),
-                **family_kwargs,
-            },
-        )
-        base_schedule = gibss.linear.default_schedule()
-    else:
-        raise ValueError(f"Unsupported base_method for TwoGroup: {base_method}")
-
-    # 2. Wrap in TwoGroup State
     f0_obj = _resolve_distribution_spec(
         f0 or {"function": "point_mass", "kwargs": {"value": 0.0}}
     )
@@ -844,60 +783,24 @@ def fit_gsea_susie_twogroup(
         }
     )
 
-    init_state = gibss.twogroup.initialize_state(
-        data=tg_data,
-        inner_state=base_state,
+    fs_kwargs = {"estimate_prior_variance": bool(estimate_prior_variance)}
+    if family_state_kwargs:
+        fs_kwargs.update(family_state_kwargs)
+
+    # BCOO membership: the glm kernels don't consume sparse pre-centering, so
+    # fit on the raw (uncentered) design (center=False).
+    state = gibss.twogroup.fit(
+        X_model,
+        bhat,
+        se,
         f0=f0_obj,
         f1=f1_obj,
-        n_null_iter=family_kwargs.get("n_null_iter", 10),
-    )
-    if base_method == "twogroup_local":
-        schedule = gibss.twogroup.local_default_schedule(base_schedule)
-    else:
-        schedule = gibss.twogroup.default_schedule(base_schedule)
-
-    # 3. Handle Thresholding
-    if threshold_method == "hard":
-        t_val = threshold if threshold is not None else 3.0
-        schedule = gibss.engine.add_step(
-            schedule,
-            before_fit=(
-                partial(gibss.twogroup.hard_threshold_Ez_step, threshold=t_val),
-                1,
-            ),
-        )
-        # Remove dynamic Ez updates if hard thresholding
-        schedule = replace(
-            schedule,
-            before_effect_update=tuple(
-                s
-                for s in schedule.before_effect_update
-                if "update_Ez_step" not in str(s)
-            ),
-        )
-    elif threshold_method == "lfdr":
-        t_val = threshold if threshold is not None else 0.05
-        schedule = gibss.engine.add_step(
-            schedule,
-            before_fit=(
-                partial(gibss.twogroup.lfdr_threshold_Ez_step, threshold=t_val),
-                1,
-            ),
-        )
-        schedule = replace(
-            schedule,
-            before_effect_update=tuple(
-                s
-                for s in schedule.before_effect_update
-                if "update_Ez_step" not in str(s)
-            ),
-        )
-
-    state = gibss.engine.fit_ibss(
-        data=tg_data,
-        init_state=init_state,
-        schedule=schedule,
+        L=l_model,
         max_iter=max_iter,
+        response=response_model,
+        prior_variance=prior_variance,
+        family_state_kwargs=fs_kwargs,
+        center=False,
     )
 
     return _make_gsea_susie_result(
@@ -908,8 +811,7 @@ def fit_gsea_susie_twogroup(
         info={
             **prepared["info"],
             "method": "twogroup",
-            "base_method": base_method,
-            "threshold_method": threshold_method,
         },
         coverage=coverage,
     )
+
