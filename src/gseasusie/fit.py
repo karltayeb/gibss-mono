@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from functools import partial
 from typing import Any, Sequence
 
 import jax.numpy as jnp
@@ -14,10 +13,10 @@ import gibss
 import gibss.engine
 import gibss.distributions
 import gibss.linear
-import gibss.legacy.localjj
-import gibss.legacy.logistic_localtaylor
+import gibss.glm
 import gibss.cox
 import gibss.twogroup
+from gibss.response import Bernoulli, JJFixed, Smoothed
 
 from gseasusie.gene_data import (
     align,
@@ -500,37 +499,36 @@ def fit_gsea_susie_logistic(
 
     l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
 
+    # variant -> (response, kernel) on the maintained gibss.glm stack (no legacy):
+    #   local_jj  = classic localjj: Gaussian q + fixed-tilt JJ bound -> conjugate "jj"
+    #               kernel (monotone; the intercept-invariant sparse path uses no
+    #               centering, so center=False).
+    #   quadrature = free-form q + GH tail -> "quad" kernel; on sparse (BCOO) the
+    #               column-centered read-out (glm_center_ser) decouples the intercept.
+    # Both take the shared intercept and the Chebyshev row background for BCOO.
     if variant == "local_jj":
-        data = gibss.legacy.localjj.prep_data(X_sparse, y_jax)
-        init_state = gibss.legacy.localjj.initialize_state(
-            data,
-            L=l_model,
-            family_state_kwargs={
-                "estimate_prior_variance": bool(estimate_prior_variance),
-                **family_kwargs,
-            },
-        )
-        schedule = gibss.legacy.localjj.default_schedule()
+        response, kernel, center = Smoothed(Bernoulli(), JJFixed()), "jj", False
     elif variant == "quadrature":
-        data = gibss.legacy.logistic_localtaylor.prep_data(X_sparse, y_jax)
-        init_state = gibss.legacy.logistic_localtaylor.initialize_state(
-            data,
-            L=l_model,
-            family_state_kwargs={
-                "estimate_prior_variance": bool(estimate_prior_variance),
-                **family_kwargs,
-            },
-        )
-        schedule = gibss.legacy.logistic_localtaylor.default_schedule()
+        response, kernel, center = Bernoulli(), "quad", True
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
-    # Set tolerance
-    if hasattr(init_state.family_state, "skl_tolerance"):
-        init_state = replace(
-            init_state,
-            family_state=replace(init_state.family_state, skl_tolerance=tol),
-        )
+    data = gibss.glm.prep_data(X_sparse, y_jax, center=center)
+    init_state = gibss.glm.initialize_state(
+        data,
+        L=l_model,
+        response=response,
+        prior_variance=prior_variance,
+        family_state_kwargs={
+            "kernel": kernel,
+            "intercept": "shared",
+            "background": "chebyshev",
+            "estimate_prior_variance": bool(estimate_prior_variance),
+            "skl_tolerance": tol,
+            **family_kwargs,
+        },
+    )
+    schedule = gibss.glm.default_schedule()
 
     state = gibss.engine.fit_ibss(
         data,
