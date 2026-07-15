@@ -296,6 +296,11 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
     def ser_log_bayes_factor(self) -> jnp.ndarray:
         return self.ser_log_bf
 
+    @property
+    def prior_variance(self) -> jnp.ndarray:
+        """Per-effect prior variance (one entry per single effect)."""
+        return jnp.array([e.prior_variance for e in self.single_effects])
+
     def get_credible_sets(self, coverage: float = 0.95) -> tuple[tuple[int, ...], ...]:
         """Returns indices of credible sets for all components."""
         return tuple(e.get_cs(coverage=coverage) for e in self.single_effects)

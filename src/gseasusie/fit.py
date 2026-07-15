@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 import jax.numpy as jnp
@@ -12,11 +12,12 @@ from scipy.stats import fisher_exact
 import gibss
 import gibss.engine
 import gibss.distributions
-import gibss.linear
-import gibss.glm
-import gibss.cox
-import gibss.twogroup
-from gibss.response import GH, Bernoulli, JJFixed, Smoothed
+from gibss import (
+    fit_cox_susie,
+    fit_glm_susie,
+    fit_linear_susie,
+    fit_twogroup_susie,
+)
 
 from gseasusie.gene_data import (
     align,
@@ -466,6 +467,62 @@ def fit_ora(
     )
 
 
+def fit_gsea_susie(gene_sets, response, *, model=None, **kwargs):
+    """Ergonomic GSEA-SuSiE front end: dispatch on the response type to the right
+    model and forward every keyword to the typed fitter.
+
+        GeneList                              -> logistic
+        GeneRanks                             -> cox
+        GeneEffects / GeneStandardizedEffects -> twogroup (default) | linear
+
+    `model` disambiguates effect-size responses ("twogroup" default, or "linear"); it
+    must be unset (or match) for GeneList/GeneRanks, whose type fixes the model. Every
+    other keyword -- common (L, prior_variance, max_iter, tol, coverage, min/max set
+    size, ...) and backend-specific (intercept, offset_integration, variant, method,
+    baseline, nullweight, ...) -- flows to the typed fitter and on to the gibss front
+    door.
+    """
+    if isinstance(response, GeneList):
+        _reject_model(model, "GeneList", "logistic")
+        return fit_gsea_susie_logistic(gene_sets, response, **kwargs)
+    if isinstance(response, GeneRanks):
+        _reject_model(model, "GeneRanks", "cox")
+        return fit_gsea_susie_cox(gene_sets, response, **kwargs)
+    if isinstance(response, (GeneEffects, GeneStandardizedEffects)):
+        chosen = model or "twogroup"
+        if chosen == "twogroup":
+            return fit_gsea_susie_twogroup(gene_sets, response, **kwargs)
+        if chosen == "linear":
+            return fit_gsea_susie_linear(gene_sets, response, **kwargs)
+        raise ValueError(
+            f"unknown model {chosen!r} for an effect-size response; use 'twogroup' "
+            f"(default) or 'linear'"
+        )
+    raise TypeError(
+        f"no GSEA-SuSiE model for response type {type(response).__name__!r}; pass a "
+        f"GeneList, GeneRanks, GeneEffects or GeneStandardizedEffects"
+    )
+
+
+def _reject_model(model, type_name, fixed):
+    if model is not None and model != fixed:
+        raise ValueError(
+            f"model={model!r} is not valid for a {type_name} response (its type fixes "
+            f"the model to {fixed!r}); `model` selects twogroup vs linear only for "
+            f"effect-size responses."
+        )
+
+
+# variant -> fit_glm_susie axis defaults (overridable via **model_kwargs). Both
+# integrate the offset (shared intercept + inter-effect messages) and decouple the
+# intercept: local_jj = classic localjj (conjugate JJ bound, method="localjj");
+# quadrature = free-form q + GH offset integration on the centered quad kernel.
+_LOGISTIC_VARIANTS = {
+    "local_jj": {"method": "localjj"},
+    "quadrature": {"offset_integration": "gh"},  # logistic family + GH offset integration
+}
+
+
 def fit_gsea_susie_logistic(
     gene_sets: GeneSetCollection,
     response: GeneList,
@@ -481,65 +538,39 @@ def fit_gsea_susie_logistic(
     coverage: float = 0.95,
     use_pseudodata: bool = False,
     verbose: bool = False,
-    **family_kwargs,
+    **model_kwargs,
 ) -> GSEASuSiEResult:
+    """Logistic GSEA-SuSiE. `variant` picks a fit_glm_susie preset; any other
+    fit_glm_susie axis (intercept, offset_integration, center, quadrature order, ...)
+    passes through **model_kwargs and overrides the variant default."""
+    if variant not in _LOGISTIC_VARIANTS:
+        raise ValueError(
+            f"unknown variant {variant!r}; use {sorted(_LOGISTIC_VARIANTS)}"
+        )
     prepared = _prepare_gsea_susie_logistic_inputs(
         gene_sets,
         response,
         min_set_size=min_set_size,
         max_set_size=max_set_size,
     )
-    fit_membership = np.asarray(prepared["membership"], dtype=np.float32)
-    fit_y = np.asarray(prepared["y"], dtype=np.float32)
+    membership = np.asarray(prepared["membership"], dtype=np.float32)
+    y = np.asarray(prepared["y"], dtype=np.float32)
     if use_pseudodata:
-        fit_membership, fit_y = _augment_with_fixed_pseudodata(fit_membership, fit_y)
+        membership, y = _augment_with_fixed_pseudodata(membership, y)
 
-    X_sparse = sparse.BCOO.fromdense(jnp.asarray(fit_membership, dtype=jnp.float32))
-    y_jax = jnp.asarray(fit_y, dtype=jnp.float32)
+    X = sparse.BCOO.fromdense(jnp.asarray(membership, dtype=jnp.float32))
+    y_jax = jnp.asarray(y, dtype=jnp.float32)
+    l_model = min(10, X.shape[1]) if L is None else int(L)
 
-    l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
-
-    # variant -> (response, kernel) on the maintained gibss.glm stack (no legacy).
-    # Both integrate over the offset (shared intercept + inter-effect messages,
-    # o ~ N(mean, var)) rather than plugging in a point offset, and both decouple the
-    # intercept and take the Chebyshev row background for sparse (BCOO):
-    #   local_jj  = classic localjj: Gaussian q + fixed-tilt JJ bound -> conjugate "jj"
-    #               kernel (monotone); the JJ bound integrates the offset, and the
-    #               per-feature tilt is intercept-invariant, so center=False.
-    #   quadrature = free-form q + GH tail -> "quad" kernel with GH offset integration
-    #               (Smoothed(Bernoulli, GH): the marginal read-out, matching local_jj);
-    #               decoupled on sparse by the column-centered kernel (glm_center_ser),
-    #               so center=True.
-    if variant == "local_jj":
-        response, kernel, center = Smoothed(Bernoulli(), JJFixed()), "jj", False
-    elif variant == "quadrature":
-        # GH order matches the front-door offset_quadrature_points default.
-        response, kernel, center = Smoothed(Bernoulli(), GH(15)), "quad", True
-    else:
-        raise ValueError(f"Unknown variant: {variant}")
-
-    data = gibss.glm.prep_data(X_sparse, y_jax, center=center)
-    init_state = gibss.glm.initialize_state(
-        data,
+    state = fit_glm_susie(
+        X,
+        y_jax,
         L=l_model,
-        response=response,
         prior_variance=prior_variance,
-        family_state_kwargs={
-            "kernel": kernel,
-            "intercept": "shared",
-            "background": "chebyshev",
-            "estimate_prior_variance": bool(estimate_prior_variance),
-            "skl_tolerance": tol,
-            **family_kwargs,
-        },
-    )
-    schedule = gibss.glm.default_schedule()
-
-    state = gibss.engine.fit_ibss(
-        data,
-        init_state,
-        schedule,
+        estimate_prior_variance=estimate_prior_variance,
         max_iter=max_iter,
+        tol=tol,
+        **{**_LOGISTIC_VARIANTS[variant], **model_kwargs},
     )
 
     return _make_gsea_susie_result(
@@ -570,44 +601,29 @@ def fit_gsea_susie_cox(
     tol: float = 1e-4,
     coverage: float = 0.95,
     verbose: bool = False,
-    **family_kwargs,
+    **model_kwargs,
 ) -> GSEASuSiEResult:
+    """Cox GSEA-SuSiE. fit_cox_susie axes (method='poisson'|'partial', baseline,
+    offset_integration, ...) pass through **model_kwargs."""
     prepared = _prepare_gsea_susie_cox_inputs(
         gene_sets,
         response,
         min_set_size=min_set_size,
         max_set_size=max_set_size,
     )
-    X_sparse = sparse.BCOO.fromdense(
-        jnp.asarray(prepared["membership"], dtype=jnp.float32)
-    )
-    y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)
+    X = sparse.BCOO.fromdense(jnp.asarray(prepared["membership"], dtype=jnp.float32))
+    y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)  # (n, 2) [time, event]
+    l_model = min(10, X.shape[1]) if L is None else int(L)
 
-    l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
-
-    data = gibss.cox.prep_data(X_sparse, y_jax)
-    init_state = gibss.cox.initialize_state(
-        data,
+    state = fit_cox_susie(
+        X,
+        y=y_jax,
         L=l_model,
-        family_state_kwargs={
-            "estimate_prior_variance": bool(estimate_prior_variance),
-            **family_kwargs,
-        },
-    )
-    schedule = gibss.cox.default_schedule()
-
-    # Set tolerance
-    if hasattr(init_state.family_state, "skl_tolerance"):
-        init_state = replace(
-            init_state,
-            family_state=replace(init_state.family_state, skl_tolerance=tol),
-        )
-
-    state = gibss.engine.fit_ibss(
-        data,
-        init_state,
-        schedule,
+        prior_variance=prior_variance,
+        estimate_prior_variance=estimate_prior_variance,
         max_iter=max_iter,
+        tol=tol,
+        **model_kwargs,
     )
 
     return _make_gsea_susie_result(
@@ -633,45 +649,30 @@ def fit_gsea_susie_linear(
     tol: float = 1e-4,
     coverage: float = 0.95,
     verbose: bool = False,
-    **family_kwargs,
+    **model_kwargs,
 ) -> GSEASuSiEResult:
-    """Run SuSiE linear regression for GSEA on Z-scores."""
+    """Linear (Gaussian) GSEA-SuSiE on effect sizes / Z-scores. fit_linear_susie axes
+    (estimate_residual_variance, residual_variance, center, ...) pass through
+    **model_kwargs."""
     prepared = _prepare_gsea_susie_linear_inputs(
         gene_sets,
         response,
         min_set_size=min_set_size,
         max_set_size=max_set_size,
     )
-    X_sparse = sparse.BCOO.fromdense(
-        jnp.asarray(prepared["membership"], dtype=jnp.float32)
-    )
+    X = sparse.BCOO.fromdense(jnp.asarray(prepared["membership"], dtype=jnp.float32))
     y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)
+    l_model = min(10, X.shape[1]) if L is None else int(L)
 
-    l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
-
-    data = gibss.linear.prep_data(X_sparse, y_jax)
-    init_state = gibss.linear.initialize_state(
-        data,
+    state = fit_linear_susie(
+        X,
+        y_jax,
         L=l_model,
-        family_state_kwargs={
-            "estimate_prior_variance": bool(estimate_prior_variance),
-            **family_kwargs,
-        },
-    )
-    schedule = gibss.linear.default_schedule()
-
-    # Set tolerance
-    if hasattr(init_state.family_state, "elbo_tolerance"):
-        init_state = replace(
-            init_state,
-            family_state=replace(init_state.family_state, elbo_tolerance=tol),
-        )
-
-    state = gibss.engine.fit_ibss(
-        data,
-        init_state,
-        schedule,
+        prior_variance=prior_variance,
+        estimate_prior_variance=estimate_prior_variance,
         max_iter=max_iter,
+        tol=tol,
+        **model_kwargs,
     )
 
     return _make_gsea_susie_result(
@@ -795,7 +796,7 @@ def fit_gsea_susie_twogroup(
 
     # BCOO membership: the glm kernels don't consume sparse pre-centering, so
     # fit on the raw (uncentered) design (center=False).
-    state = gibss.twogroup.fit(
+    state = fit_twogroup_susie(
         X_model,
         bhat,
         se,

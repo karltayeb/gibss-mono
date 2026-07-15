@@ -14,6 +14,7 @@ from gseasusie import (
     GeneSetCollection,
     GeneStandardizedEffects,
     align,
+    fit_gsea_susie,
     fit_gsea_susie_cox,
     fit_gsea_susie_logistic,
     fit_ora,
@@ -336,12 +337,12 @@ def test_fit_gsea_susie_logistic_augments_model_inputs_only_when_requested(monke
     )
     captured: dict[str, np.ndarray] = {}
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
-        captured["X"] = np.asarray(data.X.todense())
-        captured["y"] = np.asarray(data.y)
-        return DummyState(captured["X"].shape[1], L=len(init_state.single_effects))
+    def fake_fit(X, y, **kwargs):
+        captured["X"] = np.asarray(X.todense())
+        captured["y"] = np.asarray(y)
+        return DummyState(captured["X"].shape[1], L=kwargs.get("L", 1))
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_glm_susie", fake_fit)
     response = _make_gene_list_from_selected(["G1", "G2", "G3"], ["G1"])
 
     fit = fit_gsea_susie_logistic(
@@ -383,14 +384,14 @@ def test_fit_gsea_susie_logistic_uses_fixed_l_fit_by_default(monkeypatch: pytest
     response = _make_gene_list_from_selected(["G1", "G2", "G3"], ["G1"])
     captured: dict[str, object] = {}
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
-        captured["X"] = np.asarray(data.X.todense())
-        captured["y"] = np.asarray(data.y)
-        captured["L"] = len(init_state.single_effects)
+    def fake_fit(X, y, **kwargs):
+        captured["X"] = np.asarray(X.todense())
+        captured["y"] = np.asarray(y)
+        captured["L"] = kwargs.get("L")
         captured["kwargs"] = kwargs
         return DummyState(captured["X"].shape[1], L=captured["L"])
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_glm_susie", fake_fit)
 
     fit = fit_gsea_susie_logistic(
         collection,
@@ -420,12 +421,12 @@ def test_fit_gsea_susie_logistic_aligns_on_gene_id_intersection(monkeypatch: pyt
     )
     captured: dict[str, np.ndarray] = {}
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
-        captured["X"] = np.asarray(data.X.todense())
-        captured["y"] = np.asarray(data.y)
-        return DummyState(captured["X"].shape[1], L=len(init_state.single_effects))
+    def fake_fit(X, y, **kwargs):
+        captured["X"] = np.asarray(X.todense())
+        captured["y"] = np.asarray(y)
+        return DummyState(captured["X"].shape[1], L=kwargs.get("L", 1))
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_glm_susie", fake_fit)
     fit = fit_gsea_susie_logistic(collection, gene_list, L=1)
 
     assert fit.gene_ids == ["G2", "G3"]
@@ -498,12 +499,12 @@ def test_fit_gsea_susie_logistic_accepts_gene_sets_and_gene_list(monkeypatch: py
     response = _make_gene_list_from_selected(["G1", "G2", "G3"], ["G1"])
     captured: dict[str, np.ndarray] = {}
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
-        captured["X"] = np.asarray(data.X.todense())
-        captured["y"] = np.asarray(data.y)
-        return DummyState(captured["X"].shape[1], L=len(init_state.single_effects))
+    def fake_fit(X, y, **kwargs):
+        captured["X"] = np.asarray(X.todense())
+        captured["y"] = np.asarray(y)
+        return DummyState(captured["X"].shape[1], L=kwargs.get("L", 1))
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_glm_susie", fake_fit)
 
     fit = fit_gsea_susie_logistic(
         collection,
@@ -531,13 +532,14 @@ def test_fit_gsea_susie_cox_accepts_gene_sets_and_gene_ranks(monkeypatch: pytest
     )
     captured: dict[str, np.ndarray] = {}
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
-        captured["X"] = np.asarray(data.X.todense())
-        captured["event_time"] = np.asarray(data.event_time)
-        captured["event_type"] = np.asarray(data.event_type)
-        return DummyState(captured["X"].shape[1], L=len(init_state.single_effects))
+    def fake_fit(X, **kwargs):
+        captured["X"] = np.asarray(X.todense())
+        yy = np.asarray(kwargs["y"])
+        captured["event_time"] = yy[:, 0]
+        captured["event_type"] = yy[:, 1]
+        return DummyState(captured["X"].shape[1], L=kwargs.get("L", 1))
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_cox_susie", fake_fit)
     fit = fit_gsea_susie_cox(
         collection,
         response,
@@ -597,10 +599,10 @@ def test_gseafit_credible_set_report_returns_one_row_per_component(monkeypatch: 
                 (1, 2),
             )
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
+    def fake_fit(X, y, **kwargs):
         return DummyStateWithCS()
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_glm_susie", fake_fit)
     fit = fit_gsea_susie_logistic(
         collection,
         _make_gene_list_from_selected(["G1", "G2", "G3", "G4"], ["G1", "G2"]),
@@ -662,10 +664,10 @@ def test_gseafit_credible_set_report_marks_noninformative_components(monkeypatch
                 (0, 1, 2),
             )
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
+    def fake_fit(X, y, **kwargs):
         return DummyStateWithCS()
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_glm_susie", fake_fit)
     fit = fit_gsea_susie_logistic(
         collection,
         _make_gene_list_from_selected(["G1", "G2", "G3", "G4"], ["G1", "G2"]),
@@ -713,10 +715,10 @@ def test_gseafit_credible_set_report_marks_overlapping_informative_components_re
                 (1, 2),
             )
 
-    def fake_fit_ibss(data, init_state, schedule, **kwargs):
+    def fake_fit(X, y, **kwargs):
         return DummyStateWithCS()
 
-    monkeypatch.setattr("gibss.engine.fit_ibss", fake_fit_ibss)
+    monkeypatch.setattr("gseasusie.fit.fit_glm_susie", fake_fit)
     fit = fit_gsea_susie_logistic(
         collection,
         _make_gene_list_from_selected(["G1", "G2", "G3", "G4"], ["G1", "G2"]),
@@ -727,3 +729,34 @@ def test_gseafit_credible_set_report_marks_overlapping_informative_components_re
 
     assert report["informative"].to_list() == [True, True]
     assert report["redundant"].to_list() == [True, True]
+
+
+def test_fit_gsea_susie_dispatches_on_response_type(monkeypatch: pytest.MonkeyPatch):
+    collection = _make_collection(data={"SET_A": ["G1", "G2"], "SET_B": ["G2", "G3", "G4"]})
+    genes = ["G1", "G2", "G3", "G4"]
+
+    def fake(*args, **kwargs):
+        X = args[0]
+        return DummyState(X.shape[1], L=kwargs.get("L", 1))
+
+    for name in ("fit_glm_susie", "fit_cox_susie", "fit_linear_susie", "fit_twogroup_susie"):
+        monkeypatch.setattr(f"gseasusie.fit.{name}", fake)
+
+    gl = _make_gene_list_from_selected(genes, ["G1", "G2"])
+    gr = GeneRanks(gene_ids=genes, rank=np.asarray([1.0, 2.0, 3.0, 4.0]),
+                   event_observed=np.asarray([True, True, False, True]))
+    ge = GeneEffects(genes, np.asarray([0.5, -0.3, 0.1, 0.2]), np.asarray([0.2, 0.2, 0.2, 0.2]))
+
+    assert fit_gsea_susie(collection, gl).info["method"] == "logistic"
+    assert fit_gsea_susie(collection, gr).info["method"] == "cox"
+    assert fit_gsea_susie(collection, ge).info["method"] == "twogroup"  # GeneEffects default
+    assert fit_gsea_susie(collection, ge, model="linear").info["method"] == "linear"
+
+
+def test_fit_gsea_susie_rejects_bad_dispatch():
+    collection = _make_collection(data={"SET_A": ["G1", "G2"]})
+    gl = _make_gene_list_from_selected(["G1", "G2"], ["G1"])
+    with pytest.raises(ValueError):  # model= is meaningless for a type-fixed response
+        fit_gsea_susie(collection, gl, model="twogroup")
+    with pytest.raises(TypeError):  # unknown response type
+        fit_gsea_susie(collection, "not a response")

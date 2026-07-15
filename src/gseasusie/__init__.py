@@ -1,5 +1,6 @@
 from gseasusie.fit import (
     GSEASuSiEResult,
+    fit_gsea_susie,
     fit_gsea_susie_cox,
     fit_gsea_susie_linear,
     fit_gsea_susie_logistic,
@@ -34,6 +35,7 @@ __all__ = [
     "GeneRanks",
     "GeneStandardizedEffects",
     "GSEASuSiEResult",
+    "fit_gsea_susie",
     "fit_gsea_susie_cox",
     "fit_gsea_susie_linear",
     "fit_gsea_susie_logistic",
