@@ -705,8 +705,15 @@ def glm_ser(
         eta = off_e + op.column_linpred(b)
         _, grad_i, w_i = terms(eta)
         grad = op.local_moment(1, grad_i) - inv_pv * b
-        curv = op.local_moment(2, w_i) + inv_pv  # MM/Fisher curvature -> monotone
-        step = grad / curv
+        curv = op.local_moment(2, w_i) + inv_pv  # Fisher curvature
+        # Damp the step: Fisher scoring is NOT globally monotone. On a quasi-separated
+        # column the fitted probabilities saturate, so w_i -> 0, curv -> inv_pv, and the
+        # raw step blows up and overshoots to the wrong sign (the loop then oscillates and
+        # exits at n_iter on finite garbage -> a spurious logBF ~ -1e5). The +/-4 log-odds
+        # clip caps the overshoot without touching the near-mode regime (where the raw step
+        # is small, so quadratic convergence is preserved) -- same trust region the
+        # intercept Newton and glm_profile_ser already use.
+        step = jnp.clip(grad / curv, -4.0, 4.0)
         return b + step, jnp.max(jnp.abs(step)), it + 1
 
     b, _, _ = jax.lax.while_loop(
