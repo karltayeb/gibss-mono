@@ -15,6 +15,7 @@ from .engine import (
     Message,
     Schedule,
     add_message_index_step,
+    fit_ibss,
     replace_effect_in_gibss_state,
     subtract_message_index_step,
 )
@@ -187,13 +188,14 @@ def initialize_state(
     data,
     L: int = 1,
     family_state_kwargs: dict | None = None,
+    prior_variance: float = 1.0,
 ) -> GIBSSState[LinearFamilyState, Message]:
     p = data.X.shape[1]
     n = data.X.shape[0]
     family_state = LinearFamilyState(**({} if family_state_kwargs is None else dict(family_state_kwargs)))
     zero_message = Message(np.zeros(n), np.zeros(n))
     return GIBSSState(
-        single_effects=[_empty_effect(p, 1.0) for _ in range(L)],
+        single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=zero_message,
         family_state=family_state,
     )
@@ -347,3 +349,42 @@ def default_schedule() -> Schedule:
             check_elbo_convergence_step,
         ),
     )
+
+
+def fit_linear_susie(
+    X,
+    y,
+    *,
+    L=5,
+    prior_variance=1.0,
+    estimate_prior_variance=True,
+    residual_variance=1.0,
+    estimate_residual_variance=True,
+    estimate_intercept=True,
+    obs_variance=None,
+    center=None,
+    max_iter=100,
+    tol=1e-4,
+    schedule=None,
+):
+    """One-call linear (Gaussian) SuSiE. Returns the fitted `GIBSSState`.
+
+    The dedicated linear stack (NOT `fit_glm_susie(family='gaussian')`, which holds a
+    FIXED variance): here the residual variance is estimated by default. `obs_variance`
+    gives known per-observation weights (Var(y_i) = residual_variance * obs_variance_i).
+    """
+    data = prep_data(X, y, center=center, obs_variance=obs_variance)
+    state = initialize_state(
+        data,
+        L=L,
+        prior_variance=prior_variance,
+        family_state_kwargs=dict(
+            estimate_prior_variance=bool(estimate_prior_variance),
+            residual_variance=residual_variance,
+            estimate_residual_variance=bool(estimate_residual_variance),
+            estimate_intercept=bool(estimate_intercept),
+            elbo_tolerance=tol,
+        ),
+    )
+    sched = schedule if schedule is not None else default_schedule()
+    return fit_ibss(data, state, sched, max_iter=max_iter)

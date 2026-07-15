@@ -9,7 +9,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from gibss import cox, cox_poisson, fit_cox_susie, fit_twogroup_susie, twogroup
+from gibss import (
+    cox,
+    cox_poisson,
+    fit_cox_susie,
+    fit_linear_susie,
+    fit_twogroup_susie,
+    linear,
+    twogroup,
+)
 from gibss.engine import fit_ibss
 from gibss.response import GH, Poisson, Smoothed
 
@@ -90,3 +98,25 @@ def test_fit_twogroup_susie_matches_manual():
 
 def test_twogroup_fit_alias():
     assert twogroup.fit is twogroup.fit_twogroup_susie
+
+
+def test_fit_linear_susie_matches_manual():
+    rng = np.random.default_rng(3)
+    n, p = 200, 6
+    X = jnp.asarray(rng.normal(size=(n, p)))
+    y = jnp.asarray(rng.normal(size=n) + X[:, 0])
+    fd = fit_linear_susie(X, y, L=2, max_iter=60)
+    d = linear.prep_data(X, y)
+    manual = fit_ibss(d, linear.initialize_state(d, L=2, family_state_kwargs={"elbo_tolerance": 1e-4}),
+                      linear.default_schedule(), max_iter=60)
+    np.testing.assert_allclose(_pip(fd), _pip(manual), atol=1e-10)
+
+
+def test_fit_linear_susie_estimates_residual_variance():
+    # the dedicated linear stack estimates sigma^2 (unlike fit_glm_susie(family='gaussian'))
+    rng = np.random.default_rng(4)
+    n, p = 300, 5
+    X = jnp.asarray(rng.normal(size=(n, p)))
+    y = jnp.asarray(0.3 * rng.normal(size=n) + X[:, 0])  # residual variance ~ 0.09
+    fd = fit_linear_susie(X, y, L=1, max_iter=80)
+    assert float(fd.family_state.residual_variance) < 0.9  # moved off the 1.0 default
