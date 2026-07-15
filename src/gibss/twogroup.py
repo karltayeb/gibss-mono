@@ -83,6 +83,7 @@ __all__ = [
     "TwoGroupFamilyState",
     "prep_data",
     "initialize_state",
+    "fit_twogroup_susie",
     "fit",
     "compute_Ez",
     "log_likelihood",
@@ -381,7 +382,7 @@ def initialize_state(
     return _init_em(data, state)
 
 
-def fit(
+def fit_twogroup_susie(
     X,
     bhat,
     se,
@@ -412,6 +413,9 @@ def fit(
         nullweight=nullweight,
     )
     return fit_ibss(data, state, default_schedule(), max_iter=max_iter)
+
+
+fit = fit_twogroup_susie  # back-compat alias
 
 
 def default_schedule() -> Schedule:

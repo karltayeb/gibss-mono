@@ -75,9 +75,9 @@ from .cox import (
     prepare_sparse_cox_dynamic_context,
     prepare_sparse_cox_static_context,
 )
-from .engine import Schedule, replace_effect_in_gibss_state
+from .engine import Schedule, fit_ibss, replace_effect_in_gibss_state
 from .linear import LinearData
-from .response import Poisson, ResponseModel
+from .response import GH, Poisson, ResponseModel, Smoothed
 from .response_ser import build_ser_state
 
 __all__ = [
@@ -90,6 +90,7 @@ __all__ = [
     "initialize_state",
     "initialize_state_mean_message",
     "default_schedule",
+    "fit_cox_susie",
 ]
 
 
@@ -303,24 +304,28 @@ def update_effect_index_step(data, l, state):
 
 
 def initialize_state(
-    data, L=1, response: ResponseModel = Poisson(), family_state_kwargs=None
+    data, L=1, response: ResponseModel = Poisson(), family_state_kwargs=None,
+    prior_variance=1.0,
 ):
     """Engine state for Cox-Poisson. `response` must be Poisson or a Smoothed
     elaboration of it (e.g. `Smoothed(Poisson(), GH(5))` for offset-integrated Cox).
     No shared intercept: the Breslow baseline absorbs it."""
     kw = {"estimate_intercept": False}
     kw.update({} if family_state_kwargs is None else dict(family_state_kwargs))
-    return glm.initialize_state(data, L=L, response=response, family_state_kwargs=kw)
+    return glm.initialize_state(
+        data, L=L, response=response, family_state_kwargs=kw, prior_variance=prior_variance
+    )
 
 
 def initialize_state_mean_message(
-    data, L=1, response: ResponseModel = Poisson(), family_state_kwargs=None
+    data, L=1, response: ResponseModel = Poisson(), family_state_kwargs=None,
+    prior_variance=1.0,
 ):
     """Mean-only variant (see `glm.initialize_state_mean_message`)."""
     kw = {"estimate_intercept": False}
     kw.update({} if family_state_kwargs is None else dict(family_state_kwargs))
     return glm.initialize_state_mean_message(
-        data, L=L, response=response, family_state_kwargs=kw
+        data, L=L, response=response, family_state_kwargs=kw, prior_variance=prior_variance
     )
 
 
@@ -354,3 +359,82 @@ def default_schedule(baseline: str = "profiled") -> Schedule:
         before_effect_update=(update_breslow_step,) + s.before_effect_update,
         effect_update=effect_update,
     )
+
+
+def fit_cox_susie(
+    X,
+    event_time=None,
+    event_type=None,
+    *,
+    y=None,
+    L=5,
+    method="poisson",
+    prior_variance=1.0,
+    estimate_prior_variance=True,
+    max_iter=100,
+    tol=1e-4,
+    # method="poisson" axes (ignored by "partial", which profiles the baseline exactly):
+    baseline="profiled",
+    offset_integration="none",
+    offset_quadrature_points=15,
+    center=None,
+    schedule=None,
+):
+    """One-call Cox proportional-hazards SuSiE. Returns the fitted `GIBSSState`.
+
+    Two algorithms for the SAME model (they share the Breslow fixed point):
+
+        fit_cox_susie(X, event_time=t, event_type=d)              # Poisson (default)
+        fit_cox_susie(X, event_time=t, event_type=d, method="partial")
+
+    - method="poisson" (default): Cox as a Poisson working likelihood (Breslow
+      profile). Rides the glm machinery, so it exposes the `baseline` treatment axis
+      ("profiled" = partial-likelihood semantics, matches method="partial";
+      "shared"; "null" = the score analysis) and offset integration
+      (`offset_integration="gh"` -> Smoothed(Poisson(), GH) = offset-integrated Cox).
+    - method="partial": the exact partial likelihood (`cox` module), mean-message
+      only, so `baseline` / `offset_integration` do not apply.
+
+    Survival response as `y=(n, 2)` [time, event] or `event_time=`/`event_type=`, as
+    in `cox.prep_data`. `center` (poisson only) pre-centers the design.
+    """
+    from . import cox  # cox does not import cox_poisson: safe
+
+    fs_kwargs = dict(estimate_prior_variance=bool(estimate_prior_variance), skl_tolerance=tol)
+    if method == "poisson":
+        if offset_integration == "none":
+            response = Poisson()
+        elif offset_integration == "gh":
+            response = Smoothed(Poisson(), GH(offset_quadrature_points))
+        else:
+            raise ValueError(
+                f"unknown offset_integration {offset_integration!r}; use 'none' or 'gh'"
+            )
+        data = prep_data(X, y, event_time=event_time, event_type=event_type, center=center)
+        state = initialize_state(
+            data, L=L, response=response, prior_variance=prior_variance,
+            family_state_kwargs=fs_kwargs,
+        )
+        sched = schedule if schedule is not None else default_schedule(baseline=baseline)
+    elif method == "partial":
+        if offset_integration != "none":
+            raise ValueError(
+                "method='partial' (exact partial likelihood) is mean-message only "
+                "and cannot integrate the offset; use method='poisson' for "
+                "offset_integration='gh'."
+            )
+        if baseline != "profiled":
+            raise ValueError(
+                "method='partial' has no baseline-treatment axis (the partial "
+                "likelihood profiles the baseline out exactly); `baseline` applies "
+                "to method='poisson' only."
+            )
+        data = cox.prep_data(X, y, event_time=event_time, event_type=event_type)
+        state = cox.initialize_state(
+            data, L=L, prior_variance=prior_variance, family_state_kwargs=fs_kwargs
+        )
+        sched = schedule if schedule is not None else cox.default_schedule()
+    else:
+        raise ValueError(f"unknown method {method!r}; use 'poisson' or 'partial'")
+
+    return fit_ibss(data, state, sched, max_iter=max_iter)

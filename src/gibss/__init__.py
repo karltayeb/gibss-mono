@@ -36,6 +36,15 @@ if os.environ.get("GIBSS_NO_JAX_CACHE", "").lower() not in ("1", "true", "yes"):
         pass
 
 from ._logistic_intercept import _logistic_intercept
+from .cox_poisson import fit_cox_susie
 from .methods import PRESETS, fit_glm_susie
+from .twogroup import fit_twogroup_susie
 
-__all__ = ["PRESETS", "_logistic_intercept", "enable_compilation_cache", "fit_glm_susie"]
+__all__ = [
+    "PRESETS",
+    "_logistic_intercept",
+    "enable_compilation_cache",
+    "fit_glm_susie",
+    "fit_cox_susie",
+    "fit_twogroup_susie",
+]
