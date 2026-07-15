@@ -10,6 +10,7 @@ stack (`cox.py`).
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsparse
 
 from gibss import cox, cox_poisson
 from gibss.cox_poisson import breslow_log_cumhaz
@@ -256,6 +257,88 @@ def test_null_baseline_is_frozen_and_recovers():
     null_l0 = breslow_log_cumhaz(d.fixed, jnp.zeros(n))
     np.testing.assert_allclose(np.asarray(fit.family_state.glm_offset),
                                np.asarray(null_l0), atol=1e-12)
+
+
+def _sim_sparse_survival(rng, n, p, causal, beta=1.2, density=0.25):
+    # genotype-like binary design: naturally sparse, so BCOO is the honest encoding
+    X = (rng.random((n, p)) < density).astype(float)
+    rate = np.exp(beta * X[:, causal])
+    t_event = rng.exponential(1.0 / rate)
+    t_cens = rng.exponential(np.quantile(t_event, 0.7), size=n)
+    time = np.minimum(t_event, t_cens)
+    event = (t_event <= t_cens).astype(float)
+    return X, time, event
+
+
+def test_pl_read_out_sparse_matches_dense():
+    # kernel-level: the BCOO read-out (support-bucket kernel) returns the same
+    # per-feature (mu, dll, precision) and per-SER null as the dense sorted-column
+    # kernel -- same ridge-Newton polish from the same warm start.
+    rng = np.random.default_rng(7)
+    n, p, causal = 300, 8, 2
+    X, time, event = _sim_sparse_survival(rng, n, p, causal)
+    offset = 0.3 * rng.normal(size=n)
+    warm = 0.1 * rng.normal(size=p)
+
+    dd = cox_poisson.prep_data(X, event_time=time, event_type=event, center=False)
+    ds = cox_poisson.prep_data(
+        jsparse.BCOO.fromdense(X), event_time=time, event_type=event
+    )
+    assert ds.sparse_static is not None
+    mu_d, dll_d, prec_d, ll0_d = cox_poisson._pl_fit(dd, offset, warm, 1.0)
+    mu_s, dll_s, prec_s, ll0_s = cox_poisson._pl_fit(ds, offset, warm, 1.0)
+    np.testing.assert_allclose(np.asarray(mu_s), np.asarray(mu_d), atol=1e-8)
+    np.testing.assert_allclose(np.asarray(dll_s), np.asarray(dll_d), atol=1e-8)
+    np.testing.assert_allclose(np.asarray(prec_s), np.asarray(prec_d), atol=1e-8)
+    np.testing.assert_allclose(float(ll0_s), float(ll0_d), atol=1e-8)
+
+
+def test_pl_read_out_invariant_to_column_centering():
+    # the partial likelihood is invariant to column shifts (a constant in eta
+    # cancels in every risk-set ratio), so the read-out needs no centering
+    # handling: implicit sparse pre-centering and dense eager pre-centering both
+    # reproduce the uncentered read-out exactly.
+    rng = np.random.default_rng(9)
+    n, p, causal = 250, 6, 1
+    X, time, event = _sim_sparse_survival(rng, n, p, causal)
+    offset = 0.3 * rng.normal(size=n)
+    warm = np.zeros(p)
+
+    raw = cox_poisson.prep_data(X, event_time=time, event_type=event, center=False)
+    dense_c = cox_poisson.prep_data(X, event_time=time, event_type=event, center=True)
+    sparse_c = cox_poisson.prep_data(
+        jsparse.BCOO.fromdense(X), event_time=time, event_type=event, center=True
+    )
+    out_raw = cox_poisson._pl_fit(raw, offset, warm, 1.0)
+    for other in (dense_c, sparse_c):
+        out = cox_poisson._pl_fit(other, offset, warm, 1.0)
+        for a, b in zip(out, out_raw, strict=True):
+            np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-8)
+
+
+def test_profiled_baseline_bcoo_end_to_end_matches_dense():
+    # engine-level: the default (profiled-baseline) schedule accepts BCOO designs
+    # and reproduces the dense fit -- selection, PIPs and effect sizes.
+    rng = np.random.default_rng(8)
+    n, p, causal = 400, 10, 3
+    X, time, event = _sim_sparse_survival(rng, n, p, causal)
+
+    dd = cox_poisson.prep_data(X, event_time=time, event_type=event, center=False)
+    ds = cox_poisson.prep_data(
+        jsparse.BCOO.fromdense(X), event_time=time, event_type=event
+    )
+    fd = fit_ibss(dd, cox_poisson.initialize_state(dd, L=2),
+                  cox_poisson.default_schedule(), max_iter=50)
+    fs = fit_ibss(ds, cox_poisson.initialize_state(ds, L=2),
+                  cox_poisson.default_schedule(), max_iter=50)
+    assert _pip(fs, causal) > 0.9
+    assert causal in _tops(fs)
+    assert _tops(fs) == _tops(fd)
+    for es, ed in zip(fs.single_effects, fd.single_effects, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(es.alpha), np.asarray(ed.alpha), atol=1e-6
+        )
+        np.testing.assert_allclose(np.asarray(es.mu), np.asarray(ed.mu), atol=1e-6)
 
 
 def test_cox_poisson_no_shared_intercept():

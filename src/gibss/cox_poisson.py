@@ -43,7 +43,9 @@ The BASELINE TREATMENT is the Cox instance of the intercept-treatment axis
                 (I_PL = sum_k d_k Var_{R_k}(x) <= I_cond; the gap is risk-set
                 mean-centering, the many-intercepts H0b^2/H00). This IS partial-
                 likelihood semantics: per-feature quantities match cox.py. The
-                default (the field's convention for Cox); dense X only for now.
+                default (the field's convention for Cox). Dense and BCOO designs
+                both work; the sparse read-out rides cox.py's support-bucket
+                kernel, so cost scales with nnz.
 
 Because profiled-baseline subsumes any per-feature intercept (the PL is invariant
 to it), kernel="profile"/"vi_profile" are refused under baseline="profiled" -- use
@@ -63,11 +65,15 @@ import jax
 from . import glm
 from .cox import (
     FixedCoxContext,
+    SparseCoxStaticContext,
     _cox_objective_gradient_hessian_sorted,
+    _cox_sparse_objective_gradient_hessian,
     _is_bcoo,
     _normalize_survival_response,
     _suffix_sum,
     prepare_fixed_cox_context,
+    prepare_sparse_cox_dynamic_context,
+    prepare_sparse_cox_static_context,
 )
 from .engine import Schedule, replace_effect_in_gibss_state
 from .linear import LinearData
@@ -93,6 +99,10 @@ class CoxPoissonData(LinearData):
     # column_center come from LinearData -- including its `op` property, so dense
     # pre-centering and sparse implicit centering work unchanged.
     fixed: FixedCoxContext = None  # sorted-time context for the Breslow step
+    # per-column support buckets aligned to sorted rows (BCOO only): the static half
+    # of cox.py's sparse partial-likelihood kernel, used by the profiled-baseline
+    # read-out. None for dense X.
+    sparse_static: SparseCoxStaticContext | None = None
 
 
 def prep_data(X, y=None, *, event_time=None, event_type=None, center=None):
@@ -104,12 +114,16 @@ def prep_data(X, y=None, *, event_time=None, event_type=None, center=None):
         y, event_time=event_time, event_type=event_type
     )
     ld = glm.prep_data(X, jnp.asarray(event_type, dtype=float), center=center)
+    fixed = prepare_fixed_cox_context(event_time, event_type)
     return CoxPoissonData(
         X=ld.X,
         y=ld.y,
         obs_variance=ld.obs_variance,
         column_center=ld.column_center,
-        fixed=prepare_fixed_cox_context(event_time, event_type),
+        fixed=fixed,
+        sparse_static=(
+            prepare_sparse_cox_static_context(ld.X, fixed) if _is_bcoo(ld.X) else None
+        ),
     )
 
 
@@ -160,16 +174,19 @@ def update_breslow_step(data, state):
 
 
 def _pl_fit(data, offset, mu, prior_variance, newton_steps: int = 3):
-    """Per-feature PARTIAL-likelihood read-out via cox.py's sorted per-column
-    kernel. The incoming mu (the shared-baseline working mode) is first POLISHED to
-    the per-feature PL MAP by a few ridge-Newton steps -- the working mode is only
-    the PL mode at the alternation fixed point of ITS OWN feature; other features'
-    modes sit slightly off because their baseline was anchored at the shared
-    predictor. Returns (mu, dll, precision): dll = PL(mu_j) - PL(0) (the fully
-    PROFILED loglik difference -- the baseline re-profiles along the whole b-axis,
-    unlike the working-Poisson curve, conditional on one shared Breslow hazard) and
+    """Per-feature PARTIAL-likelihood read-out via cox.py's per-column kernels
+    (sorted dense columns, or support buckets for BCOO). The incoming mu (the
+    shared-baseline working mode) is first POLISHED to the per-feature PL MAP by a
+    few ridge-Newton steps -- the working mode is only the PL mode at the
+    alternation fixed point of ITS OWN feature; other features' modes sit slightly
+    off because their baseline was anchored at the shared predictor. Returns
+    (mu, dll, precision): dll = PL(mu_j) - PL(0) (the fully PROFILED loglik
+    difference -- the baseline re-profiles along the whole b-axis, unlike the
+    working-Poisson curve, conditional on one shared Breslow hazard) and
     precision = sum_k d_k Var_{R(t_k)}(x_j) + 1/pv (Schur curvature: risk-set
     mean-centering of x)."""
+    if _is_bcoo(data.X):
+        return _pl_fit_sparse(data, offset, mu, prior_variance, newton_steps)
     fixed = data.fixed
     x_sorted = jnp.asarray(data.X)[fixed.order]
     off_sorted = jnp.asarray(offset)[fixed.order]
@@ -189,6 +206,58 @@ def _pl_fit(data, offset, mu, prior_variance, newton_steps: int = 3):
     return mu, ll - ll0, -hess + ipv, ll0
 
 
+def _pl_fit_sparse(data, offset, mu, prior_variance, newton_steps: int = 3):
+    """BCOO twin of the dense read-out: the same ridge-Newton polish and PL Laplace
+    read-out, on cox.py's padded per-column support buckets (risk sums = the
+    offset-only base + suffix corrections on each column's support, so cost scales
+    with nnz, not n*p). The PL is invariant to column shifts, so implicit
+    pre-centering (`column_center`) needs no handling here -- the risk-set
+    mean-centering in the gradient absorbs it. The dynamic context's null loglik is
+    the beta = 0 partial likelihood at this offset: exactly the per-SER pl_null."""
+    fixed = data.fixed
+    static = data.sparse_static
+    dynamic = prepare_sparse_cox_dynamic_context(jnp.asarray(offset), fixed)
+    ipv = 1.0 / prior_variance
+    mu = jnp.asarray(mu)
+    p = data.X.shape[1]
+    out_mu = jnp.zeros(p, dtype=mu.dtype)
+    out_ll = jnp.zeros(p, dtype=mu.dtype)
+    out_prec = jnp.zeros(p, dtype=mu.dtype)
+
+    def one(rows, vals, mask, s_off, s_base, s_evt, b):
+        def pieces(b):
+            return _cox_sparse_objective_gradient_hessian(
+                b, rows, vals, mask, s_off, s_base, s_evt, fixed, dynamic
+            )
+
+        for _ in range(newton_steps):  # ridge-Newton polish to the per-feature MAP
+            _, g, h = pieces(b)
+            b = b - (g - b * ipv) / (h - ipv)
+        ll, _, h = pieces(b)
+        return b, ll, h
+
+    for rows_g, vals_g, mask_g, cols_g in zip(
+        static.row_groups,
+        static.val_groups,
+        static.mask_groups,
+        static.col_groups,
+        strict=False,
+    ):
+        safe_rows = jnp.where(mask_g, rows_g, 0)
+        s_off = jnp.where(mask_g, dynamic.offset_sorted[safe_rows], 0.0)
+        s_base = jnp.where(mask_g, dynamic.base_exp_sorted[safe_rows], 0.0)
+        s_evt = jnp.where(mask_g, fixed.event_sorted[safe_rows], 0.0)
+        b, ll, hess = jax.vmap(one)(
+            rows_g, vals_g, mask_g, s_off, s_base, s_evt, mu[cols_g]
+        )
+        out_mu = out_mu.at[cols_g].set(b)
+        out_ll = out_ll.at[cols_g].set(ll)
+        out_prec = out_prec.at[cols_g].set(-hess + ipv)
+
+    ll0 = dynamic.null_log_likelihood
+    return out_mu, out_ll - ll0, out_prec, ll0
+
+
 def update_effect_index_step(data, l, state):
     """The PROFILED-BASELINE effect update: glm's effect update + the partial-
     likelihood read-out. The working fit (shared baseline) supplies the mode -- its
@@ -200,13 +269,7 @@ def update_effect_index_step(data, l, state):
     kernel uses, so per-feature quantities match the dedicated stack: the Schur/
     profiled curvature instead of the conditional diagonal. Under a Smoothed
     response the read-out is the mean-predictor PL (the offset-smoothing enters the
-    fit, not the read-out) -- an approximation, documented. Dense X only: use
-    default_schedule(baseline="shared") for BCOO."""
-    if _is_bcoo(data.X):
-        raise ValueError(
-            "the profiled-baseline read-out is dense-only; build the schedule with "
-            "cox_poisson.default_schedule(baseline='shared') for BCOO designs."
-        )
+    fit, not the read-out) -- an approximation, documented."""
     effect = state.single_effects[l]
     fs = state.family_state
     if fs.intercept == "profiled":
@@ -268,16 +331,16 @@ def default_schedule(baseline: str = "profiled") -> Schedule:
     `baseline` selects the Cox instance of the intercept-treatment axis (see the
     module docstring): "profiled" (default) = per-feature baseline profiling via
     the PL read-out -- partial-likelihood semantics, Schur curvature, matches
-    cox.py, dense X only; "shared" = one baseline anchored at the total predictor
-    -- the shared-intercept analog, conditional curvature, sparse-capable, and the
-    variant under which kernel="profile"/"vi_profile" are meaningful; "null" = the
-    baseline frozen at the b = 0 Nelson-Aalen estimate, never refreshed -- the
-    SCORE analysis (per-feature score at 0 == PL score == log-rank numerator)."""
+    cox.py, dense or BCOO; "shared" = one baseline anchored at the total predictor
+    -- the shared-intercept analog, conditional curvature, and the variant under
+    which kernel="profile"/"vi_profile" are meaningful; "null" = the baseline
+    frozen at the b = 0 Nelson-Aalen estimate, never refreshed -- the SCORE
+    analysis (per-feature score at 0 == PL score == log-rank numerator)."""
     if baseline not in ("profiled", "shared", "null"):
         raise ValueError(
             f"unknown baseline {baseline!r}; use 'profiled' (partial-likelihood "
-            f"semantics, dense), 'shared' (shared-intercept analog, sparse-capable) "
-            f"or 'null' (frozen Nelson-Aalen: the score analysis)"
+            f"semantics), 'shared' (shared-intercept analog) or 'null' (frozen "
+            f"Nelson-Aalen: the score analysis)"
         )
     s = glm.default_schedule()
     if baseline == "null":
