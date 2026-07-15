@@ -16,7 +16,7 @@ import gibss.linear
 import gibss.glm
 import gibss.cox
 import gibss.twogroup
-from gibss.response import Bernoulli, JJFixed, Smoothed
+from gibss.response import GH, Bernoulli, JJFixed, Smoothed
 
 from gseasusie.gene_data import (
     align,
@@ -499,17 +499,22 @@ def fit_gsea_susie_logistic(
 
     l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
 
-    # variant -> (response, kernel) on the maintained gibss.glm stack (no legacy):
+    # variant -> (response, kernel) on the maintained gibss.glm stack (no legacy).
+    # Both integrate over the offset (shared intercept + inter-effect messages,
+    # o ~ N(mean, var)) rather than plugging in a point offset, and both decouple the
+    # intercept and take the Chebyshev row background for sparse (BCOO):
     #   local_jj  = classic localjj: Gaussian q + fixed-tilt JJ bound -> conjugate "jj"
-    #               kernel (monotone; the intercept-invariant sparse path uses no
-    #               centering, so center=False).
-    #   quadrature = free-form q + GH tail -> "quad" kernel; on sparse (BCOO) the
-    #               column-centered read-out (glm_center_ser) decouples the intercept.
-    # Both take the shared intercept and the Chebyshev row background for BCOO.
+    #               kernel (monotone); the JJ bound integrates the offset, and the
+    #               per-feature tilt is intercept-invariant, so center=False.
+    #   quadrature = free-form q + GH tail -> "quad" kernel with GH offset integration
+    #               (Smoothed(Bernoulli, GH): the marginal read-out, matching local_jj);
+    #               decoupled on sparse by the column-centered kernel (glm_center_ser),
+    #               so center=True.
     if variant == "local_jj":
         response, kernel, center = Smoothed(Bernoulli(), JJFixed()), "jj", False
     elif variant == "quadrature":
-        response, kernel, center = Bernoulli(), "quad", True
+        # GH order matches the front-door offset_quadrature_points default.
+        response, kernel, center = Smoothed(Bernoulli(), GH(15)), "quad", True
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
