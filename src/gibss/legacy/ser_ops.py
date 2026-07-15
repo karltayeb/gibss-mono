@@ -60,6 +60,16 @@ def _smooth_cumulant(eta, ov, offset_integration="taylor"):
     if offset_integration == "none":
         return A, p, w
     if offset_integration == "taylor":
+        # 2nd-order Taylor of the cumulant in o around E[o], at the MEAN predictor
+        # `eta` = bx + E[o] (the argument here already includes E[o]). So E_o[·] depends
+        # only on the offset's first two moments: E[o] (in `eta`) and V[o] = `ov`. With
+        # c = 1/2 V[o] and the logistic identities A'=p, A''=w, A'''=w*u, A''''=w*(u^2-2w)
+        # (u = 1-2p), the returned (A~, s~, w~) are exactly, all evaluated at eta=bx+E[o]:
+        #   A~ = E_o[A]   = A  + 1/2 V[o] A''    = A + c*w
+        #   s~ = E_o[A']  = A' + 1/2 V[o] A'''   = p + c*w*u
+        #   w~ = E_o[A''] = A''+ 1/2 V[o] A''''  = w + c*w*(u^2 - 2w)
+        # i.e. the derivatives wrt eta of A~; the x, x^2 chain-rule factors (d/db = x d/deta)
+        # are applied downstream by local_moment(1, y - s~) and local_moment(2, w~).
         c = 0.5 * ov
         u = 1.0 - 2.0 * p
         return A + c * w, p + c * w * u, w + c * w * (u * u - 2.0 * w)
