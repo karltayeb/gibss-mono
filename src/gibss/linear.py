@@ -176,9 +176,9 @@ def _empty_effect(p: int, prior_variance: float) -> LinearEffect:
         alpha=pi,
         pi=pi,
         prior_variance=float(prior_variance),
-        feature_log_evidence=zeros,
+        feature_log_marginal=zeros,
         marginal_log_likelihood=0.0,
-        null_log_likelihood=0.0,
+        null_log_marginal=0.0,
         kl=np.inf,
     )
 
@@ -223,9 +223,9 @@ def fit_linear_ser(data, tau, offset, prior_variance) -> BaseSERState:
         alpha=alpha,
         pi=np.full(p, 1.0 / p),
         prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
+        feature_log_marginal=feature_log_evidence,
         marginal_log_likelihood=float(marginal_log_likelihood),
-        null_log_likelihood=float(linear_null_log_likelihood(data, tau, offset)),
+        null_log_marginal=float(linear_null_log_likelihood(data, tau, offset)),
         kl=float(kl),
     )
 

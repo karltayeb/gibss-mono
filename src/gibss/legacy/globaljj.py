@@ -205,9 +205,9 @@ def fit_global_jj_ser(
         alpha=alpha,
         pi=jnp.full(p, 1.0 / p),
         prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
+        feature_log_marginal=feature_log_evidence,
         marginal_log_likelihood=float(marginal_log_likelihood),
-        null_log_likelihood=float(null_ll),
+        null_log_marginal=float(null_ll),
         kl=float(kl),
     )
     if profile:

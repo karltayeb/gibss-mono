@@ -208,9 +208,16 @@ class BaseSERState:
     alpha: np.ndarray
     pi: np.ndarray
     prior_variance: float
-    feature_log_evidence: np.ndarray
-    marginal_log_likelihood: float
-    null_log_likelihood: float
+    # feature_log_marginal[j]: the per-feature log marginal likelihood of the
+    # single-effect model with the effect on feature j (b_j integrated under the
+    # prior), on the kernel's own scale. null_log_marginal: the SER's b=0 null log
+    # marginal on the SAME scale (feature-independent -> one scalar per SER). Their
+    # difference is the per-feature log Bayes factor (`feature_log_bf`); any
+    # eta-free base-measure constant cancels, so the BF is comparable across
+    # kernels. See `response_ser.build_ser_state` and notes on the evidence contract.
+    feature_log_marginal: np.ndarray
+    marginal_log_likelihood: float  # SER-level: logsumexp(feature_log_marginal) - log p
+    null_log_marginal: float
     kl: float
 
     def get_cs(self, coverage: float = 0.95) -> tuple[int, ...]:
@@ -223,6 +230,19 @@ class BaseSERState:
     @property
     def pip(self) -> jnp.ndarray:
         return self.alpha
+
+    @property
+    def feature_log_bf(self) -> jnp.ndarray:
+        """Per-feature log Bayes factor vs the SER's b=0 null:
+        feature_log_marginal - null_log_marginal. Comparable across kernels by
+        construction (both terms live on one scale, so the base measure cancels)."""
+        return jnp.asarray(self.feature_log_marginal) - self.null_log_marginal
+
+    @property
+    def ser_log_bf(self) -> float:
+        """SER-level log Bayes factor vs b=0: marginal_log_likelihood -
+        null_log_marginal."""
+        return self.marginal_log_likelihood - self.null_log_marginal
 
     def message(self, data: Any) -> Message:
         # operator-native: mean = X coef, var = (X^2) coef2 - mean^2. The design's
@@ -267,13 +287,14 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
         return jnp.sum(self.alpha * self.mu, axis=0)
 
     @property
+    def ser_log_bf(self) -> jnp.ndarray:
+        """Per-effect SER log Bayes factor vs b=0 (comparable across kernels)."""
+        return jnp.array([e.ser_log_bf for e in self.single_effects])
+
+    # historical alias (gseasusie and older callers read this name)
+    @property
     def ser_log_bayes_factor(self) -> jnp.ndarray:
-        return jnp.array(
-            [
-                e.marginal_log_likelihood - e.null_log_likelihood
-                for e in self.single_effects
-            ]
-        )
+        return self.ser_log_bf
 
     def get_credible_sets(self, coverage: float = 0.95) -> tuple[tuple[int, ...], ...]:
         """Returns indices of credible sets for all components."""

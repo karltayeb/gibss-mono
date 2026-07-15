@@ -74,7 +74,7 @@ def test_dense_cox_update_returns_finite_ser():
     assert effect.var.shape == (X.shape[1],)
     assert np.all(np.isfinite(effect.mu))
     assert np.all(np.isfinite(effect.var))
-    assert np.all(np.isfinite(effect.feature_log_evidence))
+    assert np.all(np.isfinite(effect.feature_log_marginal))
     assert np.isclose(np.sum(effect.alpha), 1.0)
     assert effect.kl >= 0
 

@@ -34,6 +34,7 @@ from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (r
 from .operators import CenteredOperator, as_operator
 from .response import Bernoulli, ResponseModel, Smoothed
 from .response_ser import (
+    _profile_null,
     build_ser_state,
     glm_center_ser,
     glm_jj_ser,
@@ -243,13 +244,39 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     return mu, var, log_bf, coefficient_kl
 
 
+def _null_log_marginal(fs, aux, offset):
+    """The SER's b=0 null log marginal on the KERNEL'S OWN scale -- the reference
+    feature_log_bf is measured against, stored so the absolute marginal is
+    recoverable and cross-kernel comparable. Feature-independent (one scalar per
+    SER). Recomputed here (cheap: one terms pass, or a scalar Newton when profiled)
+    rather than threaded out of every kernel; matches exactly the baseline each
+    kernel subtracts internally:
+      profiled -> the profiled null (b0 maximized at b=0), _profile_null;
+      jj       -> the b=0 fixed-tilt bound (xi0^2 = offset^2 + ov);
+      else     -> the b=0 loglik summed over all rows (smoothed at variance ov)."""
+    response = fs.response
+    offset = jnp.asarray(offset)
+    if fs.intercept == "profiled":
+        return float(_profile_null(response, offset, aux)[1])
+    if fs.kernel == "jj":
+        y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
+        ov = jnp.asarray(ov)
+        xi0 = jnp.sqrt(jnp.maximum(offset**2 + ov, 1e-12))
+        return float(jnp.sum(response.terms(offset, (y, ov, xi0))[0]))
+    return float(jnp.sum(response.terms(offset, aux)[0]))
+
+
 def _fit_effect(data, fs, aux, offset, prior_variance, order):
-    # log_bf is relative to the b=0 fit at `offset`; alpha only needs the relative
-    # feature evidence, so use log_bf directly (the shared baseline cancels).
+    # The kernel returns feature_log_bf relative to the b=0 null at `offset`; pair it
+    # with that null's marginal so the state stores the absolute per-feature marginal
+    # (comparable across kernels). alpha only needs the relative BF (shift-invariant).
     mu, var, log_bf, coefficient_kl = _fit_effect_raw(
         data, fs, aux, offset, prior_variance, order
     )
-    return build_ser_state(mu, var, log_bf, coefficient_kl, prior_variance)
+    null = _null_log_marginal(fs, aux, offset)
+    return build_ser_state(
+        mu, var, log_bf, coefficient_kl, prior_variance, null_log_marginal=null
+    )
 
 
 def _freeze_null_intercept(data, state):

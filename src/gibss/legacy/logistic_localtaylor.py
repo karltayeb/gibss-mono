@@ -148,9 +148,9 @@ def _fit_effect(data, offset, prior_variance, fs, offset_var, offset_integration
     return LocalTaylorEffect(
         mu=mu, var=var, alpha=alpha, pi=jnp.full(p, 1.0 / p),
         prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
+        feature_log_marginal=feature_log_evidence,
         marginal_log_likelihood=float(log_norm - jnp.log(float(p))),
-        null_log_likelihood=float(null_ll), kl=float(kl),
+        null_log_marginal=float(null_ll), kl=float(kl),
         coefficient_kl=coefficient_kl, mode=mu, hessian=h, b0=b0,
     )
 
@@ -173,8 +173,8 @@ def _empty_effect(p: int) -> LocalTaylorEffect:
     return LocalTaylorEffect(
         mu=jnp.zeros(p), var=jnp.full(p, 1.0), alpha=jnp.full(p, 1.0 / p),
         pi=jnp.full(p, 1.0 / p), prior_variance=1.0,
-        feature_log_evidence=jnp.zeros(p), marginal_log_likelihood=0.0,
-        null_log_likelihood=0.0, kl=0.0, coefficient_kl=jnp.zeros(p),
+        feature_log_marginal=jnp.zeros(p), marginal_log_likelihood=0.0,
+        null_log_marginal=0.0, kl=0.0, coefficient_kl=jnp.zeros(p),
         mode=jnp.zeros(p), hessian=jnp.ones(p), b0=jnp.zeros(p),
     )
 

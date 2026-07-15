@@ -195,7 +195,7 @@ def test_pl_curvature_matches_cox_univariate_variance():
     dc = cox.prep_data(X, event_time=time, event_type=event)
     mu_cox, var_cox, _ = cox.fit_univariate_cox_regression(dc, np.zeros(n), 1.0)
     d = cox_poisson.prep_data(X, event_time=time, event_type=event)
-    mu_pl, _, prec = cox_poisson._pl_fit(d, np.zeros(n), np.asarray(mu_cox), 1.0)
+    mu_pl, _, prec, _ = cox_poisson._pl_fit(d, np.zeros(n), np.asarray(mu_cox), 1.0)
     np.testing.assert_allclose(np.asarray(mu_pl), np.asarray(mu_cox), atol=1e-10)
     np.testing.assert_allclose(1.0 / np.asarray(prec), np.asarray(var_cox), atol=1e-10)
 

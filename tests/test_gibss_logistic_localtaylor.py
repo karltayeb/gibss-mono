@@ -78,8 +78,8 @@ def test_offset_shift_invariance_profile():
     off = jnp.asarray(rng.normal(size=400) * 0.3)
     a = LT.fit_local_taylor_ser(data, off, 1.0, profile=True)
     b = LT.fit_local_taylor_ser(data, off + 1.7, 1.0, profile=True)
-    bfa = np.asarray(a.feature_log_evidence) - a.null_log_likelihood
-    bfb = np.asarray(b.feature_log_evidence) - b.null_log_likelihood
+    bfa = np.asarray(a.feature_log_marginal) - a.null_log_marginal
+    bfb = np.asarray(b.feature_log_marginal) - b.null_log_marginal
     np.testing.assert_allclose(bfa, bfb, atol=1e-4)
 
 

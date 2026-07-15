@@ -189,9 +189,9 @@ def _fit_centered_ser(data, tau, offset, prior_variance, cbar, W) -> IRLSCentere
         alpha=alpha,
         pi=np.full(p, 1.0 / p),
         prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
+        feature_log_marginal=feature_log_evidence,
         marginal_log_likelihood=float(log_norm - np.log(p)),
-        null_log_likelihood=float(null_ll),
+        null_log_marginal=float(null_ll),
         kl=kl,
         cbar=cbar,
     )
@@ -303,7 +303,7 @@ def _relogistic_null(effect, data, fs, message_mean, offset_var=0.0, offset_inte
     # / PIPs. We don't add it back, so marginal_log_likelihood is that ELBO minus this
     # constant. Inference (BF, PIPs, CS) is exact; only the absolute marginal is offset.
     p = np.asarray(effect.mu).shape[0]
-    log_bf = np.asarray(effect.feature_log_evidence) - float(effect.null_log_likelihood)
+    log_bf = np.asarray(effect.feature_log_bf)
     glm_eta = jnp.asarray(fs.glm_offset) + jnp.asarray(message_mean)  # b=0 GLM predictor
     ov = None if offset_integration == "none" else offset_var
     null_ll = float(profiled_logistic_null(
@@ -311,8 +311,8 @@ def _relogistic_null(effect, data, fs, message_mean, offset_var=0.0, offset_inte
     fle = null_ll + log_bf
     return replace(
         effect,
-        feature_log_evidence=fle,
-        null_log_likelihood=null_ll,
+        feature_log_marginal=fle,
+        null_log_marginal=null_ll,
         marginal_log_likelihood=float(linear._logsumexp(fle) - np.log(p)),
     )
 

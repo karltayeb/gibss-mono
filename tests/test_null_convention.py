@@ -40,7 +40,7 @@ def _fit(mod, X, y, **kw):
         mod.default_schedule(), max_iter=40,
     )
     e = st.single_effects[0]
-    return float(e.null_log_likelihood), float(np.asarray(st.ser_log_bayes_factor)[0])
+    return float(e.null_log_marginal), float(np.asarray(st.ser_log_bayes_factor)[0])
 
 
 @pytest.mark.parametrize(

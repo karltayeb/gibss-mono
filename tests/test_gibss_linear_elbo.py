@@ -175,11 +175,11 @@ def test_fit_linear_ser_returns_normalized_posterior_and_consistent_kl():
 
     np.testing.assert_allclose(effect.mu, expected_mu)
     np.testing.assert_allclose(effect.var, expected_var)
-    np.testing.assert_allclose(effect.feature_log_evidence, expected_log_evidence)
+    np.testing.assert_allclose(effect.feature_log_marginal, expected_log_evidence)
     np.testing.assert_allclose(effect.alpha, expected_alpha)
     assert np.isclose(np.sum(effect.alpha), 1.0)
     assert np.isclose(effect.marginal_log_likelihood, log_norm - np.log(p))
-    assert np.isclose(effect.null_log_likelihood, linear_null_log_likelihood(data, tau, offset))
+    assert np.isclose(effect.null_log_marginal, linear_null_log_likelihood(data, tau, offset))
     assert np.isclose(effect.kl, expected_kl)
 
 
@@ -313,12 +313,12 @@ def test_update_effect_index_step_matches_closed_form_ser_update(effect_index):
     np.testing.assert_allclose(actual_effect.var, expected_effect.var)
     np.testing.assert_allclose(actual_effect.alpha, expected_effect.alpha)
     np.testing.assert_allclose(
-        actual_effect.feature_log_evidence, expected_effect.feature_log_evidence
+        actual_effect.feature_log_marginal, expected_effect.feature_log_marginal
     )
     assert np.isclose(
         actual_effect.marginal_log_likelihood, expected_effect.marginal_log_likelihood
     )
-    assert np.isclose(actual_effect.null_log_likelihood, expected_effect.null_log_likelihood)
+    assert np.isclose(actual_effect.null_log_marginal, expected_effect.null_log_marginal)
     assert np.isclose(actual_effect.kl, expected_effect.kl)
 
 

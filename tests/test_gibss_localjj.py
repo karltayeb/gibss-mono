@@ -74,7 +74,7 @@ def test_fit_local_jj_ser_returns_normalized_ser_state():
     assert np.all(np.isfinite(effect.mu))
     assert np.all(np.isfinite(effect.var))
     assert np.isfinite(effect.kl)
-    assert np.isfinite(effect.null_log_likelihood)
+    assert np.isfinite(effect.null_log_marginal)
     assert np.isfinite(effect.marginal_log_likelihood)
 
 

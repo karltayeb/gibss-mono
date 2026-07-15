@@ -290,35 +290,41 @@ def glm_profile_ser(
 def build_ser_state(
     mu,
     var,
-    feature_log_evidence,
+    feature_log_bf,
     coefficient_kl,
     prior_variance,
-    null_log_likelihood=0.0,
+    null_log_marginal=0.0,
 ):
-    """Assemble a `BaseSERState` from per-feature glm_ser outputs.
+    """Assemble a `BaseSERState` from a kernel's per-feature outputs.
 
-    `feature_log_evidence` is the per-feature log-evidence (log-BF up to a shared,
-    feature-independent baseline that cancels in `alpha`). Shared by every family
-    built on `glm_ser`; only how the evidence baseline / null are defined differs.
-    """
-    p = feature_log_evidence.shape[0]
-    log_norm = jax.nn.logsumexp(feature_log_evidence)
-    alpha = jnp.exp(feature_log_evidence - log_norm)
+    `feature_log_bf[j]` is the per-feature log Bayes factor RELATIVE to the SER's
+    b=0 null at the current offset (what the kernels natively produce and what
+    `alpha` needs). `null_log_marginal` is that same b=0 null's log marginal (a
+    per-SER scalar, on the kernel's scale). The state stores the ABSOLUTE marginal
+    `feature_log_marginal = feature_log_bf + null_log_marginal` plus the null, so
+    `BaseSERState.feature_log_bf` recovers the input and the two stored terms are on
+    one scale (comparable across kernels). `alpha` is unchanged (softmax is
+    shift-invariant, so relative vs absolute makes no difference)."""
+    p = feature_log_bf.shape[0]
+    log_norm = jax.nn.logsumexp(feature_log_bf)
+    alpha = jnp.exp(feature_log_bf - log_norm)
     alpha = alpha / jnp.sum(alpha)
     log_pi = -jnp.log(float(p))
     kl = float(
         jnp.sum(alpha * (jnp.log(alpha + 1e-30) - log_pi))
         + jnp.sum(alpha * coefficient_kl)
     )
+    null_log_marginal = float(null_log_marginal)
+    feature_log_marginal = jnp.asarray(feature_log_bf) + null_log_marginal
     return BaseSERState(
         mu=mu,
         var=var,
         alpha=alpha,
         pi=jnp.full(p, 1.0 / p),
         prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
-        marginal_log_likelihood=float(log_norm - jnp.log(float(p))),
-        null_log_likelihood=float(null_log_likelihood),
+        feature_log_marginal=feature_log_marginal,
+        marginal_log_likelihood=float(log_norm - jnp.log(float(p)) + null_log_marginal),
+        null_log_marginal=null_log_marginal,
         kl=kl,
     )
 

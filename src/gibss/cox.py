@@ -565,9 +565,9 @@ def fit_cox_ser(
         alpha=alpha,
         pi=np.full(p, 1.0 / p),
         prior_variance=float(prior_variance),
-        feature_log_evidence=feature_log_evidence,
+        feature_log_marginal=feature_log_evidence,
         marginal_log_likelihood=marginal_log_likelihood,
-        null_log_likelihood=null_ll,
+        null_log_marginal=null_ll,
         kl=kl,
     )
 
@@ -581,9 +581,9 @@ def _empty_effect(p: int, prior_variance: float) -> CoxEffect:
         alpha=pi,
         pi=pi,
         prior_variance=float(prior_variance),
-        feature_log_evidence=zeros,
+        feature_log_marginal=zeros,
         marginal_log_likelihood=0.0,
-        null_log_likelihood=0.0,
+        null_log_marginal=0.0,
         kl=np.inf,
     )
 

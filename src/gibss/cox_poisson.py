@@ -185,8 +185,8 @@ def _pl_fit(data, offset, mu, prior_variance, newton_steps: int = 3):
     mu, ll, hess = jax.vmap(one)(x_sorted.T, jnp.asarray(mu))
     ll0, _, _ = _cox_objective_gradient_hessian_sorted(
         jnp.asarray(0.0), x_sorted[:, 0], off_sorted, fixed
-    )  # beta = 0: feature-independent PL null at this offset
-    return mu, ll - ll0, -hess + ipv
+    )  # beta = 0: feature-independent PL null at this offset (per-SER scalar)
+    return mu, ll - ll0, -hess + ipv, ll0
 
 
 def update_effect_index_step(data, l, state):
@@ -225,13 +225,17 @@ def update_effect_index_step(data, l, state):
     # PL read-out, polished to the per-feature PL MAP; the PL offset is the LOO
     # predictor WITHOUT the Breslow glm_offset (the PL has no baseline).
     ipv = 1.0 / effect.prior_variance
-    mu, dll, prec_pl = _pl_fit(
+    mu, dll, prec_pl, pl_null = _pl_fit(
         data, jnp.asarray(state.total_message.mean), mu, effect.prior_variance
     )
     v_pl = 1.0 / prec_pl
     log_bf = dll - 0.5 * mu**2 * ipv - 0.5 * jnp.log(effect.prior_variance * prec_pl)
     ckl = dll - 0.5 * (prec_pl - ipv) * v_pl - log_bf  # Laplace-consistent E_q[dll]
-    new_effect = build_ser_state(mu, v_pl, log_bf, ckl, effect.prior_variance)
+    # pl_null (PL at beta=0, per-SER) is the reference for log_bf, so the stored
+    # feature_log_marginal is the absolute partial-likelihood marginal.
+    new_effect = build_ser_state(
+        mu, v_pl, log_bf, ckl, effect.prior_variance, null_log_marginal=pl_null
+    )
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
