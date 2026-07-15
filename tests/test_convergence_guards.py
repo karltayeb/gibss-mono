@@ -14,6 +14,7 @@ from gibss.legacy.ser_ops import (
     local_irls,
     local_irls_centered,
     localjj_centered_ser,
+    localjj_ser,
     profile_ser,
     quadrature_ser,
 )
@@ -110,5 +111,19 @@ def test_glm_ser_does_not_diverge_on_separated_design():
     assert lbf_q > 0, f"strong enrichment must have positive logBF, got {lbf_q}"
     # quad (free-form q) and localjj (Gaussian q) approximate the same MAP; on a strong,
     # well-identified effect they agree closely -- a loose tol guards the sign/scale.
+    np.testing.assert_allclose(mu_q, mu_j, rtol=0.1)
+    np.testing.assert_allclose(lbf_q, lbf_j, rtol=0.1)
+
+
+def test_legacy_quadrature_ser_does_not_diverge_on_separated_design():
+    # Same guarantee for the LEGACY shared-intercept mode-finder (local_irls, via
+    # quadrature_ser) that the gseasusie pipeline runs for method="logistic". Undamped
+    # it overshot to mu ~ -150 / logBF ~ -2e4; pin sign+scale against localjj_ser.
+    op, y, offset = _separated_enrichment()
+    mu_q, _, lbf_q, _ = quadrature_ser(op, y, offset, 1.0, order=15)
+    mu_j, _, lbf_j = localjj_ser(op, y, offset, 1.0)
+    mu_q, lbf_q, mu_j, lbf_j = (float(np.asarray(v)[0]) for v in (mu_q, lbf_q, mu_j, lbf_j))
+    assert np.isfinite(mu_q) and np.isfinite(lbf_q)
+    assert mu_q > 0 and lbf_q > 0, f"enriched set must be positive, got mu={mu_q} logBF={lbf_q}"
     np.testing.assert_allclose(mu_q, mu_j, rtol=0.1)
     np.testing.assert_allclose(lbf_q, lbf_j, rtol=0.1)

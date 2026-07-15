@@ -822,7 +822,9 @@ def glm_center_ser(
     def body(state):
         b, _, it = state
         grad, curv = _grad_curv(b)
-        step = grad / curv  # MM/Fisher curvature (w >= 0) -> monotone
+        # Damp: undamped Fisher scoring overshoots to the wrong sign on a
+        # quasi-separated column (w -> 0); clip to +/-4 log-odds as in glm_ser.
+        step = jnp.clip(grad / curv, -4.0, 4.0)
         return b + step, jnp.max(jnp.abs(step)), it + 1
 
     b, _, _ = jax.lax.while_loop(

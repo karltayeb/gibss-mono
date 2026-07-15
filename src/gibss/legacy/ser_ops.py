@@ -163,7 +163,10 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
             _, s, w = _smooth_cumulant(eta, ov_e, offset_integration)
             grad = op.local_moment(1, y_e - s) - inv_pv * b
             curv = op.local_moment(2, w) + inv_pv
-            step = grad / curv
+            # Damp: undamped Fisher scoring overshoots to the wrong sign on a
+            # quasi-separated column (w -> 0), exiting on finite garbage. The +/-4
+            # log-odds clip matches local_irls_centered and glm_ser.
+            step = jnp.clip(grad / curv, -4.0, 4.0)
             return b + step, jnp.max(jnp.abs(step)), it + 1
 
         b, _, _ = jax.lax.while_loop(
@@ -210,7 +213,7 @@ def local_irls(op, y, offset, prior_variance, n_iter: int = 60, tol: float = 1e-
     def body(state):
         b, _, it = state
         grad, curv = _centered_grad_curv(b)
-        step = grad / curv
+        step = jnp.clip(grad / curv, -4.0, 4.0)  # damp: see raw branch above
         return b + step, jnp.max(jnp.abs(step)), it + 1
 
     b, _, _ = jax.lax.while_loop(
