@@ -161,6 +161,7 @@ def fit_glm_susie(
     offset=0.0,  # fixed per-row offset (Poisson exposure, etc.)
     prior_variance=1.0,
     estimate_prior_variance=True,
+    prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
     estimate_intercept=True,
     max_iter=100,
     tol=1e-4,
@@ -254,6 +255,7 @@ def fit_glm_susie(
             glm_offset=offset,
             estimate_intercept=estimate_intercept,
             estimate_prior_variance=estimate_prior_variance,
+            prior_variance_scale=prior_variance_scale,
             skl_tolerance=tol,
         ),
     )

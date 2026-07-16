@@ -58,6 +58,7 @@ class LinearFamilyState:
     min_residual_variance: float = 0.0
     estimate_residual_variance: bool = True
     estimate_prior_variance: bool = True
+    prior_variance_scale: float | None = None  # half-normal(sigma; s) MAP if set; None = MLE
     intercept: float = 0.0
     estimate_intercept: bool = True
     elbo_tolerance: float = 1e-3
@@ -245,8 +246,24 @@ def update_effect_index_step(data, l, state):
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
-def estimate_prior_variance(effect: BaseSERState) -> BaseSERState:
-    new_v0 = float(np.sum(effect.alpha * (effect.mu**2 + effect.var)))
+def estimate_prior_variance(effect: BaseSERState, scale: float | None = None) -> BaseSERState:
+    """Coordinate update of the SER prior variance from S = E_q[b^2].
+
+    `scale=None`: the type-II MLE, sigma^2 = S. `scale=s` (a float): the MAP under a
+    half-normal(0, s) prior on the prior STANDARD DEVIATION, sigma^2 = s*sqrt(s^2+S) - s^2.
+    That keeps a separated feature's sigma^2 FINITE -- a runaway S is damped to
+    sigma^2 ~ s*sqrt(S) instead of the MLE's sigma^2 = S -> infinity -- while PRESERVING
+    ARD: sigma^2 -> 0 as S -> 0 (near-null: ~S/2), so an irrelevant effect still prunes.
+    `s` is a regularization scale (weaker as s grows: sigma^2 -> S/2 as s -> infinity),
+    NOT a hard cap. The half-normal-on-sigma is a heavy (polynomial, lambda^-3/2) tail
+    on the precision lambda=1/sigma^2, unlike an inverse-gamma (Gamma-on-precision, an
+    exponential tail) which would floor sigma^2 above 0 and kill the pruning."""
+    S = float(np.sum(effect.alpha * (effect.mu**2 + effect.var)))
+    if scale is None:
+        new_v0 = S
+    else:
+        s = float(scale)
+        new_v0 = s * np.sqrt(s * s + S) - s * s
     new_v0 = max(new_v0, 1e-8)
     p = effect.alpha.size
     # var can be a hair negative from E[b^2]-E[b]^2 cancellation on a sharply
@@ -260,10 +277,11 @@ def estimate_prior_variance(effect: BaseSERState) -> BaseSERState:
 
 def update_prior_variance_index_step(data, l, state):
     del data
-    if not state.family_state.estimate_prior_variance:
+    fs = state.family_state
+    if not fs.estimate_prior_variance:
         return state
     effect = state.single_effects[l]
-    new_effect = estimate_prior_variance(effect)
+    new_effect = estimate_prior_variance(effect, getattr(fs, "prior_variance_scale", None))
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
@@ -359,6 +377,7 @@ def fit_linear_susie(
     L=5,  # int, or "auto" for greedy forward-selection (grows to max_L)
     prior_variance=1.0,
     estimate_prior_variance=True,
+    prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
     residual_variance=1.0,
     estimate_residual_variance=True,
     estimate_intercept=True,
@@ -386,6 +405,7 @@ def fit_linear_susie(
         prior_variance=prior_variance,
         family_state_kwargs=dict(
             estimate_prior_variance=bool(estimate_prior_variance),
+            prior_variance_scale=prior_variance_scale,
             residual_variance=residual_variance,
             estimate_residual_variance=bool(estimate_residual_variance),
             estimate_intercept=bool(estimate_intercept),

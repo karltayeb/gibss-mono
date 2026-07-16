@@ -68,6 +68,7 @@ class CoxEffect(BaseSERState):
 @dataclass(frozen=True, slots=True)
 class CoxFamilyState:
     estimate_prior_variance: bool = False
+    prior_variance_scale: float | None = None  # half-normal(sigma; s) MAP if set; None = MLE
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
 

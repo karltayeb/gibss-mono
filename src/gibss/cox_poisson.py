@@ -374,6 +374,7 @@ def fit_cox_susie(
     method="poisson",
     prior_variance=1.0,
     estimate_prior_variance=True,
+    prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
     max_iter=100,
     tol=1e-4,
     max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
@@ -409,7 +410,8 @@ def fit_cox_susie(
 
     greedy = L == "auto"
     L_alloc = (min(20, X.shape[1]) if max_L is None else int(max_L)) if greedy else int(L)
-    fs_kwargs = dict(estimate_prior_variance=bool(estimate_prior_variance), skl_tolerance=tol)
+    fs_kwargs = dict(estimate_prior_variance=bool(estimate_prior_variance),
+                     prior_variance_scale=prior_variance_scale, skl_tolerance=tol)
     if method == "poisson":
         if offset_integration == "none":
             response = Poisson()
