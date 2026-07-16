@@ -74,49 +74,60 @@ def fit_ibss_greedy(
     schedule: "Schedule",
     *,
     tol_L: float = 1.0,
+    stride: int = 1,
     max_L: int | None = None,
     max_iter: int = 50,
 ) -> Any:
-    """Greedy forward-selection of L: grow the active effect set one SER at a time.
+    """Greedy forward-selection of L: grow the active effect set until it stops helping.
 
-    Each round activates one more effect and refits (warm-started from the previous
-    converged fit -- an inactive effect contributes a zero message, so this is nearly
-    free), then stops when adding an effect no longer helps. "Helps" is measured by
-    the stopping rule *any active effect went null*: a warm-started effect that lands
-    null, OR an existing effect whose prior variance was estimated to ~0 (which need
-    NOT be the last one -- hence checking all k, not just the newest). Nullness is
-    `ser_log_bf < tol_L`, defined for every family, so this is family-agnostic and
-    needs no ELBO.
+    Each round activates `stride` more effects and refits (warm-started from the
+    previous fit -- an inactive effect contributes a zero message, so this is nearly
+    free). It stops at the first round where *any active effect is null*, then KEEPS
+    the non-null effects and drops the rest. A null effect is one that never found
+    signal, OR an existing effect whose prior variance was estimated to ~0 -- both show
+    up as `ser_log_bf < tol_L` (defined for every family, so this is family-agnostic
+    and needs no ELBO). SuSiE coordinate ascent lets a batch of freshly activated
+    effects each grab their own residual and the surplus go null, so the survivors are
+    already the right fit -- which is why dropping the nulls is exact at any `stride`,
+    in ~n_effects/stride fits.
 
-    Returns the last fit in which every active effect was non-null, TRUNCATED to those
-    effects -- so a returned state never carries a null effect (and its pip/alpha are
-    not diluted by empty trailing effects). `init_state` must be pre-allocated with at
-    least `max_L` empty effects; the front doors do this.
+    Returns a state carrying only the kept (non-null) effects, with `total_message`
+    rebuilt from them -- so it never carries a null effect and its pip/alpha are not
+    diluted. The dropped effects may be interspersed (a middle effect can zero out),
+    so this is a filter, not a prefix truncation. `init_state` must be pre-allocated
+    with at least `max_L` empty effects; the front doors do this.
     """
     n_alloc = len(init_state.single_effects)
     cap = n_alloc if max_L is None else min(int(max_L), n_alloc)
+    stride = max(1, int(stride))
+
     state = init_state
-    best = None
-    kept = 0
-    for k in range(1, cap + 1):
+    k = 0
+    keep: list[int] = []
+    while True:
+        k = min(k + stride, cap)
         # fresh update_order for the grown active set + clear `converged` so the
         # warm-started fit actually runs (fit_ibss only seeds update_order when empty).
         state = replace(state, update_order=(), converged=False)
-        state = fit_ibss(
-            data, state, schedule, active_effects=range(k), max_iter=max_iter
-        )
-        went_null = any(
-            float(state.single_effects[j].ser_log_bf) < tol_L for j in range(k)
-        )
-        if went_null:
+        state = fit_ibss(data, state, schedule, active_effects=range(k), max_iter=max_iter)
+        keep = [
+            j for j in range(k) if float(state.single_effects[j].ser_log_bf) >= tol_L
+        ]
+        if len(keep) < k or k == cap:  # a null appeared, or we filled the cap
             break
-        best, kept = state, k
-    if best is None:  # even a single effect is null -> return the 1-effect fit
-        best, kept = state, 1
+    if not keep:  # nothing cleared tol_L -> return the single strongest effect (floor)
+        keep = [max(range(k), key=lambda j: float(state.single_effects[j].ser_log_bf))]
+
+    # rebuild the message from the kept effects only (dropped nulls were fit, so their
+    # contribution is still in state.total_message; init_state.total_message is zero).
+    tm = init_state.total_message
+    for j in keep:
+        tm = tm.add(state.single_effects[j].message(data))
     return replace(
-        best,
-        single_effects=list(best.single_effects[:kept]),
-        update_order=tuple(range(kept)),
+        state,
+        single_effects=[state.single_effects[j] for j in keep],
+        total_message=tm,
+        update_order=tuple(range(len(keep))),
     )
 
 

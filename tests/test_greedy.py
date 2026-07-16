@@ -73,3 +73,31 @@ def test_no_signal_returns_single_effect():
     y = jnp.asarray(rng.normal(size=400))
     out = fit_linear_susie(X, y, L="auto", max_iter=100)
     assert len(out.single_effects) == 1
+
+
+@pytest.mark.parametrize("stride", [1, 2, 3, 5, 10])
+def test_stride_recovers_same_exact_L(stride):
+    # a coarse stride must reach the same exact answer as one-at-a-time (drop-nulls).
+    X, y, cols = _linear_design(7, seed=0, n=800, p=50)
+    d = linear.prep_data(X, y)
+    st = linear.initialize_state(d, L=20, family_state_kwargs={
+        "estimate_prior_variance": True, "elbo_tolerance": 1e-5})
+    out = fit_ibss_greedy(d, st, linear.default_schedule(), tol_L=1.0, stride=stride,
+                          max_L=20, max_iter=200)
+    assert len(out.single_effects) == 7
+    found = sorted(int(np.argmax(np.asarray(e.alpha))) for e in out.single_effects)
+    assert found == cols
+    assert np.all(np.asarray(out.ser_log_bf) >= 1.0)  # no null kept
+
+
+def test_stride_message_rebuilt_consistently():
+    # dropping (possibly interspersed) null effects must leave a state whose
+    # total_message is the sum of the kept effects -> pip/posterior stay valid.
+    X, y, _ = _linear_design(4, seed=2, n=600, p=30)
+    d = linear.prep_data(X, y)
+    st = linear.initialize_state(d, L=15)
+    out = fit_ibss_greedy(d, st, linear.default_schedule(), stride=5, max_L=15, max_iter=200)
+    assert len(out.single_effects) == 4
+    tm = np.asarray(out.total_message.mean)
+    rebuilt = sum(np.asarray(e.message(d).mean) for e in out.single_effects)
+    np.testing.assert_allclose(tm, rebuilt, atol=1e-10)

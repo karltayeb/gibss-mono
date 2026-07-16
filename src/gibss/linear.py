@@ -368,6 +368,7 @@ def fit_linear_susie(
     tol=1e-4,
     max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
     tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
+    stride=1,  # L="auto": effects added per round (>1 brackets coarsely, still exact)
     schedule=None,
 ):
     """One-call linear (Gaussian) SuSiE. Returns the fitted `GIBSSState`.
@@ -393,5 +394,5 @@ def fit_linear_susie(
     )
     sched = schedule if schedule is not None else default_schedule()
     if greedy:
-        return fit_ibss_greedy(data, state, sched, tol_L=tol_L, max_L=L_alloc, max_iter=max_iter)
+        return fit_ibss_greedy(data, state, sched, tol_L=tol_L, stride=stride, max_L=L_alloc, max_iter=max_iter)
     return fit_ibss(data, state, sched, max_iter=max_iter)

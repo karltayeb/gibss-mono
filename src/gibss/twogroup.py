@@ -398,6 +398,7 @@ def fit_twogroup_susie(
     center=True,
     max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
     tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
+    stride=1,  # L="auto": effects added per round (>1 brackets coarsely, still exact)
 ):
     """One-call two-group enrichment SuSiE. Returns the fitted GIBSSState:
     `state.single_effects[l].alpha` are the PIPs, `state.family_state.f0/f1` the
@@ -419,7 +420,7 @@ def fit_twogroup_susie(
     )
     if greedy:
         return fit_ibss_greedy(data, state, default_schedule(), tol_L=tol_L,
-                               max_L=L_alloc, max_iter=max_iter)
+                               stride=stride, max_L=L_alloc, max_iter=max_iter)
     return fit_ibss(data, state, default_schedule(), max_iter=max_iter)
 
 
