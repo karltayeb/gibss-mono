@@ -86,6 +86,7 @@ class GLMFamilyState:
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
     prior_variance_scale: float | None = None  # half-normal(sigma; s) MAP if set; None = MLE
+    max_prior_variance: float | None = None  # hard ceiling on sigma^2 (None = no cap)
     quadrature_order: int = 15
     # kernel: HOW b is integrated per column (orthogonal to `intercept`; the old
     # compound names profile/vi_profile/linear_profile were kernel x intercept pairs):

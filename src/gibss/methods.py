@@ -162,6 +162,7 @@ def fit_glm_susie(
     prior_variance=1.0,
     estimate_prior_variance=True,
     prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
+    max_prior_variance=None,  # hard ceiling on the estimated prior variance (None = no cap)
     estimate_intercept=True,
     max_iter=100,
     tol=1e-4,
@@ -256,6 +257,7 @@ def fit_glm_susie(
             estimate_intercept=estimate_intercept,
             estimate_prior_variance=estimate_prior_variance,
             prior_variance_scale=prior_variance_scale,
+            max_prior_variance=max_prior_variance,
             skl_tolerance=tol,
         ),
     )

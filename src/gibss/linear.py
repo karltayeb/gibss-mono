@@ -59,6 +59,7 @@ class LinearFamilyState:
     estimate_residual_variance: bool = True
     estimate_prior_variance: bool = True
     prior_variance_scale: float | None = None  # half-normal(sigma; s) MAP if set; None = MLE
+    max_prior_variance: float | None = None  # hard ceiling on sigma^2 (None = no cap)
     intercept: float = 0.0
     estimate_intercept: bool = True
     elbo_tolerance: float = 1e-3
@@ -246,7 +247,11 @@ def update_effect_index_step(data, l, state):
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
-def estimate_prior_variance(effect: BaseSERState, scale: float | None = None) -> BaseSERState:
+def estimate_prior_variance(
+    effect: BaseSERState,
+    scale: float | None = None,
+    max_prior_variance: float | None = None,
+) -> BaseSERState:
     """Coordinate update of the SER prior variance from S = E_q[b^2].
 
     `scale=None`: the type-II MLE, sigma^2 = S. `scale=s` (a float): the MAP under a
@@ -257,13 +262,19 @@ def estimate_prior_variance(effect: BaseSERState, scale: float | None = None) ->
     `s` is a regularization scale (weaker as s grows: sigma^2 -> S/2 as s -> infinity),
     NOT a hard cap. The half-normal-on-sigma is a heavy (polynomial, lambda^-3/2) tail
     on the precision lambda=1/sigma^2, unlike an inverse-gamma (Gamma-on-precision, an
-    exponential tail) which would floor sigma^2 above 0 and kill the pruning."""
+    exponential tail) which would floor sigma^2 above 0 and kill the pruning.
+
+    `max_prior_variance`: a hard ceiling, sigma^2 <- min(sigma^2, max_prior_variance),
+    applied AFTER the MLE/half-normal update. Orthogonal to `scale` (composes, or use
+    alone with scale=None); leaves ARD untouched (the min never raises a small sigma^2)."""
     S = float(np.sum(effect.alpha * (effect.mu**2 + effect.var)))
     if scale is None:
         new_v0 = S
     else:
         s = float(scale)
         new_v0 = s * np.sqrt(s * s + S) - s * s
+    if max_prior_variance is not None:
+        new_v0 = min(new_v0, float(max_prior_variance))
     new_v0 = max(new_v0, 1e-8)
     p = effect.alpha.size
     # var can be a hair negative from E[b^2]-E[b]^2 cancellation on a sharply
@@ -281,7 +292,11 @@ def update_prior_variance_index_step(data, l, state):
     if not fs.estimate_prior_variance:
         return state
     effect = state.single_effects[l]
-    new_effect = estimate_prior_variance(effect, getattr(fs, "prior_variance_scale", None))
+    new_effect = estimate_prior_variance(
+        effect,
+        getattr(fs, "prior_variance_scale", None),
+        getattr(fs, "max_prior_variance", None),
+    )
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
@@ -378,6 +393,7 @@ def fit_linear_susie(
     prior_variance=1.0,
     estimate_prior_variance=True,
     prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
+    max_prior_variance=None,  # hard ceiling on the estimated prior variance (None = no cap)
     residual_variance=1.0,
     estimate_residual_variance=True,
     estimate_intercept=True,
@@ -406,6 +422,7 @@ def fit_linear_susie(
         family_state_kwargs=dict(
             estimate_prior_variance=bool(estimate_prior_variance),
             prior_variance_scale=prior_variance_scale,
+            max_prior_variance=max_prior_variance,
             residual_variance=residual_variance,
             estimate_residual_variance=bool(estimate_residual_variance),
             estimate_intercept=bool(estimate_intercept),

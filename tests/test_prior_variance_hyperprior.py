@@ -45,6 +45,22 @@ def test_ard_preserved_and_damps_runaway():
     assert v < 0.05 * S  # heavily damped vs the MLE (sigma^2 = S)
 
 
+def test_max_prior_variance_hard_cap():
+    # cap kicks in only above the ceiling; ARD (small sigma^2) is left untouched
+    e = _effect([3.0, 0.0], [0.5, 0.1], [1.0, 0.0])
+    S = 3.0**2 + 0.5  # 9.5, the uncapped MLE
+    assert estimate_prior_variance(e, None, 4.0).prior_variance == pytest.approx(4.0)   # capped
+    assert estimate_prior_variance(e, None, 100.0).prior_variance == pytest.approx(S)   # no effect
+    # composes with the half-normal: min(half-normal MAP, cap)
+    s = 2.0
+    hn = s * np.sqrt(s * s + S) - s * s
+    assert estimate_prior_variance(e, s, 100.0).prior_variance == pytest.approx(hn)
+    assert estimate_prior_variance(e, s, 1.0).prior_variance == pytest.approx(1.0)
+    # a null effect stays near 0 regardless of the cap (min never raises it)
+    null = _effect([0.0, 0.0], [1e-9, 1e-9], [0.5, 0.5])
+    assert estimate_prior_variance(null, None, 4.0).prior_variance < 1e-3
+
+
 def _separated_logistic(seed=0):
     rng = np.random.default_rng(seed)
     n = 2000
@@ -71,3 +87,12 @@ def test_front_door_damps_separated_sigma2():
                                   max_iter=100).single_effects[0].prior_variance)
     assert damped3 < mle      # the hyperprior regularizes the runaway down
     assert damped1 < damped3  # smaller scale -> stronger shrinkage
+
+
+def test_front_door_max_prior_variance_caps_sigma2():
+    X, y = _separated_logistic()
+    mle = float(fit_glm_susie(X, y, L=1, method="logistic", max_iter=100).single_effects[0].prior_variance)
+    capped = float(fit_glm_susie(X, y, L=1, method="logistic", max_prior_variance=2.0,
+                                 max_iter=100).single_effects[0].prior_variance)
+    assert mle > 2.0          # the separated MLE runs past the ceiling
+    assert capped <= 2.0 + 1e-9  # and is clamped to it
