@@ -116,19 +116,50 @@ def _normalize_survival_response(
     return event_time, event_type
 
 
+def coarsen_event_time(event_time, time_bins):
+    """Bucket event times into groups (Breslow ties) to shrink the number of DISTINCT
+    event times D. The Cox per-feature read-out costs ~O(p*D) (each of p features is
+    evaluated against the D distinct-event-time risk sets), so fewer distinct times is
+    a near-linear speedup; the returned times are an order-preserving coarsening, so
+    the risk-set structure -- hence the fitted model -- is an approximation.
+
+    `time_bins`:
+      None            -- exact, no coarsening (returns event_time unchanged);
+      int N           -- N equal-observation quantile bins (simple, robust default);
+      1-D array edges -- arbitrary bin edges in event-time units (finer where you want
+                         resolution, e.g. denser near the events -- the caller's choice).
+    Bin indices are used as the coarsened times (only the ordering matters to Cox)."""
+    if time_bins is None:
+        return event_time
+    et = np.asarray(event_time, dtype=float)
+    if np.ndim(time_bins) == 0:
+        n_bins = int(time_bins)
+        if n_bins < 1:
+            raise ValueError(f"time_bins must be >= 1, got {time_bins!r}")
+        if n_bins >= np.unique(et).size:
+            return event_time  # already at/below the requested resolution: no-op
+        edges = np.quantile(et, np.linspace(0.0, 1.0, n_bins + 1)[1:-1])
+    else:
+        edges = np.asarray(time_bins, dtype=float)
+    return np.searchsorted(edges, et, side="right").astype(float)
+
+
 def prep_data(
     X: Any,
     y: np.ndarray | jax.Array | None = None,
     *,
     event_time: np.ndarray | jax.Array | None = None,
     event_type: np.ndarray | jax.Array | None = None,
+    time_bins=None,
 ) -> CoxData:
-    """Prepare Cox data and fixed/static contexts."""
+    """Prepare Cox data and fixed/static contexts. `time_bins` coarsens the event times
+    to speed up the fit -- see `coarsen_event_time`."""
     if not _is_bcoo(X):
         X = jnp.asarray(X)
     event_time, event_type = _normalize_survival_response(
         y, event_time=event_time, event_type=event_type
     )
+    event_time = coarsen_event_time(event_time, time_bins)
     fixed = prepare_fixed_cox_context(event_time, event_type)
     sparse_static_context = (
         prepare_sparse_cox_static_context(X, fixed) if _is_bcoo(X) else None

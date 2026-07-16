@@ -71,6 +71,7 @@ from .cox import (
     _is_bcoo,
     _normalize_survival_response,
     _suffix_sum,
+    coarsen_event_time,
     prepare_fixed_cox_context,
     prepare_sparse_cox_dynamic_context,
     prepare_sparse_cox_static_context,
@@ -106,14 +107,16 @@ class CoxPoissonData(LinearData):
     sparse_static: SparseCoxStaticContext | None = None
 
 
-def prep_data(X, y=None, *, event_time=None, event_type=None, center=None):
+def prep_data(X, y=None, *, event_time=None, event_type=None, center=None, time_bins=None):
     """Package (X, survival response) for the glm engine. The design is handled
     exactly like `glm.prep_data` (dense pre-centering etc.); the survival response is
     `y = (n, 2) [time, event]` or `event_time=`/`event_type=`, as in `cox.prep_data`.
-    `data.y` becomes the event indicator (the Poisson working response)."""
+    `data.y` becomes the event indicator (the Poisson working response). `time_bins`
+    coarsens the event times to speed up the fit -- see `cox.coarsen_event_time`."""
     event_time, event_type = _normalize_survival_response(
         y, event_time=event_time, event_type=event_type
     )
+    event_time = coarsen_event_time(event_time, time_bins)
     ld = glm.prep_data(X, jnp.asarray(event_type, dtype=float), center=center)
     fixed = prepare_fixed_cox_context(event_time, event_type)
     return CoxPoissonData(
@@ -376,6 +379,7 @@ def fit_cox_susie(
     max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
     tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
     stride=1,  # L="auto": effects added per round (>1 brackets coarsely, still exact)
+    time_bins=None,  # coarsen event times to speed the fit (see cox.coarsen_event_time)
     # method="poisson" axes (ignored by "partial", which profiles the baseline exactly):
     baseline="profiled",
     offset_integration="none",
@@ -415,7 +419,8 @@ def fit_cox_susie(
             raise ValueError(
                 f"unknown offset_integration {offset_integration!r}; use 'none' or 'gh'"
             )
-        data = prep_data(X, y, event_time=event_time, event_type=event_type, center=center)
+        data = prep_data(X, y, event_time=event_time, event_type=event_type,
+                         center=center, time_bins=time_bins)
         state = initialize_state(
             data, L=L_alloc, response=response, prior_variance=prior_variance,
             family_state_kwargs=fs_kwargs,
@@ -434,7 +439,8 @@ def fit_cox_susie(
                 "likelihood profiles the baseline out exactly); `baseline` applies "
                 "to method='poisson' only."
             )
-        data = cox.prep_data(X, y, event_time=event_time, event_type=event_type)
+        data = cox.prep_data(X, y, event_time=event_time, event_type=event_type,
+                             time_bins=time_bins)
         state = cox.initialize_state(
             data, L=L_alloc, prior_variance=prior_variance, family_state_kwargs=fs_kwargs
         )
