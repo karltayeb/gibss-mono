@@ -504,6 +504,14 @@ def fit_gsea_susie(gene_sets, response, *, model=None, **kwargs):
     )
 
 
+def _resolve_L(L, n_features):
+    """gseasusie's default L is min(10, n_features); pass through "auto" (greedy
+    forward-selection, handled by the gibss front door) and explicit ints unchanged."""
+    if L == "auto":
+        return "auto"
+    return min(10, n_features) if L is None else int(L)
+
+
 def _reject_model(model, type_name, fixed):
     if model is not None and model != fixed:
         raise ValueError(
@@ -560,7 +568,7 @@ def fit_gsea_susie_logistic(
 
     X = sparse.BCOO.fromdense(jnp.asarray(membership, dtype=jnp.float32))
     y_jax = jnp.asarray(y, dtype=jnp.float32)
-    l_model = min(10, X.shape[1]) if L is None else int(L)
+    l_model = _resolve_L(L, X.shape[1])
 
     state = fit_glm_susie(
         X,
@@ -613,7 +621,7 @@ def fit_gsea_susie_cox(
     )
     X = sparse.BCOO.fromdense(jnp.asarray(prepared["membership"], dtype=jnp.float32))
     y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)  # (n, 2) [time, event]
-    l_model = min(10, X.shape[1]) if L is None else int(L)
+    l_model = _resolve_L(L, X.shape[1])
 
     state = fit_cox_susie(
         X,
@@ -662,7 +670,7 @@ def fit_gsea_susie_linear(
     )
     X = sparse.BCOO.fromdense(jnp.asarray(prepared["membership"], dtype=jnp.float32))
     y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)
-    l_model = min(10, X.shape[1]) if L is None else int(L)
+    l_model = _resolve_L(L, X.shape[1])
 
     state = fit_linear_susie(
         X,
@@ -777,7 +785,7 @@ def fit_gsea_susie_twogroup(
     X_model = sparse.BCOO.fromdense(membership)
     y = np.asarray(prepared["y"], dtype=np.float64)
     bhat, se = y[:, 0], y[:, 1]
-    l_model = min(10, X_model.shape[1]) if L is None else int(L)
+    l_model = _resolve_L(L, X_model.shape[1])
 
     f0_obj = _resolve_distribution_spec(
         f0 or {"function": "point_mass", "kwargs": {"value": 0.0}}

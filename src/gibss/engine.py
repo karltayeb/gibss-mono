@@ -68,6 +68,58 @@ def fit_ibss(
     return state
 
 
+def fit_ibss_greedy(
+    data: Any,
+    init_state: Any,
+    schedule: "Schedule",
+    *,
+    tol_L: float = 1.0,
+    max_L: int | None = None,
+    max_iter: int = 50,
+) -> Any:
+    """Greedy forward-selection of L: grow the active effect set one SER at a time.
+
+    Each round activates one more effect and refits (warm-started from the previous
+    converged fit -- an inactive effect contributes a zero message, so this is nearly
+    free), then stops when adding an effect no longer helps. "Helps" is measured by
+    the stopping rule *any active effect went null*: a warm-started effect that lands
+    null, OR an existing effect whose prior variance was estimated to ~0 (which need
+    NOT be the last one -- hence checking all k, not just the newest). Nullness is
+    `ser_log_bf < tol_L`, defined for every family, so this is family-agnostic and
+    needs no ELBO.
+
+    Returns the last fit in which every active effect was non-null, TRUNCATED to those
+    effects -- so a returned state never carries a null effect (and its pip/alpha are
+    not diluted by empty trailing effects). `init_state` must be pre-allocated with at
+    least `max_L` empty effects; the front doors do this.
+    """
+    n_alloc = len(init_state.single_effects)
+    cap = n_alloc if max_L is None else min(int(max_L), n_alloc)
+    state = init_state
+    best = None
+    kept = 0
+    for k in range(1, cap + 1):
+        # fresh update_order for the grown active set + clear `converged` so the
+        # warm-started fit actually runs (fit_ibss only seeds update_order when empty).
+        state = replace(state, update_order=(), converged=False)
+        state = fit_ibss(
+            data, state, schedule, active_effects=range(k), max_iter=max_iter
+        )
+        went_null = any(
+            float(state.single_effects[j].ser_log_bf) < tol_L for j in range(k)
+        )
+        if went_null:
+            break
+        best, kept = state, k
+    if best is None:  # even a single effect is null -> return the 1-effect fit
+        best, kept = state, 1
+    return replace(
+        best,
+        single_effects=list(best.single_effects[:kept]),
+        update_order=tuple(range(kept)),
+    )
+
+
 def _execute_sweep(data, state, schedule):
     state = _apply_steps(schedule.before_sweep, data, state)
 

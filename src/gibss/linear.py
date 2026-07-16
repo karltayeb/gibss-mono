@@ -16,6 +16,7 @@ from .engine import (
     Schedule,
     add_message_index_step,
     fit_ibss,
+    fit_ibss_greedy,
     replace_effect_in_gibss_state,
     subtract_message_index_step,
 )
@@ -355,7 +356,7 @@ def fit_linear_susie(
     X,
     y,
     *,
-    L=5,
+    L=5,  # int, or "auto" for greedy forward-selection (grows to max_L)
     prior_variance=1.0,
     estimate_prior_variance=True,
     residual_variance=1.0,
@@ -365,6 +366,8 @@ def fit_linear_susie(
     center=None,
     max_iter=100,
     tol=1e-4,
+    max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
+    tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
     schedule=None,
 ):
     """One-call linear (Gaussian) SuSiE. Returns the fitted `GIBSSState`.
@@ -373,10 +376,12 @@ def fit_linear_susie(
     FIXED variance): here the residual variance is estimated by default. `obs_variance`
     gives known per-observation weights (Var(y_i) = residual_variance * obs_variance_i).
     """
+    greedy = L == "auto"
+    L_alloc = (min(20, X.shape[1]) if max_L is None else int(max_L)) if greedy else int(L)
     data = prep_data(X, y, center=center, obs_variance=obs_variance)
     state = initialize_state(
         data,
-        L=L,
+        L=L_alloc,
         prior_variance=prior_variance,
         family_state_kwargs=dict(
             estimate_prior_variance=bool(estimate_prior_variance),
@@ -387,4 +392,6 @@ def fit_linear_susie(
         ),
     )
     sched = schedule if schedule is not None else default_schedule()
+    if greedy:
+        return fit_ibss_greedy(data, state, sched, tol_L=tol_L, max_L=L_alloc, max_iter=max_iter)
     return fit_ibss(data, state, sched, max_iter=max_iter)

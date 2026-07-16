@@ -18,7 +18,7 @@ family, Gaussian q without a smoothing scheme).
 from __future__ import annotations
 
 from . import glm
-from .engine import fit_ibss
+from .engine import fit_ibss, fit_ibss_greedy
 from .linear import is_bcoo
 from .response import (
     GH,
@@ -145,7 +145,7 @@ def _resolve(cfg):
 def fit_glm_susie(
     X,
     y,
-    L=5,
+    L=5,  # int, or "auto" for greedy forward-selection (grows to max_L)
     method=None,  # name in PRESETS; None = plain axes below
     *,
     # model axes (None = "not specified": preset value, then _DEFAULTS)
@@ -164,6 +164,8 @@ def fit_glm_susie(
     estimate_intercept=True,
     max_iter=100,
     tol=1e-4,
+    max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
+    tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
     schedule=None,  # escape hatch; defaults to glm.default_schedule()
 ):
     """Fit a GLM SuSiE. Returns the fitted `GIBSSState`.
@@ -236,9 +238,11 @@ def fit_glm_susie(
     init = (
         glm.initialize_state_mean_message if cfg["_mean_message"] else glm.initialize_state
     )
+    greedy = L == "auto"
+    L_alloc = (min(20, X.shape[1]) if max_L is None else int(max_L)) if greedy else int(L)
     state = init(
         data,
-        L=L,
+        L=L_alloc,
         response=response,
         prior_variance=prior_variance,
         family_state_kwargs=dict(
@@ -252,9 +256,7 @@ def fit_glm_susie(
             skl_tolerance=tol,
         ),
     )
-    return fit_ibss(
-        data,
-        state,
-        schedule if schedule is not None else glm.default_schedule(),
-        max_iter=max_iter,
-    )
+    sched = schedule if schedule is not None else glm.default_schedule()
+    if greedy:
+        return fit_ibss_greedy(data, state, sched, tol_L=tol_L, max_L=L_alloc, max_iter=max_iter)
+    return fit_ibss(data, state, sched, max_iter=max_iter)

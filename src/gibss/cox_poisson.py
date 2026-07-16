@@ -75,7 +75,7 @@ from .cox import (
     prepare_sparse_cox_dynamic_context,
     prepare_sparse_cox_static_context,
 )
-from .engine import Schedule, fit_ibss, replace_effect_in_gibss_state
+from .engine import Schedule, fit_ibss, fit_ibss_greedy, replace_effect_in_gibss_state
 from .linear import LinearData
 from .response import GH, Poisson, ResponseModel, Smoothed
 from .response_ser import build_ser_state
@@ -367,12 +367,14 @@ def fit_cox_susie(
     event_type=None,
     *,
     y=None,
-    L=5,
+    L=5,  # int, or "auto" for greedy forward-selection (grows to max_L)
     method="poisson",
     prior_variance=1.0,
     estimate_prior_variance=True,
     max_iter=100,
     tol=1e-4,
+    max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
+    tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
     # method="poisson" axes (ignored by "partial", which profiles the baseline exactly):
     baseline="profiled",
     offset_integration="none",
@@ -400,6 +402,8 @@ def fit_cox_susie(
     """
     from . import cox  # cox does not import cox_poisson: safe
 
+    greedy = L == "auto"
+    L_alloc = (min(20, X.shape[1]) if max_L is None else int(max_L)) if greedy else int(L)
     fs_kwargs = dict(estimate_prior_variance=bool(estimate_prior_variance), skl_tolerance=tol)
     if method == "poisson":
         if offset_integration == "none":
@@ -412,7 +416,7 @@ def fit_cox_susie(
             )
         data = prep_data(X, y, event_time=event_time, event_type=event_type, center=center)
         state = initialize_state(
-            data, L=L, response=response, prior_variance=prior_variance,
+            data, L=L_alloc, response=response, prior_variance=prior_variance,
             family_state_kwargs=fs_kwargs,
         )
         sched = schedule if schedule is not None else default_schedule(baseline=baseline)
@@ -431,10 +435,12 @@ def fit_cox_susie(
             )
         data = cox.prep_data(X, y, event_time=event_time, event_type=event_type)
         state = cox.initialize_state(
-            data, L=L, prior_variance=prior_variance, family_state_kwargs=fs_kwargs
+            data, L=L_alloc, prior_variance=prior_variance, family_state_kwargs=fs_kwargs
         )
         sched = schedule if schedule is not None else cox.default_schedule()
     else:
         raise ValueError(f"unknown method {method!r}; use 'poisson' or 'partial'")
 
+    if greedy:
+        return fit_ibss_greedy(data, state, sched, tol_L=tol_L, max_L=L_alloc, max_iter=max_iter)
     return fit_ibss(data, state, sched, max_iter=max_iter)

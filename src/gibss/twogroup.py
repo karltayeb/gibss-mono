@@ -70,6 +70,7 @@ from .engine import (
     add_message_index_step,
     check_alpha_skl_convergence_step,
     fit_ibss,
+    fit_ibss_greedy,
     replace_effect_in_gibss_state,
     snapshot_state_step,
     subtract_message_index_step,
@@ -388,13 +389,15 @@ def fit_twogroup_susie(
     se,
     f0=None,
     f1=None,
-    L=5,
+    L=5,  # int, or "auto" for greedy forward-selection (grows to max_L)
     max_iter=50,
     response=None,
     family_state_kwargs=None,
     prior_variance=1.0,
     nullweight=1.0,
     center=True,
+    max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
+    tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
 ):
     """One-call two-group enrichment SuSiE. Returns the fitted GIBSSState:
     `state.single_effects[l].alpha` are the PIPs, `state.family_state.f0/f1` the
@@ -406,12 +409,17 @@ def fit_twogroup_susie(
     features); dense X is centered eagerly, BCOO X implicitly via the chebyshev row
     background. It is the two-group's only intercept-decoupling route, since the
     profiled intercept is degenerate here."""
+    greedy = L == "auto"
+    L_alloc = (min(20, X.shape[1]) if max_L is None else int(max_L)) if greedy else int(L)
     data = prep_data(X, bhat=bhat, se=se, center=center)
     state = initialize_state(
-        data, L=L, f0=f0, f1=f1, response=response,
+        data, L=L_alloc, f0=f0, f1=f1, response=response,
         family_state_kwargs=family_state_kwargs, prior_variance=prior_variance,
         nullweight=nullweight,
     )
+    if greedy:
+        return fit_ibss_greedy(data, state, default_schedule(), tol_L=tol_L,
+                               max_L=L_alloc, max_iter=max_iter)
     return fit_ibss(data, state, default_schedule(), max_iter=max_iter)
 
 
