@@ -62,6 +62,12 @@ class LinearFamilyState:
     max_prior_variance: float | None = None  # hard ceiling on sigma^2 (None = no cap)
     intercept: float = 0.0
     estimate_intercept: bool = True
+    # Power-posterior tempering: the effect SER sees precision tau/temperature, i.e. the
+    # Gaussian loglik scaled by beta = 1/temperature (>1 flattens toward the prior; <1
+    # peaks toward least squares; dropping it traces the forward-stagewise path). The WLS
+    # intercept and the residual-variance MLE are scale-invariant to tau, so they are
+    # untouched -- temperature is an orthogonal "sharpness" knob on the effects.
+    temperature: float = 1.0
     elbo_tolerance: float = 1e-3
     elbo_history: list[float] = field(default_factory=lambda: [-np.inf])
 
@@ -237,7 +243,13 @@ def fit_linear_ser(data, tau, offset, prior_variance) -> BaseSERState:
 
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
-    tau = 1.0 / (state.family_state.residual_variance * _obs_variance(data))
+    # tau/temperature = beta * precision: tempers the Gaussian loglik (score AND curvature
+    # AND the null marginal, which fit_linear_ser derives from this same tau) by beta.
+    tau = 1.0 / (
+        state.family_state.temperature
+        * state.family_state.residual_variance
+        * _obs_variance(data)
+    )
     new_effect = fit_linear_ser(
         data,
         tau,
@@ -397,6 +409,7 @@ def fit_linear_susie(
     residual_variance=1.0,
     estimate_residual_variance=True,
     estimate_intercept=True,
+    temperature=1.0,  # power-posterior: scale the loglik by 1/temperature (>1 -> prior/shrink; <1 -> least squares; dropping it traces the forward-stagewise path)
     obs_variance=None,
     center=None,
     max_iter=100,
@@ -411,7 +424,19 @@ def fit_linear_susie(
     The dedicated linear stack (NOT `fit_glm_susie(family='gaussian')`, which holds a
     FIXED variance): here the residual variance is estimated by default. `obs_variance`
     gives known per-observation weights (Var(y_i) = residual_variance * obs_variance_i).
+
+    `temperature` tempers the Gaussian likelihood to the power `1/temperature` (the effect
+    SER sees precision `tau/temperature`; the prior, the WLS intercept, and the
+    residual-variance MLE are untouched). `>1` flattens it toward the prior (effects shrink
+    toward 0); `<1` peaks it toward least squares. Dropping the temperature grows effects
+    in from zero in marginal-evidence order -- forward-stagewise regression (paired with
+    `L="auto"`); `1.0` is the ordinary posterior. With `temperature != 1` fix the prior
+    variance (`estimate_prior_variance=False`) for a clean path -- see `response.Tempered`.
     """
+    if not (temperature > 0):
+        raise ValueError(
+            f"temperature must be > 0 (the loglik is scaled by 1/temperature); got {temperature!r}"
+        )
     greedy = L == "auto"
     L_alloc = (min(20, X.shape[1]) if max_L is None else int(max_L)) if greedy else int(L)
     data = prep_data(X, y, center=center, obs_variance=obs_variance)
@@ -426,6 +451,7 @@ def fit_linear_susie(
             residual_variance=residual_variance,
             estimate_residual_variance=bool(estimate_residual_variance),
             estimate_intercept=bool(estimate_intercept),
+            temperature=float(temperature),
             elbo_tolerance=tol,
         ),
     )

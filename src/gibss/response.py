@@ -45,6 +45,8 @@ __all__ = [
     "JJEnvelope",
     "JJFixed",
     "Smoothed",
+    "Tempered",
+    "base_response",
     "Bernoulli",
     "TwoGroupMarginal",
     "Poisson",
@@ -338,6 +340,77 @@ class Smoothed(ResponseModel):
 
     def terms(self, eta, aux):
         return self.smoother.terms(self.base, eta, aux)
+
+
+@dataclass(frozen=True)
+class Tempered(ResponseModel):
+    """Power-posterior tempering: scales the log-likelihood by `beta = 1 / temperature`,
+    so the per-feature SER integrates `p(y | b)^beta p(b)` (the PRIOR is untouched --
+    `prior_variance` lives inside the kernels, not in `terms`). Because temperature
+    multiplies `(loglik, grad, weight)` UNIFORMLY, it:
+
+      - commutes with offset smoothing (`beta E_o[A] = E_o[beta A]`), so tempering the
+        SMOOTHED loglik and smoothing the tempered loglik agree -- this wrapper sits
+        OUTERMOST, `Tempered(Smoothed(base, scheme))`, and the engine's smoother
+        introspection looks through it via `base_response`;
+      - preserves the Newton/MM majorization `weight >= -loglik''` for `beta > 0`, so it
+        composes with every kernel and family (the conjugate `jj`/`vi` bounds included);
+      - leaves a quadratic loglik quadratic, so `quadratic` (hence the kernel choice) is
+        just the base's.
+
+    Holding the prior fixed, temperature traces a regularization path from the prior to
+    the MLE, and DROPPING it is forward-stagewise regression: effects grow in from zero,
+    in order of marginal evidence (alpha sharpens onto the strongest feature and its
+    magnitude grows as T falls). See `engine.fit_ibss_greedy` for the greedy loop it
+    rides on. The two endpoints:
+
+      - `temperature -> inf` FLATTENS the likelihood: the per-feature posterior reverts
+        toward the prior, so every effect shrinks toward 0 -- maximal regularization, the
+        START of the path. A single effect's mean is then `~ beta * sigma0^2 *
+        (x . residual)`, a vanishing step proportional to the marginal correlation.
+      - `temperature -> 0` PEAKS the likelihood: the posterior concentrates at the MLE and
+        alpha collapses onto the single strongest feature -- the unpenalized greedy
+        (matching-pursuit / forward-stepwise) endpoint.
+      - `temperature = 1` is the ordinary posterior (this wrapper is then a no-op; the
+        front doors skip it).
+
+    NOTE (empirical-Bayes interaction): tempering also scales the evidence used to
+    estimate the prior variance and, in `fit_ibss_greedy`, the `ser_log_bf` compared to
+    `tol_L`. For a clean stagewise path, fix the prior variance
+    (`estimate_prior_variance=False`) and, if using `L="auto"`, read `tol_L` on the
+    tempered (~beta) scale.
+    """
+
+    base: ResponseModel
+    temperature: float = 1.0
+
+    def __post_init__(self):
+        if not (self.temperature > 0):
+            raise ValueError(
+                f"temperature must be > 0 (beta = 1/temperature scales the loglik); "
+                f"got {self.temperature!r}"
+            )
+
+    @property
+    def quadratic(self):
+        # a uniformly scaled quadratic is still quadratic -> same kernel as the base
+        return self.base.quadratic
+
+    def terms(self, eta, aux):
+        ll, g, w = self.base.terms(eta, aux)
+        beta = 1.0 / self.temperature
+        return beta * ll, beta * g, beta * w
+
+
+def base_response(response):
+    """The underlying response beneath a `Tempered` wrapper (identity otherwise).
+
+    Type-introspection sites -- is this `Smoothed`? which `Smoother`? -- unwrap with this
+    so `Tempered` can sit outermost without their needing to know it exists. The paired
+    `.terms` VALUE calls stay on the passed-in `response`, which is where the temperature
+    scaling lives; only the static type/scheme queries unwrap.
+    """
+    return response.base if isinstance(response, Tempered) else response
 
 
 @dataclass(frozen=True)

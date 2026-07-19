@@ -31,6 +31,7 @@ from .response import (
     Smoothed,
     Taylor,
     TaylorFixed,
+    Tempered,
 )
 
 __all__ = ["PRESETS", "fit_glm_susie"]
@@ -163,6 +164,7 @@ def fit_glm_susie(
     estimate_prior_variance=True,
     prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
     max_prior_variance=None,  # hard ceiling on the estimated prior variance (None = no cap)
+    temperature=1.0,  # power-posterior: loglik scaled by 1/temperature (>1 -> prior/shrink; <1 -> MLE; dropping it traces the forward-stagewise path)
     estimate_intercept=True,
     max_iter=100,
     tol=1e-4,
@@ -187,6 +189,14 @@ def fit_glm_susie(
     offset_integration="gh". Axis arguments not consulted by the resolved
     configuration are ignored (tuning knobs), but combinations implying a wrong
     model are rejected -- see `_resolve`.
+
+    `temperature` tempers the likelihood to the power `1/temperature` (the prior is
+    untouched -- a power posterior). `>1` flattens it toward the prior (effects shrink
+    toward 0); `<1` peaks it toward the MLE. Dropping the temperature grows effects in
+    from zero, one at a time in marginal-evidence order -- forward-stagewise regression
+    (paired with `L="auto"`); `1.0` is the ordinary posterior. See `response.Tempered`
+    for the empirical-Bayes / `tol_L` caveats. Works for every family (`Tempered` wraps
+    the resolved response outermost and the kernels see through it).
     """
     explicit = {
         k: v
@@ -215,6 +225,11 @@ def fit_glm_susie(
     }
 
     response, kernel = _resolve(cfg)
+    # Power-posterior tempering, applied OUTERMOST (after any offset smoothing): scales the
+    # loglik by 1/temperature, leaving the prior fixed. `kernel` was resolved on the base's
+    # `quadratic`, which Tempered preserves, so the wrap never changes the kernel choice.
+    if temperature != 1.0:
+        response = Tempered(response, temperature)
 
     # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
     # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row

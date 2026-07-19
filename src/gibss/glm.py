@@ -32,7 +32,7 @@ from .engine import (
 )
 from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
 from .operators import CenteredOperator, as_operator
-from .response import Bernoulli, ResponseModel, Smoothed
+from .response import Bernoulli, ResponseModel, Smoothed, base_response
 from .response_ser import (
     _profile_null,
     build_ser_state,
@@ -175,10 +175,11 @@ def _aux(data, state, include_intercept_var=True):
     per-entry tilt instead)."""
     y = jnp.asarray(data.y)
     fs = state.family_state
-    if not isinstance(fs.response, Smoothed):
+    sm = base_response(fs.response)  # see through a Tempered wrapper for the type query
+    if not isinstance(sm, Smoothed):
         return y
     ov = _offset_var(state, include_intercept_var)
-    if fs.response.smoother.takes_row_param and fs.kernel != "jj":
+    if sm.smoother.takes_row_param and fs.kernel != "jj":
         return y, ov, jnp.asarray(fs.row_param)
     return y, ov
 
@@ -394,13 +395,14 @@ def update_row_param_step(data, state):
     anchor="null" = score mode). No-op for schemes without a row parameter, and
     under kernel="jj" (which tunes its own per-entry tilt from the b-posterior)."""
     fs = state.family_state
+    sm = base_response(fs.response)  # see through a Tempered wrapper for the smoother query
     if (
         fs.kernel == "jj"
-        or not isinstance(fs.response, Smoothed)
-        or not fs.response.smoother.takes_row_param
+        or not isinstance(sm, Smoothed)
+        or not sm.smoother.takes_row_param
     ):
         return state
-    param = fs.response.smoother.row_param(
+    param = sm.smoother.row_param(
         jnp.asarray(state.total_message.mean),
         _offset_var(state),  # message variance + intercept variance
         fs.intercept_value + fs.glm_offset,  # base = every non-effect part of the predictor

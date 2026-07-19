@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 from .engine import BaseSERState
 from .operators import DesignOperator
-from .response import GH, Bernoulli, JJFixed, ResponseModel, Smoothed
+from .response import GH, Bernoulli, JJFixed, ResponseModel, Smoothed, base_response
 from ._numerics import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
 __all__ = [
@@ -354,7 +354,8 @@ def glm_jj_ser(
     the bound is quadratic. Matches `ser_ops.localjj_ser(variational=True)`.
     Returns (m, v, log_bf, coefficient_kl) with coefficient_kl = KL(q_j || prior)
     (the `build_ser_state` contract; log_bf here IS the per-feature ELBO - null)."""
-    if not (isinstance(response, Smoothed) and isinstance(response.smoother, JJFixed)):
+    sm = base_response(response)  # a Tempered wrapper only scales terms; unwrap for the type check
+    if not (isinstance(sm, Smoothed) and isinstance(sm.smoother, JJFixed)):
         raise TypeError(
             "glm_jj_ser needs a fixed-tilt quadratic-bound response "
             "(Smoothed(Bernoulli(), JJFixed())): the conjugate Gaussian update is "
@@ -527,7 +528,8 @@ def glm_vi_ser(
     scheme, a true ELBO. `aux = (y, ov)` or plain y (ov = 0); `response` must be
     Smoothed(base, scheme) with a pointwise scheme (GH/Taylor/JJEnvelope).
     Returns (m, v, elbo_rel, coefficient_kl = KL(q_j || prior))."""
-    if not isinstance(response, Smoothed) or response.smoother.takes_row_param:
+    sm = base_response(response)  # a Tempered wrapper only scales terms; unwrap for the type check
+    if not isinstance(sm, Smoothed) or sm.smoother.takes_row_param:
         raise TypeError(
             "glm_vi_ser needs Smoothed(base, scheme) with a POINTWISE scheme "
             "(GH/Taylor/JJEnvelope): the scheme is the Gaussian expectation operator "
@@ -609,7 +611,8 @@ def glm_vi_profile_ser(
     aux = (y, ov) or plain y (ov = 0); response must be Smoothed with a pointwise
     scheme (GH/Taylor/JJEnvelope). Returns (m, v, elbo_rel, coefficient_kl, b0,
     precision), the glm_profile_ser contract."""
-    if not isinstance(response, Smoothed) or response.smoother.takes_row_param:
+    sm = base_response(response)  # a Tempered wrapper only scales terms; unwrap for the type check
+    if not isinstance(sm, Smoothed) or sm.smoother.takes_row_param:
         raise TypeError(
             "glm_vi_profile_ser needs Smoothed(base, scheme) with a POINTWISE scheme "
             "(GH/Taylor/JJEnvelope): the scheme is the Gaussian expectation operator "
