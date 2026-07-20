@@ -61,6 +61,12 @@ class PointMass:
         se = jnp.asarray(se)
         return jax.scipy.stats.norm.logpdf(bhat, float(self.value), se)
 
+    def cdf_nm(self, bhat, se):
+        # normal-means marginal: bhat | null ~ N(value, se^2)
+        bhat = jnp.asarray(bhat)
+        se = jnp.asarray(se)
+        return jax.scipy.stats.norm.cdf(bhat, float(self.value), se)
+
     def update_nm(self, bhat, se, weights):
         del se
         if not self.estimate_value:
@@ -95,6 +101,13 @@ class Normal:
         se = jnp.asarray(se)
         marginal_scale = jnp.sqrt(jnp.square(se) + float(self.scale) ** 2)
         return jax.scipy.stats.norm.logpdf(bhat, float(self.loc), marginal_scale)
+
+    def cdf_nm(self, bhat, se):
+        # normal-means marginal: bhat | non-null ~ N(loc, se^2 + scale^2)
+        bhat = jnp.asarray(bhat)
+        se = jnp.asarray(se)
+        marginal_scale = jnp.sqrt(jnp.square(se) + float(self.scale) ** 2)
+        return jax.scipy.stats.norm.cdf(bhat, float(self.loc), marginal_scale)
 
     def update_nm(self, bhat, se, weights):
         if not self.estimate_loc and not self.estimate_scale:
@@ -185,6 +198,18 @@ class NormalMixture:
             jnp.log(self.weights + 1e-30)[None, :] + component_log_likelihood,
             axis=1,
         )
+
+    def cdf_nm(self, bhat, se):
+        # mixture normal-means CDF: sum_k w_k Phi((bhat - loc_k)/sqrt(se^2 + scale_k^2))
+        bhat = jnp.asarray(bhat)
+        se = jnp.asarray(se)
+        marginal_scale = jnp.sqrt(
+            jnp.square(se)[:, None] + jnp.square(self.scales)[None, :]
+        )
+        component_cdf = jax.scipy.stats.norm.cdf(
+            bhat[:, None], self.locs[None, :], marginal_scale
+        )
+        return jnp.sum(self.weights[None, :] * component_cdf, axis=1)
 
     def update_nm(self, bhat, se, weights):
         if not self.estimate_weights and not self.estimate_locs and not self.estimate_scales:
