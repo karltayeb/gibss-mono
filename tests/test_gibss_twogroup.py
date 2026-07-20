@@ -94,6 +94,23 @@ def test_normal_mixture_f1():
     assert _feat_pip(st, CAUSAL) > 0.9
 
 
+def test_default_f1_is_ash_scale_mixture():
+    # f1=None picks the ash data-driven grid (zero-mean scale mixture), estimates
+    # its weights, and still recovers the enrichment feature.
+    from gibss.distributions import autoselect_scales
+
+    X, bhat, se = _sim(0)
+    st = TG.fit(X, bhat, se, L=2, max_iter=50)  # no f1 -> ash default
+    f1 = st.family_state.f1
+    assert isinstance(f1, NormalMixture)
+    np.testing.assert_allclose(np.asarray(f1.locs), 0.0)
+    # grid matches autoselect_scales on the same data (weights move, scales fixed)
+    np.testing.assert_allclose(
+        np.sort(np.asarray(f1.scales)), autoselect_scales(bhat, se), rtol=1e-10
+    )
+    assert _feat_pip(st, CAUSAL) > 0.9
+
+
 def test_dense_sparse_parity():
     # full engine loop agrees on dense vs BCOO designs. center=False on both:
     # the default pre-centers dense X but not BCOO (inherited glm limitation),

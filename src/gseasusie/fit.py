@@ -790,13 +790,9 @@ def fit_gsea_susie_twogroup(
     f0_obj = _resolve_distribution_spec(
         f0 or {"function": "point_mass", "kwargs": {"value": 0.0}}
     )
-    f1_obj = _resolve_distribution_spec(
-        f1
-        or {
-            "function": "normal",
-            "kwargs": {"loc": 0.0, "scale": 1.0, "estimate_loc": True},
-        }
-    )
+    # f1=None falls through to gibss.twogroup's default: ash_scale_mixture(bhat,
+    # se), a zero-mean scale mixture on ash's data-driven autoselect_scales grid.
+    f1_obj = None if f1 is None else _resolve_distribution_spec(f1)
 
     fs_kwargs = {"estimate_prior_variance": bool(estimate_prior_variance)}
     if family_state_kwargs:

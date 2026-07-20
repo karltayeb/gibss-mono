@@ -250,3 +250,67 @@ def scale_mixture(scales, weights) -> NormalMixture:
         locs=jnp.zeros_like(scales),
         scales=scales,
     )
+
+
+def autoselect_scales(bhat, se, *, mult: float = np.sqrt(2.0), mode: float = 0.0) -> np.ndarray:
+    """ash's data-driven scale grid (a faithful port of `ashr::autoselect.mixsd`).
+
+    Returns an ascending geometric grid of prior standard deviations for a
+    zero-mean scale mixture of normals, spanning the range of effect sizes the
+    data can resolve:
+
+      - lower end `sigma_min = min(se) / 10` -- the finest scale worth
+        distinguishing from the null given the observation noise;
+      - upper end `sigma_max = 2 * sqrt(max(bhat^2 - se^2))` -- twice the largest
+        noise-corrected signal (i.e. the biggest true effect the data support).
+        If no observation clears its own noise (`bhat^2 <= se^2` everywhere) the
+        span collapses to `8 * sigma_min`, ash's "no detectable signal" fallback;
+      - filled geometrically with ratio `mult` (ash's default `sqrt(2)`), so
+        `npoint = ceil(log2(sigma_max / sigma_min) / log2(mult))` points land at
+        `mult^(-npoint .. 0) * sigma_max`.
+
+    The point mass at 0 that ash prepends is DELIBERATELY omitted: in the
+    two-group model the null is the separate `f0`, so `f1` carries the non-null
+    grid only (a near-zero scale here would compete with `f0` and unidentify the
+    null/non-null gate -- see `gibss.twogroup`). `bhat`/`se` are paired by a
+    single positive-finite-`se` mask (ash filters `se` alone; masking both keeps
+    the noise-corrected signal well defined)."""
+    bhat = np.asarray(bhat, dtype=float) - float(mode)
+    se = np.asarray(se, dtype=float)
+    if bhat.shape != se.shape or bhat.ndim != 1:
+        raise ValueError("bhat and se must be 1D arrays of the same shape.")
+    if not (mult > 1.0):
+        raise ValueError("mult must be > 1.")
+    finite = np.isfinite(se) & (se > 0)
+    if not np.any(finite):
+        raise ValueError("se must contain at least one positive, finite value.")
+    bhat, se = bhat[finite], se[finite]
+
+    sigma_min = float(np.min(se)) / 10.0
+    signal = float(np.max(np.square(bhat) - np.square(se)))
+    sigma_max = 2.0 * np.sqrt(signal) if signal > 0.0 else 8.0 * sigma_min
+
+    npoint = int(np.ceil(np.log2(sigma_max / sigma_min) / np.log2(mult)))
+    npoint = max(npoint, 0)
+    return mult ** np.arange(-npoint, 1) * sigma_max
+
+
+def ash_scale_mixture(
+    bhat,
+    se,
+    *,
+    mult: float = np.sqrt(2.0),
+    mode: float = 0.0,
+    estimate_weights: bool = True,
+) -> NormalMixture:
+    """A zero-mean `NormalMixture` on ash's `autoselect_scales` grid, weights
+    initialized uniform and (by default) estimated by EM. This is the ash-style
+    `f1` for `gibss.twogroup`: the covariate model moves mass between null and
+    non-null, and this mixture is the shared non-null effect-size shape."""
+    scales = autoselect_scales(bhat, se, mult=mult, mode=mode)
+    return NormalMixture(
+        weights=jnp.full(len(scales), 1.0 / len(scales)),
+        locs=jnp.full(len(scales), float(mode)),
+        scales=jnp.asarray(scales),
+        estimate_weights=estimate_weights,
+    )
