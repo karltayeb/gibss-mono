@@ -205,6 +205,121 @@ def _pit_glm(
 
 
 # --------------------------------------------------------------------------- #
+# Cox: Cox-Snell residual PIT  (Stage 3)
+# --------------------------------------------------------------------------- #
+def _colsq_matvec(X: Any, w: np.ndarray) -> np.ndarray:
+    """(X**2) @ w, honoring a BCOO layout (square the stored data, same indices)."""
+    from jax.experimental import sparse as jsparse
+
+    if isinstance(X, jsparse.BCOO):
+        xsq = jsparse.BCOO((X.data**2, X.indices), shape=X.shape)
+        return np.asarray(xsq @ jnp.asarray(w))
+    return np.asarray(np.asarray(X) ** 2 @ np.asarray(w))
+
+
+def _reconstruct_eta_var(data: Any, state: Any) -> np.ndarray:
+    """Per-observation posterior variance of eta = X (sum_l alpha_l mu_l), rebuilt
+    from the effects. Cox aggregates effects with a MeanMessage (variance dropped),
+    but each CoxEffect still carries (alpha, mu, var), so the moment-matched offset
+    variance -- the same formula as BaseSERState.message -- is recoverable here."""
+    X = data.X
+    v = np.zeros(np.asarray(state.total_message.mean).shape, dtype=float)
+    for e in state.single_effects:
+        cm = np.asarray(e.alpha) * np.asarray(e.mu)
+        csm = np.asarray(e.alpha) * (np.asarray(e.mu) ** 2 + np.asarray(e.var))
+        mean_l = np.asarray(X @ jnp.asarray(cm))
+        v += np.maximum(_colsq_matvec(X, csm) - mean_l**2, 0.0)
+    return v
+
+
+def _breslow_cumulative_hazard(
+    time: np.ndarray, event: np.ndarray, eta: np.ndarray
+) -> np.ndarray:
+    """Breslow baseline cumulative hazard H0(t_i) at each observation's own time,
+    given the fitted log-hazard-ratio eta. dH0(t_k) = d_k / sum_{j: t_j >= t_k}
+    exp(eta_j); H0(t) sums the jumps at event times <= t. Ties share the risk-set
+    denominator (Breslow)."""
+    time = np.asarray(time, dtype=float)
+    event = np.asarray(event, dtype=float)
+    eta = np.asarray(eta, dtype=float)
+    order = np.argsort(time, kind="mergesort")
+    t = time[order]
+    d = event[order]
+    e = np.exp(eta[order])
+    risk = np.cumsum(e[::-1])[::-1]  # risk[i] = sum_{j >= i} e_j (times sorted asc)
+    is_new = np.concatenate([[True], t[1:] != t[:-1]])
+    group = np.cumsum(is_new) - 1
+    group_first_risk = risk[np.flatnonzero(is_new)]  # risk set at each distinct time
+    events_per_group = np.add.reduceat(d, np.flatnonzero(is_new))
+    dH_group = events_per_group / group_first_risk
+    H0_sorted = np.cumsum(dH_group)[group]
+    H0 = np.empty_like(H0_sorted)
+    H0[order] = H0_sorted
+    return H0
+
+
+def _cox_predictive_survival(
+    H0: np.ndarray,
+    m: np.ndarray,
+    v: np.ndarray | None,
+    *,
+    offset_uncertainty: bool,
+    order: int,
+) -> np.ndarray:
+    """S_i = P(T_i > t_i): exp(-H0 exp(m)) plugging in the mean, or the eta-integral
+    E_{eta ~ N(m, v)}[exp(-H0 exp(eta))] by Gauss-Hermite when offset_uncertainty."""
+    if not offset_uncertainty or v is None:
+        return np.exp(-H0 * np.exp(m))
+    nodes, weights = _gh_nodes(order)
+    nodes = np.asarray(nodes)
+    weights = np.asarray(weights)
+    sd = np.sqrt(2.0 * np.maximum(np.asarray(v), 0.0))
+    eta_nodes = m[None, :] + sd[None, :] * nodes[:, None]  # (order, n)
+    return np.sum(weights[:, None] * np.exp(-H0[None, :] * np.exp(eta_nodes)), axis=0)
+
+
+def _pit_cox(
+    data: Any,
+    state: Any,
+    *,
+    offset_uncertainty: bool,
+    order: int,
+    randomized: bool,
+    seed: int | None,
+) -> PITResult:
+    """Cox-Snell PIT. The residual r_i = H0(t_i) exp(eta_i) is a unit-exponential
+    under the true model, so the predictive survival S_i = exp(-r_i) gives
+    PIT = 1 - S_i for an event and, for a right-censored observation (T > t_i, so
+    the transform is only known to lie in (1 - S_i, 1)), the randomized value
+    (1 - S_i) + V S_i, V ~ U(0,1).
+
+    offset_uncertainty integrates eta_i ~ N(m_i, v_i) (v_i rebuilt from the
+    effects) through the survival, S_i = E[exp(-H0(t_i) exp(eta_i))]. The Breslow
+    baseline H0 is held at its plug-in value (it profiles out the nuisance); its
+    own dependence on the eta_j is NOT propagated -- a documented approximation."""
+    time = np.asarray(data.event_time, dtype=float)
+    event = np.asarray(data.event_type, dtype=float)
+    if not np.all((event == 0.0) | (event == 1.0)):
+        raise ValueError("event_type must be 0 (censored) or 1 (event).")
+    m = np.asarray(state.total_message.mean, dtype=float)
+    H0 = _breslow_cumulative_hazard(time, event, m)
+    v = _reconstruct_eta_var(data, state) if offset_uncertainty else None
+    surv = _cox_predictive_survival(
+        H0, m, v, offset_uncertainty=offset_uncertainty, order=order
+    )
+
+    cdf = 1.0 - surv  # event PIT
+    if randomized:
+        jitter = np.random.default_rng(seed).uniform(size=surv.shape)
+    else:
+        jitter = 0.5
+    censored = event < 0.5
+    pit = np.where(censored, cdf + jitter * surv, cdf)
+    used_randomization = bool(randomized) if bool(np.any(censored)) else None
+    return PITResult(np.asarray(pit), "cox", offset_uncertainty, used_randomization)
+
+
+# --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
 def posterior_pit(
@@ -227,8 +342,10 @@ def posterior_pit(
         jitter V ~ U(0,1) (reproducible via `seed`); `randomized=False` uses the
         deterministic mid-PIT (V = 1/2).
 
-    Continuous families (linear-Gaussian, two-group, glm-Gaussian) and discrete
-    glm families (Bernoulli, Poisson) are handled. Cox lands in Stage 3.
+    All families are handled: continuous (linear-Gaussian, two-group, glm-Gaussian),
+    discrete glm (Bernoulli, Poisson), and Cox (Cox-Snell residuals). For a Cox fit
+    use method="partial" (the CoxFamilyState); the method="poisson" reduction expands
+    to risk-set pseudo-observations, so its glm state is not a survival PIT.
     """
     fs = state.family_state
     cls = type(fs).__name__
@@ -246,5 +363,8 @@ def posterior_pit(
             randomized=randomized, seed=seed,
         )
     if cls == "CoxFamilyState":
-        raise NotImplementedError("Cox PIT (Cox-Snell residuals) lands in Stage 3.")
+        return _pit_cox(
+            data, state, offset_uncertainty=offset_uncertainty, order=order,
+            randomized=randomized, seed=seed,
+        )
     raise NotImplementedError(f"PIT not implemented for family state {cls!r}.")
