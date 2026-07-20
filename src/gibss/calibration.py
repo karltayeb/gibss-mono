@@ -151,6 +151,60 @@ def _pit_twogroup(
 
 
 # --------------------------------------------------------------------------- #
+# glm families: continuous (Gaussian) and discrete (Bernoulli, Poisson)  (Stage 2)
+# --------------------------------------------------------------------------- #
+def _pit_glm(
+    data: Any,
+    state: Any,
+    *,
+    offset_uncertainty: bool,
+    order: int,
+    randomized: bool,
+    seed: int | None,
+) -> PITResult:
+    """PIT for a GLM family via the response's predictive CDF `base.cdf(eta, y)`,
+    offset-integrated over eta. Continuous bases give the CDF directly; discrete
+    bases (integer y) use the randomized PIT
+
+        PIT_i = F(y_i - 1) + V_i (F(y_i) - F(y_i - 1)),   V_i ~ U(0, 1),
+
+    (Dunn-Smyth / Czado): the only transform that is Uniform(0,1) for a discrete
+    predictive. `randomized=False` substitutes V_i = 1/2 (the deterministic
+    mid-PIT -- not uniform, but reproducible for QQ inspection)."""
+    fs = state.family_state
+    base = _base_response(fs.response)
+    family = type(base).__name__.lower()
+    y = jnp.asarray(data.y)
+    mean, ov = _glm_eta_moments(state)
+
+    if not getattr(base, "discrete", False):
+        pit = _integrate_over_eta(
+            lambda eta: base.cdf(eta, y),
+            mean, ov, offset_uncertainty=offset_uncertainty, order=order,
+        )
+        return PITResult(np.asarray(pit), family, offset_uncertainty)
+
+    f_y = np.asarray(
+        _integrate_over_eta(
+            lambda eta: base.cdf(eta, y),
+            mean, ov, offset_uncertainty=offset_uncertainty, order=order,
+        )
+    )
+    f_ym1 = np.asarray(
+        _integrate_over_eta(
+            lambda eta: base.cdf(eta, y - 1.0),
+            mean, ov, offset_uncertainty=offset_uncertainty, order=order,
+        )
+    )
+    if randomized:
+        v = np.random.default_rng(seed).uniform(size=f_y.shape)
+    else:
+        v = 0.5
+    pit = f_ym1 + v * (f_y - f_ym1)
+    return PITResult(np.asarray(pit), family, offset_uncertainty, randomized=bool(randomized))
+
+
+# --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
 def posterior_pit(
@@ -159,6 +213,8 @@ def posterior_pit(
     *,
     offset_uncertainty: bool = True,
     order: int = 32,
+    randomized: bool = True,
+    seed: int | None = 0,
     **kwargs: Any,
 ) -> PITResult:
     """Posterior predictive PIT for a fitted state, dispatched on the family.
@@ -167,10 +223,12 @@ def posterior_pit(
         the calibrated check) vs plug in the posterior mean (the overconfident
         baseline -- useful to see the offset term do work).
     order : Gauss-Hermite nodes for the eta-integral (ignored where closed form).
+    randomized, seed : discrete families only. `randomized=True` draws the PIT
+        jitter V ~ U(0,1) (reproducible via `seed`); `randomized=False` uses the
+        deterministic mid-PIT (V = 1/2).
 
-    Stage 1 handles the continuous families (linear-Gaussian, two-group). Discrete
-    families (Bernoulli, Poisson) and Cox arrive in later stages; until then they
-    raise NotImplementedError with a pointer.
+    Continuous families (linear-Gaussian, two-group, glm-Gaussian) and discrete
+    glm families (Bernoulli, Poisson) are handled. Cox lands in Stage 3.
     """
     fs = state.family_state
     cls = type(fs).__name__
@@ -183,14 +241,9 @@ def posterior_pit(
     if cls == "LinearFamilyState":
         return _pit_linear(data, state, offset_uncertainty=offset_uncertainty)
     if cls == "GLMFamilyState":
-        base = type(_base_response(fs.response)).__name__
-        if base == "Gaussian":
-            # glm(Gaussian): same predictive as linear, assembled from the glm state
-            raise NotImplementedError(
-                "glm(Gaussian) PIT: use the linear family, or extend Stage 1."
-            )
-        raise NotImplementedError(
-            f"PIT for glm base response {base!r} (discrete) lands in Stage 2."
+        return _pit_glm(
+            data, state, offset_uncertainty=offset_uncertainty, order=order,
+            randomized=randomized, seed=seed,
         )
     if cls == "CoxFamilyState":
         raise NotImplementedError("Cox PIT (Cox-Snell residuals) lands in Stage 3.")

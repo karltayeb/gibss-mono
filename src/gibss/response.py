@@ -67,8 +67,17 @@ class ResponseModel:
     """
 
     quadratic = False
+    # discrete: the observation is integer-supported, so a calibration PIT needs
+    # the randomized transform (see gibss.calibration). Continuous families expose
+    # a plain predictive CDF.
+    discrete = False
 
     def terms(self, eta, aux):
+        raise NotImplementedError
+
+    def cdf(self, eta, y):
+        """Predictive CDF P(Y <= y | eta) at a fixed linear predictor. Used by the
+        calibration PIT; not every response defines it."""
         raise NotImplementedError
 
 
@@ -344,6 +353,8 @@ class Smoothed(ResponseModel):
 class Bernoulli(ExponentialFamily):
     """Logistic likelihood. aux = y in {0,1}. A = softplus; weight = A'' = s(1-s)."""
 
+    discrete = True
+
     def terms(self, eta, aux):
         s = jax.nn.sigmoid(eta)
         return aux * eta - jax.nn.softplus(eta), aux - s, s * (1.0 - s)
@@ -352,6 +363,12 @@ class Bernoulli(ExponentialFamily):
         s = jax.nn.sigmoid(eta)
         v = s * (1.0 - s)
         return v * (1.0 - 2.0 * s), v * (1.0 - 6.0 * v)  # A''', A''''
+
+    def cdf(self, eta, y):
+        # P(Y <= y), Y ~ Bernoulli(sigmoid(eta)): 0 below 0, 1-s on [0,1), 1 at >=1
+        s = jax.nn.sigmoid(eta)
+        y = jnp.asarray(y)
+        return jnp.where(y >= 1.0, 1.0, jnp.where(y >= 0.0, 1.0 - s, 0.0))
 
 
 @dataclass(frozen=True)
@@ -376,6 +393,8 @@ class TwoGroupMarginal(ResponseModel):
 class Poisson(ExponentialFamily):
     """Poisson (log link). aux = y (counts). A = exp; weight = A'' = lam."""
 
+    discrete = True
+
     def terms(self, eta, aux):
         lam = jnp.exp(eta)
         return aux * eta - lam, aux - lam, lam
@@ -383,6 +402,13 @@ class Poisson(ExponentialFamily):
     def cumulant_derivs(self, eta):
         lam = jnp.exp(eta)
         return lam, lam  # A''' = A'''' = exp(eta)
+
+    def cdf(self, eta, y):
+        # P(Y <= k), Y ~ Poisson(exp(eta)): the regularized upper incomplete gamma
+        # Q(floor(k)+1, lam) = gammaincc(k+1, lam); 0 below 0.
+        lam = jnp.exp(eta)
+        k = jnp.floor(jnp.asarray(y))
+        return jnp.where(k >= 0.0, jax.scipy.special.gammaincc(k + 1.0, lam), 0.0)
 
 
 @dataclass(frozen=True)
@@ -406,3 +432,7 @@ class Gaussian(ExponentialFamily):
     def cumulant_derivs(self, eta):
         z = jnp.zeros_like(eta)
         return z, z  # cumulant is quadratic: A''' = A'''' = 0
+
+    def cdf(self, eta, y):
+        # P(Y <= y), Y ~ N(eta, variance)
+        return jax.scipy.stats.norm.cdf(jnp.asarray(y), eta, jnp.sqrt(self.variance))
