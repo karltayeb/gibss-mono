@@ -22,7 +22,8 @@ Scope of the uncertainty captured: `q(eta_i)` is the mean-field posterior CONDIT
 on the point-estimated hyperparameters (prior variance, f0/f1, residual variance,
 nullweight). It is a moment-matched Gaussian of a genuinely mixture posterior (the
 SER selection), and the check is in-sample, so this is a self-consistency diagnostic,
-not a frequentist coverage guarantee. See `notes/` (to be written) for the caveats.
+not a frequentist coverage guarantee. See `notes/posterior pit checks.md` for the
+per-family treatment and the caveats.
 """
 
 from __future__ import annotations
