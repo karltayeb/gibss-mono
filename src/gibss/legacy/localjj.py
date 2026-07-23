@@ -170,7 +170,8 @@ def fit_local_jj_ser(
 
 
 def initialize_state(
-    data: LocalJJData, L: int = 1, family_state_kwargs: dict | None = None
+    data: LocalJJData, L: int = 1, family_state_kwargs: dict | None = None,
+    prior_variance: float = 1.0,
 ) -> GIBSSState[LocalJJFamilyState, Message]:
     """Initialize GIBSS state with empty effects and zero total message."""
     reject_sparse_precenter(data)  # local-xi sparse pre-centering: follow-up
@@ -181,9 +182,9 @@ def initialize_state(
     )
     zero_message = Message(jnp.zeros(X.shape[0]), jnp.zeros(X.shape[0]))
     if family_state.profile:
-        effects = [_empty_centered_effect(p) for _ in range(L)]
+        effects = [_empty_centered_effect(p, prior_variance) for _ in range(L)]
     else:
-        effects = [_empty_effect(p, 1.0) for _ in range(L)]
+        effects = [_empty_effect(p, prior_variance) for _ in range(L)]
     return GIBSSState(
         single_effects=effects,
         total_message=zero_message,
@@ -191,8 +192,8 @@ def initialize_state(
     )
 
 
-def _empty_centered_effect(p: int) -> LocalJJCenteredEffect:
-    base = _empty_effect(p, 1.0)
+def _empty_centered_effect(p: int, prior_variance: float = 1.0) -> LocalJJCenteredEffect:
+    base = _empty_effect(p, prior_variance)
     return LocalJJCenteredEffect(
         **{f: getattr(base, f) for f in base.__dataclass_fields__}, b0=np.zeros(p)
     )

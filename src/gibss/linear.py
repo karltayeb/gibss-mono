@@ -17,6 +17,7 @@ from .engine import (
     add_message_index_step,
     replace_effect_in_gibss_state,
     subtract_message_index_step,
+    to_numpy_state_step,
 )
 
 
@@ -187,13 +188,14 @@ def initialize_state(
     data,
     L: int = 1,
     family_state_kwargs: dict | None = None,
+    prior_variance: float = 1.0,
 ) -> GIBSSState[LinearFamilyState, Message]:
     p = data.X.shape[1]
     n = data.X.shape[0]
     family_state = LinearFamilyState(**({} if family_state_kwargs is None else dict(family_state_kwargs)))
     zero_message = Message(np.zeros(n), np.zeros(n))
     return GIBSSState(
-        single_effects=[_empty_effect(p, 1.0) for _ in range(L)],
+        single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=zero_message,
         family_state=family_state,
     )
@@ -346,4 +348,5 @@ def default_schedule() -> Schedule:
             compute_elbo_step,
             check_elbo_convergence_step,
         ),
+        after_fit=(to_numpy_state_step,),
     )

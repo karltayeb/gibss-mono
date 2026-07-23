@@ -62,7 +62,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import glm
-from .distributions import Normal, PointMass
+from .distributions import Normal, PointMass, ash_scale_mixture
 from .engine import (
     GIBSSState,
     Message,
@@ -357,11 +357,13 @@ def initialize_state(
     """Engine state for the two-group family, warm-started by the covariate-free
     two-group EM. `response` must be TwoGroupMarginal (default) or
     `Smoothed(TwoGroupMarginal(), GH(k))` for LOO-message offset integration.
-    Defaults: f0 = PointMass(0) (fixed null), f1 = Normal(scale=2,
-    estimate_scale=True). `nullweight` (ashr's) makes the null-proportion (base
-    enrichment rate) estimate conservative; 1.0 = no penalty."""
+    Defaults: f0 = PointMass(0) (fixed null), f1 = ash_scale_mixture(bhat, se) --
+    a zero-mean scale mixture on ash's data-driven `autoselect_scales` grid, with
+    EM-estimated weights (the ash-style non-null effect-size shape). `nullweight`
+    (ashr's) makes the null-proportion (base enrichment rate) estimate
+    conservative; 1.0 = no penalty."""
     f0 = PointMass() if f0 is None else f0
-    f1 = Normal(scale=2.0, estimate_scale=True) if f1 is None else f1
+    f1 = ash_scale_mixture(data.bhat, data.se) if f1 is None else f1
     response = TwoGroupMarginal() if response is None else response
     p = data.X.shape[1]
     n = data.bhat.shape[0]

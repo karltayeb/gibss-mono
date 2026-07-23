@@ -235,3 +235,35 @@ def test_invalid_configurations_raise():
     # unknown intercept: rejected downstream by GLMFamilyState
     with pytest.raises(ValueError, match="intercept"):
         fit_glm_susie(X, y, intercept="wat")
+
+
+def _jax_leaves(obj, path="state"):
+    """Every jax.Array leaf in a fitted-state tree, as (path, shape) pairs. numpy
+    arrays are NOT jax.Array, so a host-numpy state yields an empty list."""
+    import jax
+    from dataclasses import fields, is_dataclass
+    if isinstance(obj, jax.Array) and not isinstance(obj, np.ndarray):
+        return [(path, getattr(obj, "shape", None))]
+    if is_dataclass(obj) and not isinstance(obj, type):
+        out = []
+        for f in fields(obj):
+            out += _jax_leaves(getattr(obj, f.name), f"{path}.{f.name}")
+        return out
+    if isinstance(obj, (list, tuple)):
+        out = []
+        for i, v in enumerate(obj):
+            out += _jax_leaves(v, f"{path}[{i}]")
+        return out
+    return []
+
+
+@pytest.mark.parametrize("method", sorted(PRESETS))
+def test_fitted_state_is_host_numpy(method):
+    # A returned fit must be free of jax arrays (whole tree, incl. family_state and
+    # the previous_state snapshot) so it can be pickled/saved directly.
+    import pickle
+    X, y = _data(PRESETS[method].get("family", "logistic"))
+    st = fit_glm_susie(X, y, L=2, method=method, max_iter=30)
+    leaks = _jax_leaves(st)
+    assert not leaks, f"jax arrays remain in fitted state: {leaks}"
+    pickle.loads(pickle.dumps(st))  # host-numpy state round-trips through pickle

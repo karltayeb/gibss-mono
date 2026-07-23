@@ -43,6 +43,15 @@ def test_linear_gibss_tracks_reference_on_stable_fixture():
     pip_ref = 1.0 - np.prod(1.0 - alpha_ref, axis=0)
     posterior_mean_ref = np.sum(alpha_ref * mu_ref, axis=0)
 
+    # the linear schedule's after_fit must move the state to host numpy: no jax
+    # arrays should survive in the returned effects or total message.
+    import jax
+    for e in gibss_state.single_effects:
+        for f in ("mu", "var", "alpha", "feature_log_marginal"):
+            v = getattr(e, f)
+            assert isinstance(v, np.ndarray) and not isinstance(v, jax.Array)
+    assert isinstance(gibss_state.total_message.mean, np.ndarray)
+
     pip = np.asarray(gibss_state.pip)
     posterior_mean = np.asarray(gibss_state.posterior_mean)
 

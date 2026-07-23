@@ -104,15 +104,31 @@ class Normal:
         weights = jnp.asarray(weights)
         sum_w = jnp.maximum(jnp.sum(weights), 1e-30)
 
+        # One generalized-EM M-step for the normal-means marginal
+        # bhat_i ~ N(loc, se_i^2 + scale^2) with responsibilities `weights`, via
+        # the latent theta_i ~ N(loc, scale^2), bhat_i | theta_i ~ N(theta_i, se_i^2).
+        # The plain moment update (scale^2 = wmean((bhat-loc)^2) - wmean(se^2)) is
+        # the MLE only for homoskedastic se; under unequal se it lets the
+        # low-precision observations dominate the subtracted noise term and has a
+        # spurious scale->0 fixed point (f1 collapses onto f0). This EM step is
+        # precision-weighted through the posterior mean/variance (shrink -> 0 for
+        # high-se rows) and is monotone in the expected complete-data loglik.
+        scale2 = float(self.scale) ** 2
+        marginal_var = jnp.square(se) + scale2
+        shrink = scale2 / marginal_var
+        post_mean = float(self.loc) + shrink * (bhat - float(self.loc))
+        post_var = shrink * jnp.square(se)  # = scale^2 * se^2 / marginal_var
+
         loc = float(self.loc)
         if self.estimate_loc:
-            loc = float(jnp.sum(weights * bhat) / sum_w)
+            loc = float(jnp.sum(weights * post_mean) / sum_w)
 
         scale = float(self.scale)
         if self.estimate_scale:
-            centered_second = jnp.sum(weights * jnp.square(bhat - loc)) / sum_w
-            mean_se_sq = jnp.sum(weights * jnp.square(se)) / sum_w
-            scale = float(jnp.sqrt(jnp.maximum(centered_second - mean_se_sq, 1e-8)))
+            second = (
+                jnp.sum(weights * (jnp.square(post_mean - loc) + post_var)) / sum_w
+            )
+            scale = float(jnp.sqrt(jnp.maximum(second, 1e-8)))
 
         return replace(self, loc=loc, scale=scale)
 
@@ -207,24 +223,38 @@ class NormalMixture:
         if self.estimate_weights:
             new_weights = _normalize_weights(component_weight_sums)
 
+        # Per-component generalized-EM M-step via the latent theta (see
+        # Normal.update_nm): precision-weighted posterior mean/variance, not the
+        # plain moment update, so heteroskedastic se cannot collapse a component
+        # scale onto zero.
         new_locs = self.locs
-        if self.estimate_locs:
-            new_locs = jnp.sum(weighted_responsibilities * bhat[:, None], axis=0) / jnp.maximum(
-                component_weight_sums,
-                1e-30,
-            )
-
         new_scales = self.scales
-        if self.estimate_scales:
-            centered_second = jnp.sum(
-                weighted_responsibilities * jnp.square(bhat[:, None] - new_locs[None, :]),
-                axis=0,
-            ) / jnp.maximum(component_weight_sums, 1e-30)
-            mean_se_sq = jnp.sum(
-                weighted_responsibilities * jnp.square(se)[:, None],
-                axis=0,
-            ) / jnp.maximum(component_weight_sums, 1e-30)
-            new_scales = jnp.sqrt(jnp.maximum(centered_second - mean_se_sq, 1e-8))
+        if self.estimate_locs or self.estimate_scales:
+            scale2 = jnp.square(self.scales)[None, :]  # (1, K)
+            marginal_var = jnp.square(se)[:, None] + scale2  # (n, K)
+            shrink = scale2 / marginal_var
+            post_mean = self.locs[None, :] + shrink * (
+                bhat[:, None] - self.locs[None, :]
+            )
+            post_var = shrink * jnp.square(se)[:, None]
+            denom = jnp.maximum(component_weight_sums, 1e-30)
+
+            if self.estimate_locs:
+                new_locs = (
+                    jnp.sum(weighted_responsibilities * post_mean, axis=0) / denom
+                )
+
+            if self.estimate_scales:
+                loc_ref = new_locs if self.estimate_locs else self.locs
+                second = (
+                    jnp.sum(
+                        weighted_responsibilities
+                        * (jnp.square(post_mean - loc_ref[None, :]) + post_var),
+                        axis=0,
+                    )
+                    / denom
+                )
+                new_scales = jnp.sqrt(jnp.maximum(second, 1e-8))
 
         return replace(
             self,
@@ -249,4 +279,68 @@ def scale_mixture(scales, weights) -> NormalMixture:
         weights=weights,
         locs=jnp.zeros_like(scales),
         scales=scales,
+    )
+
+
+def autoselect_scales(bhat, se, *, mult: float = np.sqrt(2.0), mode: float = 0.0) -> np.ndarray:
+    """ash's data-driven scale grid (a faithful port of `ashr::autoselect.mixsd`).
+
+    Returns an ascending geometric grid of prior standard deviations for a
+    zero-mean scale mixture of normals, spanning the range of effect sizes the
+    data can resolve:
+
+      - lower end `sigma_min = min(se) / 10` -- the finest scale worth
+        distinguishing from the null given the observation noise;
+      - upper end `sigma_max = 2 * sqrt(max(bhat^2 - se^2))` -- twice the largest
+        noise-corrected signal (i.e. the biggest true effect the data support).
+        If no observation clears its own noise (`bhat^2 <= se^2` everywhere) the
+        span collapses to `8 * sigma_min`, ash's "no detectable signal" fallback;
+      - filled geometrically with ratio `mult` (ash's default `sqrt(2)`), so
+        `npoint = ceil(log2(sigma_max / sigma_min) / log2(mult))` points land at
+        `mult^(-npoint .. 0) * sigma_max`.
+
+    The point mass at 0 that ash prepends is DELIBERATELY omitted: in the
+    two-group model the null is the separate `f0`, so `f1` carries the non-null
+    grid only (a near-zero scale here would compete with `f0` and unidentify the
+    null/non-null gate -- see `gibss.twogroup`). `bhat`/`se` are paired by a
+    single positive-finite-`se` mask (ash filters `se` alone; masking both keeps
+    the noise-corrected signal well defined)."""
+    bhat = np.asarray(bhat, dtype=float) - float(mode)
+    se = np.asarray(se, dtype=float)
+    if bhat.shape != se.shape or bhat.ndim != 1:
+        raise ValueError("bhat and se must be 1D arrays of the same shape.")
+    if not (mult > 1.0):
+        raise ValueError("mult must be > 1.")
+    finite = np.isfinite(se) & (se > 0)
+    if not np.any(finite):
+        raise ValueError("se must contain at least one positive, finite value.")
+    bhat, se = bhat[finite], se[finite]
+
+    sigma_min = float(np.min(se)) / 10.0
+    signal = float(np.max(np.square(bhat) - np.square(se)))
+    sigma_max = 2.0 * np.sqrt(signal) if signal > 0.0 else 8.0 * sigma_min
+
+    npoint = int(np.ceil(np.log2(sigma_max / sigma_min) / np.log2(mult)))
+    npoint = max(npoint, 0)
+    return mult ** np.arange(-npoint, 1) * sigma_max
+
+
+def ash_scale_mixture(
+    bhat,
+    se,
+    *,
+    mult: float = np.sqrt(2.0),
+    mode: float = 0.0,
+    estimate_weights: bool = True,
+) -> NormalMixture:
+    """A zero-mean `NormalMixture` on ash's `autoselect_scales` grid, weights
+    initialized uniform and (by default) estimated by EM. This is the ash-style
+    `f1` for `gibss.twogroup`: the covariate model moves mass between null and
+    non-null, and this mixture is the shared non-null effect-size shape."""
+    scales = autoselect_scales(bhat, se, mult=mult, mode=mode)
+    return NormalMixture(
+        weights=jnp.full(len(scales), 1.0 / len(scales)),
+        locs=jnp.full(len(scales), float(mode)),
+        scales=jnp.asarray(scales),
+        estimate_weights=estimate_weights,
     )

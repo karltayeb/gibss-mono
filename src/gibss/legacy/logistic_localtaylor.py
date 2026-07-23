@@ -169,10 +169,10 @@ def fit_local_taylor_ser(
     return _fit_effect(data, offset, prior_variance, fs, offset_var, offset_integration)
 
 
-def _empty_effect(p: int) -> LocalTaylorEffect:
+def _empty_effect(p: int, prior_variance: float = 1.0) -> LocalTaylorEffect:
     return LocalTaylorEffect(
         mu=jnp.zeros(p), var=jnp.full(p, 1.0), alpha=jnp.full(p, 1.0 / p),
-        pi=jnp.full(p, 1.0 / p), prior_variance=1.0,
+        pi=jnp.full(p, 1.0 / p), prior_variance=float(prior_variance),
         feature_log_marginal=jnp.zeros(p), marginal_log_likelihood=0.0,
         null_log_marginal=0.0, kl=0.0, coefficient_kl=jnp.zeros(p),
         mode=jnp.zeros(p), hessian=jnp.ones(p), b0=jnp.zeros(p),
@@ -181,7 +181,7 @@ def _empty_effect(p: int) -> LocalTaylorEffect:
 
 def initialize_state(
     data: LocalTaylorData, L: int = 1, quadrature_order: int = 15,
-    family_state_kwargs: dict | None = None,
+    family_state_kwargs: dict | None = None, prior_variance: float = 1.0,
 ) -> GIBSSState[LocalTaylorFamilyState, Message]:
     # sparse pre-centering is supported now: profile=False fits (x-c) via the
     # background (see quadrature_ser `center`); profile=True re-profiles the
@@ -195,7 +195,7 @@ def initialize_state(
     # gives the fixed-offset fit.
     zero_message = Message(jnp.zeros(n), jnp.zeros(n))
     return GIBSSState(
-        single_effects=[_empty_effect(p) for _ in range(L)],
+        single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=zero_message,
         family_state=family_state,
     )

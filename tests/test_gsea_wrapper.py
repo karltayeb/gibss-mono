@@ -15,7 +15,9 @@ from gseasusie import (
     GeneStandardizedEffects,
     align,
     fit_gsea_susie_cox,
+    fit_gsea_susie_linear,
     fit_gsea_susie_logistic,
+    fit_gsea_susie_twogroup,
     fit_ora,
     intersect_gene_ids,
     load_gene_sets,
@@ -727,3 +729,102 @@ def test_gseafit_credible_set_report_marks_overlapping_informative_components_re
 
     assert report["informative"].to_list() == [True, True]
     assert report["redundant"].to_list() == [True, True]
+
+
+# --- real-fit regression tests (no mocked fit_ibss) -------------------------
+# These exercise the true gibss return contract. The mocked tests above use a
+# DummyState and so never caught: prior_variance being dropped, credible_set_report
+# reading a missing attribute, or dtype/centering drift between methods.
+
+
+def _real_fit_fixture(n_genes: int = 40, n_sets: int = 6, seed: int = 1):
+    rng = np.random.default_rng(seed)
+    gene_ids = [f"G{i}" for i in range(n_genes)]
+    set_ids = [f"S{j}" for j in range(n_sets)]
+    membership = (rng.random((n_genes, n_sets)) < 0.35).astype(np.float64)
+    for j in range(n_sets):  # no empty sets
+        if membership[:, j].sum() == 0:
+            membership[0, j] = 1.0
+    collection = GeneSetCollection(
+        gene_ids=gene_ids, set_ids=set_ids, membership=membership
+    )
+    gene_list = GeneList(gene_ids=gene_ids, included=(rng.random(n_genes) < 0.4))
+    effects = GeneEffects(
+        gene_ids=gene_ids,
+        effect_estimates=rng.normal(size=n_genes),
+        standard_errors=np.abs(rng.normal(size=n_genes)) + 0.5,
+    )
+    ranks = GeneRanks(
+        gene_ids=gene_ids,
+        rank=np.arange(1, n_genes + 1).astype(float),
+        event_observed=(rng.random(n_genes) < 0.7),
+    )
+    return collection, gene_list, effects, ranks
+
+
+@pytest.mark.parametrize("variant", ["local_jj", "quadrature"])
+def test_logistic_respects_fixed_prior_variance(variant):
+    # With estimation off, the requested prior variance must be used (not reset to 1).
+    collection, gene_list, _, _ = _real_fit_fixture()
+    fit = fit_gsea_susie_logistic(
+        collection, gene_list, L=1, max_iter=3, variant=variant,
+        prior_variance=7.0, estimate_prior_variance=False,
+    )
+    np.testing.assert_allclose(np.asarray(fit.model.prior_variance), 7.0)
+
+
+def test_linear_respects_fixed_prior_variance():
+    collection, _, effects, _ = _real_fit_fixture()
+    fit = fit_gsea_susie_linear(
+        collection, effects, L=1, max_iter=3,
+        prior_variance=7.0, estimate_prior_variance=False,
+    )
+    np.testing.assert_allclose(np.asarray(fit.model.prior_variance), 7.0)
+
+
+def test_credible_set_report_runs_on_real_fit():
+    collection, gene_list, _, _ = _real_fit_fixture()
+    fit = fit_gsea_susie_logistic(collection, gene_list, L=2, max_iter=3)
+    report = fit.credible_set_report()
+    assert isinstance(report, pl.DataFrame)
+    assert "prior_variance" in report.columns
+    assert report.height == len(fit.model.single_effects)
+
+
+def test_all_methods_center_by_default_and_run():
+    collection, gene_list, effects, ranks = _real_fit_fixture()
+    logistic = fit_gsea_susie_logistic(collection, gene_list, L=2, max_iter=3)
+    quadrature = fit_gsea_susie_logistic(
+        collection, gene_list, L=2, max_iter=3, variant="quadrature"
+    )
+    linear = fit_gsea_susie_linear(collection, effects, L=2, max_iter=3)
+    twogroup = fit_gsea_susie_twogroup(collection, effects, L=2, max_iter=3)
+    for fit in (logistic, quadrature, linear, twogroup):
+        assert fit.info["center"] is True
+        assert np.all(np.isfinite(fit.pips))
+    # Cox has no shared intercept, so it exposes no center knob.
+    cox = fit_gsea_susie_cox(collection, ranks, L=2, max_iter=3)
+    assert "center" not in cox.info
+    assert np.all(np.isfinite(cox.pips))
+
+
+def test_local_jj_center_toggles_profiled_intercept():
+    # local_jj cannot pre-center sparse data; center maps to the profiled intercept.
+    collection, gene_list, _, _ = _real_fit_fixture()
+    centered = fit_gsea_susie_logistic(collection, gene_list, L=1, max_iter=3, center=True)
+    uncentered = fit_gsea_susie_logistic(collection, gene_list, L=1, max_iter=3, center=False)
+    assert type(centered.model.single_effects[0]).__name__ == "LocalJJCenteredEffect"
+    assert type(uncentered.model.single_effects[0]).__name__ == "BaseSERState"
+
+
+def test_all_methods_produce_float64_outputs():
+    collection, gene_list, effects, ranks = _real_fit_fixture()
+    fits = [
+        fit_gsea_susie_logistic(collection, gene_list, L=1, max_iter=2),
+        fit_gsea_susie_linear(collection, effects, L=1, max_iter=2),
+        fit_gsea_susie_twogroup(collection, effects, L=1, max_iter=2),
+        fit_gsea_susie_cox(collection, ranks, L=1, max_iter=2),
+    ]
+    for fit in fits:
+        assert fit.pips.dtype == np.float64
+        assert fit.posterior_mean.dtype == np.float64

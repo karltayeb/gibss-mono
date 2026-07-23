@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, Callable, Generic, TypeVar
 
 import jax
@@ -279,6 +279,11 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
         return jnp.stack([e.mu for e in self.single_effects])
 
     @property
+    def prior_variance(self) -> jnp.ndarray:
+        """Per-effect prior variance (one entry per SER component)."""
+        return jnp.array([e.prior_variance for e in self.single_effects])
+
+    @property
     def pip(self) -> jnp.ndarray:
         return 1.0 - jnp.prod(1.0 - self.alpha, axis=0)
 
@@ -302,23 +307,50 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
 
 
 def _to_numpy_leaf(x):
-    if x is None or isinstance(x, (str, bool)):
+    """Move a single leaf to host numpy: a jax array becomes np.asarray (0-d -> python
+    float). Everything else -- numpy arrays, python scalars (int/float/bool), None,
+    strings, config objects -- is returned untouched, so ints stay ints (e.g. n_iter,
+    update_order) and only genuine jax arrays are pulled off-device."""
+    if isinstance(x, np.ndarray):
         return x
-    a = np.asarray(x)
-    return float(a) if a.ndim == 0 else a
+    if isinstance(x, jax.Array):
+        a = np.asarray(x)
+        return float(a) if a.ndim == 0 else a
+    return x
+
+
+def _to_numpy_tree(obj):
+    """Recursively move every jax array in a fitted-state tree to host numpy. Dataclass
+    instances are rebuilt field-by-field (uniformly covering single_effects,
+    total_message, family_state AND the previous_state snapshot), lists/tuples are mapped
+    elementwise (so float histories stay lists of floats and int tuples stay ints), and
+    any other leaf goes through `_to_numpy_leaf`. Uses structural sharing: a node is only
+    rebuilt when a jax array actually changed beneath it, so array-free config objects
+    (e.g. a fixed prior distribution) keep their identity. Idempotent; guarantees the
+    returned tree holds no jax arrays regardless of family/kernel."""
+    if is_dataclass(obj) and not isinstance(obj, type):
+        changes = {}
+        for f in fields(obj):
+            old = getattr(obj, f.name)
+            new = _to_numpy_tree(old)
+            if new is not old:
+                changes[f.name] = new
+        return replace(obj, **changes) if changes else obj
+    if isinstance(obj, list):
+        new = [_to_numpy_tree(v) for v in obj]
+        return new if any(a is not b for a, b in zip(new, obj)) else obj
+    if isinstance(obj, tuple):
+        new = tuple(_to_numpy_tree(v) for v in obj)
+        return new if any(a is not b for a, b in zip(new, obj)) else obj
+    return _to_numpy_leaf(obj)
 
 
 def state_to_numpy(state: GIBSSState) -> GIBSSState:
-    """Move a fitted state to host numpy: numpy-ify every effect field (arrays ->
-    np.asarray, 0-d -> float) and rebuild the total message by its type. Generic over
-    the effect/message dataclasses -- one implementation for every family."""
-    effects = [
-        replace(e, **{f: _to_numpy_leaf(getattr(e, f)) for f in e.__dataclass_fields__})
-        for e in state.single_effects
-    ]
-    tm = state.total_message
-    tm = tm.__class__(*(_to_numpy_leaf(getattr(tm, f)) for f in tm.__dataclass_fields__))
-    return replace(state, single_effects=effects, total_message=tm)
+    """Move a fitted state fully to host numpy so it carries no jax arrays and can be
+    pickled/saved. Walks the whole GIBSSState tree (effects, total_message,
+    family_state, and the previous_state snapshot) via `_to_numpy_tree` -- generic over
+    every family's dataclasses, with no per-field enumeration to fall out of date."""
+    return _to_numpy_tree(state)
 
 
 def to_numpy_state_step(data, state):

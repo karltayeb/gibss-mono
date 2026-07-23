@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from functools import partial
 from typing import Any, Sequence
 
 import jax.numpy as jnp
@@ -27,6 +26,11 @@ from gseasusie.gene_data import (
     GeneSetCollection,
     GeneStandardizedEffects,
 )
+
+# Single dtype for every SER fit. gibss enables jax_enable_x64 on import, and the
+# SER math (log-sum-exp normalization, Bayes factors, prior-variance estimation)
+# is precision-sensitive, so all methods run in float64 rather than mixing f32/f64.
+_DTYPE = np.float64
 
 
 def _resolve_distribution_spec(spec: Any) -> Any:
@@ -261,16 +265,16 @@ def _augment_with_fixed_pseudodata(
     membership: np.ndarray,
     y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    pseudodata_y = np.asarray([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    pseudodata_y = np.asarray([1.0, 1.0, 0.0, 0.0], dtype=_DTYPE)
     pseudodata_x = np.tile(
-        np.asarray([1.0, 0.0, 1.0, 0.0], dtype=np.float32)[:, None],
+        np.asarray([1.0, 0.0, 1.0, 0.0], dtype=_DTYPE)[:, None],
         (1, membership.shape[1]),
     )
     return (
         np.concatenate(
-            [np.asarray(membership, dtype=np.float32), pseudodata_x], axis=0
+            [np.asarray(membership, dtype=_DTYPE), pseudodata_x], axis=0
         ),
-        np.concatenate([np.asarray(y, dtype=np.float32), pseudodata_y], axis=0),
+        np.concatenate([np.asarray(y, dtype=_DTYPE), pseudodata_y], axis=0),
     )
 
 
@@ -331,8 +335,8 @@ def _prepare_gsea_susie_logistic_inputs(
     }
     metadata["response_type"] = "GeneList"
     return {
-        "membership": np.asarray(filtered_collection.membership, dtype=np.float32),
-        "y": np.asarray(aligned_response.y, dtype=np.float32),
+        "membership": np.asarray(filtered_collection.membership, dtype=_DTYPE),
+        "y": np.asarray(aligned_response.y, dtype=_DTYPE),
         "gene_ids": list(filtered_collection.gene_ids),
         "set_ids": list(filtered_collection.set_ids),
         "set_sizes": np.asarray(filtered_collection.membership.sum(axis=0), dtype=int),
@@ -357,11 +361,11 @@ def _prepare_gsea_susie_cox_inputs(
     if filtered_collection.membership.shape[1] == 0:
         raise ValueError("No gene sets remain after alignment and size filtering.")
     return {
-        "membership": np.asarray(filtered_collection.membership, dtype=np.float32),
+        "membership": np.asarray(filtered_collection.membership, dtype=_DTYPE),
         "y": np.column_stack(
             [
-                np.asarray(aligned_response.rank, dtype=np.float32),
-                np.asarray(aligned_response.event_observed, dtype=np.float32),
+                np.asarray(aligned_response.rank, dtype=_DTYPE),
+                np.asarray(aligned_response.event_observed, dtype=_DTYPE),
             ]
         ),
         "gene_ids": list(filtered_collection.gene_ids),
@@ -404,8 +408,8 @@ def _prepare_gsea_susie_linear_inputs(
         y = aligned_response.z_scores
 
     return {
-        "membership": np.asarray(filtered_collection.membership, dtype=np.float32),
-        "y": np.asarray(y, dtype=np.float32),
+        "membership": np.asarray(filtered_collection.membership, dtype=_DTYPE),
+        "y": np.asarray(y, dtype=_DTYPE),
         "gene_ids": list(filtered_collection.gene_ids),
         "set_ids": list(filtered_collection.set_ids),
         "set_sizes": np.asarray(filtered_collection.membership.sum(axis=0), dtype=int),
@@ -477,6 +481,7 @@ def fit_gsea_susie_logistic(
     variant: str = "local_jj",
     prior_variance: float = 1.0,
     estimate_prior_variance: bool = True,
+    center: bool = True,
     max_iter: int = 50,
     tol: float = 1e-4,
     coverage: float = 0.95,
@@ -490,21 +495,25 @@ def fit_gsea_susie_logistic(
         min_set_size=min_set_size,
         max_set_size=max_set_size,
     )
-    fit_membership = np.asarray(prepared["membership"], dtype=np.float32)
-    fit_y = np.asarray(prepared["y"], dtype=np.float32)
+    fit_membership = np.asarray(prepared["membership"], dtype=_DTYPE)
+    fit_y = np.asarray(prepared["y"], dtype=_DTYPE)
     if use_pseudodata:
         fit_membership, fit_y = _augment_with_fixed_pseudodata(fit_membership, fit_y)
 
-    X_sparse = sparse.BCOO.fromdense(jnp.asarray(fit_membership, dtype=jnp.float32))
-    y_jax = jnp.asarray(fit_y, dtype=jnp.float32)
+    X_sparse = sparse.BCOO.fromdense(jnp.asarray(fit_membership, dtype=_DTYPE))
+    y_jax = jnp.asarray(fit_y, dtype=_DTYPE)
 
     l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
 
     if variant == "local_jj":
+        # local_jj rejects sparse pre-centering; it decouples the shared intercept
+        # via a per-feature profiled intercept instead. `center` maps to `profile`.
+        family_kwargs.setdefault("profile", bool(center))
         data = gibss.legacy.localjj.prep_data(X_sparse, y_jax)
         init_state = gibss.legacy.localjj.initialize_state(
             data,
             L=l_model,
+            prior_variance=float(prior_variance),
             family_state_kwargs={
                 "estimate_prior_variance": bool(estimate_prior_variance),
                 **family_kwargs,
@@ -512,10 +521,15 @@ def fit_gsea_susie_logistic(
         )
         schedule = gibss.legacy.localjj.default_schedule()
     elif variant == "quadrature":
-        data = gibss.legacy.logistic_localtaylor.prep_data(X_sparse, y_jax)
+        # quadrature pre-centers the design (BCOO implicit column_center) to
+        # decouple the shared intercept.
+        data = gibss.legacy.logistic_localtaylor.prep_data(
+            X_sparse, y_jax, center=bool(center)
+        )
         init_state = gibss.legacy.logistic_localtaylor.initialize_state(
             data,
             L=l_model,
+            prior_variance=float(prior_variance),
             family_state_kwargs={
                 "estimate_prior_variance": bool(estimate_prior_variance),
                 **family_kwargs,
@@ -549,6 +563,7 @@ def fit_gsea_susie_logistic(
             "method": "logistic",
             "variant": variant,
             "use_pseudodata": bool(use_pseudodata),
+            "center": bool(center),
         },
         coverage=coverage,
     )
@@ -569,6 +584,8 @@ def fit_gsea_susie_cox(
     verbose: bool = False,
     **family_kwargs,
 ) -> GSEASuSiEResult:
+    # Cox has no shared intercept (the baseline hazard cancels in the partial
+    # likelihood), so there is no intercept to decouple and hence no `center` knob.
     prepared = _prepare_gsea_susie_cox_inputs(
         gene_sets,
         response,
@@ -576,9 +593,9 @@ def fit_gsea_susie_cox(
         max_set_size=max_set_size,
     )
     X_sparse = sparse.BCOO.fromdense(
-        jnp.asarray(prepared["membership"], dtype=jnp.float32)
+        jnp.asarray(prepared["membership"], dtype=_DTYPE)
     )
-    y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)
+    y_jax = jnp.asarray(prepared["y"], dtype=_DTYPE)
 
     l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
 
@@ -586,6 +603,7 @@ def fit_gsea_susie_cox(
     init_state = gibss.cox.initialize_state(
         data,
         L=l_model,
+        prior_variance=float(prior_variance),
         family_state_kwargs={
             "estimate_prior_variance": bool(estimate_prior_variance),
             **family_kwargs,
@@ -626,6 +644,7 @@ def fit_gsea_susie_linear(
     L: int | None = None,
     prior_variance: float = 1.0,
     estimate_prior_variance: bool = True,
+    center: bool = True,
     max_iter: int = 50,
     tol: float = 1e-4,
     coverage: float = 0.95,
@@ -640,16 +659,19 @@ def fit_gsea_susie_linear(
         max_set_size=max_set_size,
     )
     X_sparse = sparse.BCOO.fromdense(
-        jnp.asarray(prepared["membership"], dtype=jnp.float32)
+        jnp.asarray(prepared["membership"], dtype=_DTYPE)
     )
-    y_jax = jnp.asarray(prepared["y"], dtype=jnp.float32)
+    y_jax = jnp.asarray(prepared["y"], dtype=_DTYPE)
 
     l_model = min(10, X_sparse.shape[1]) if L is None else int(L)
 
-    data = gibss.linear.prep_data(X_sparse, y_jax)
+    # Pre-center the design (BCOO implicit column_center) to decouple the shared
+    # intercept from the features.
+    data = gibss.linear.prep_data(X_sparse, y_jax, center=bool(center))
     init_state = gibss.linear.initialize_state(
         data,
         L=l_model,
+        prior_variance=float(prior_variance),
         family_state_kwargs={
             "estimate_prior_variance": bool(estimate_prior_variance),
             **family_kwargs,
@@ -676,7 +698,7 @@ def fit_gsea_susie_linear(
         gene_ids=prepared["gene_ids"],
         set_ids=prepared["set_ids"],
         set_sizes=prepared["set_sizes"],
-        info={**prepared["info"], "method": "linear"},
+        info={**prepared["info"], "method": "linear", "center": bool(center)},
         coverage=coverage,
     )
 
@@ -714,8 +736,8 @@ def _prepare_gsea_susie_twogroup_inputs(
         se = np.ones_like(bhat)
 
     return {
-        "membership": np.asarray(filtered_collection.membership, dtype=np.float32),
-        "y": np.column_stack([bhat, se]).astype(np.float32),
+        "membership": np.asarray(filtered_collection.membership, dtype=_DTYPE),
+        "y": np.column_stack([bhat, se]).astype(_DTYPE),
         "gene_ids": list(filtered_collection.gene_ids),
         "set_ids": list(filtered_collection.set_ids),
         "set_sizes": np.asarray(filtered_collection.membership.sum(axis=0), dtype=int),
@@ -743,6 +765,7 @@ def fit_gsea_susie_twogroup(
     f1: Any | None = None,
     prior_variance: float = 1.0,
     estimate_prior_variance: bool = True,
+    center: bool = True,
     nullweight: float = 1.0,
     max_iter: int = 50,
     coverage: float = 0.95,
@@ -769,29 +792,27 @@ def fit_gsea_susie_twogroup(
         max_set_size=max_set_size,
         normalize=normalize,
     )
-    membership = jnp.asarray(prepared["membership"], dtype=jnp.float64)
+    membership = jnp.asarray(prepared["membership"], dtype=_DTYPE)
     X_model = sparse.BCOO.fromdense(membership)
-    y = np.asarray(prepared["y"], dtype=np.float64)
+    y = np.asarray(prepared["y"], dtype=_DTYPE)
     bhat, se = y[:, 0], y[:, 1]
     l_model = min(10, X_model.shape[1]) if L is None else int(L)
 
     f0_obj = _resolve_distribution_spec(
         f0 or {"function": "point_mass", "kwargs": {"value": 0.0}}
     )
-    f1_obj = _resolve_distribution_spec(
-        f1
-        or {
-            "function": "normal",
-            "kwargs": {"loc": 0.0, "scale": 1.0, "estimate_loc": True},
-        }
-    )
+    # f1=None falls through to gibss.twogroup's default: ash_scale_mixture(bhat,
+    # se), a zero-mean scale mixture on ash's data-driven autoselect_scales grid.
+    f1_obj = None if f1 is None else _resolve_distribution_spec(f1)
 
     fs_kwargs = {"estimate_prior_variance": bool(estimate_prior_variance)}
     if family_state_kwargs:
         fs_kwargs.update(family_state_kwargs)
 
-    # BCOO membership: the glm kernels don't consume sparse pre-centering, so
-    # fit on the raw (uncentered) design (center=False).
+    # Pre-center the design to decouple the shared intercept. The default quad
+    # kernel consumes BCOO implicit column-centering (glm_center_ser); centering is
+    # the two-group's only intercept-decoupling route (its profiled intercept is
+    # degenerate).
     state = gibss.twogroup.fit(
         X_model,
         bhat,
@@ -804,7 +825,7 @@ def fit_gsea_susie_twogroup(
         prior_variance=prior_variance,
         nullweight=nullweight,
         family_state_kwargs=fs_kwargs,
-        center=False,
+        center=bool(center),
     )
 
     return _make_gsea_susie_result(
@@ -815,6 +836,7 @@ def fit_gsea_susie_twogroup(
         info={
             **prepared["info"],
             "method": "twogroup",
+            "center": bool(center),
         },
         coverage=coverage,
     )

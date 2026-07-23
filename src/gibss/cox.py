@@ -592,11 +592,12 @@ def initialize_state(
     data: CoxData,
     L: int = 1,
     family_state_kwargs: dict | None = None,
+    prior_variance: float = 1.0,
 ) -> GIBSSState[CoxFamilyState, MeanMessage]:
     """Initialize Cox state with empty effects and a zero mean-only message."""
     n, p = data.X.shape
     return GIBSSState(
-        single_effects=[_empty_effect(p, 1.0) for _ in range(L)],
+        single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=MeanMessage(jnp.zeros(n)),
         family_state=CoxFamilyState(
             **({} if family_state_kwargs is None else dict(family_state_kwargs))
