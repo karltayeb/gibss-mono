@@ -104,15 +104,31 @@ class Normal:
         weights = jnp.asarray(weights)
         sum_w = jnp.maximum(jnp.sum(weights), 1e-30)
 
+        # One generalized-EM M-step for the normal-means marginal
+        # bhat_i ~ N(loc, se_i^2 + scale^2) with responsibilities `weights`, via
+        # the latent theta_i ~ N(loc, scale^2), bhat_i | theta_i ~ N(theta_i, se_i^2).
+        # The plain moment update (scale^2 = wmean((bhat-loc)^2) - wmean(se^2)) is
+        # the MLE only for homoskedastic se; under unequal se it lets the
+        # low-precision observations dominate the subtracted noise term and has a
+        # spurious scale->0 fixed point (f1 collapses onto f0). This EM step is
+        # precision-weighted through the posterior mean/variance (shrink -> 0 for
+        # high-se rows) and is monotone in the expected complete-data loglik.
+        scale2 = float(self.scale) ** 2
+        marginal_var = jnp.square(se) + scale2
+        shrink = scale2 / marginal_var
+        post_mean = float(self.loc) + shrink * (bhat - float(self.loc))
+        post_var = shrink * jnp.square(se)  # = scale^2 * se^2 / marginal_var
+
         loc = float(self.loc)
         if self.estimate_loc:
-            loc = float(jnp.sum(weights * bhat) / sum_w)
+            loc = float(jnp.sum(weights * post_mean) / sum_w)
 
         scale = float(self.scale)
         if self.estimate_scale:
-            centered_second = jnp.sum(weights * jnp.square(bhat - loc)) / sum_w
-            mean_se_sq = jnp.sum(weights * jnp.square(se)) / sum_w
-            scale = float(jnp.sqrt(jnp.maximum(centered_second - mean_se_sq, 1e-8)))
+            second = (
+                jnp.sum(weights * (jnp.square(post_mean - loc) + post_var)) / sum_w
+            )
+            scale = float(jnp.sqrt(jnp.maximum(second, 1e-8)))
 
         return replace(self, loc=loc, scale=scale)
 
@@ -207,24 +223,38 @@ class NormalMixture:
         if self.estimate_weights:
             new_weights = _normalize_weights(component_weight_sums)
 
+        # Per-component generalized-EM M-step via the latent theta (see
+        # Normal.update_nm): precision-weighted posterior mean/variance, not the
+        # plain moment update, so heteroskedastic se cannot collapse a component
+        # scale onto zero.
         new_locs = self.locs
-        if self.estimate_locs:
-            new_locs = jnp.sum(weighted_responsibilities * bhat[:, None], axis=0) / jnp.maximum(
-                component_weight_sums,
-                1e-30,
-            )
-
         new_scales = self.scales
-        if self.estimate_scales:
-            centered_second = jnp.sum(
-                weighted_responsibilities * jnp.square(bhat[:, None] - new_locs[None, :]),
-                axis=0,
-            ) / jnp.maximum(component_weight_sums, 1e-30)
-            mean_se_sq = jnp.sum(
-                weighted_responsibilities * jnp.square(se)[:, None],
-                axis=0,
-            ) / jnp.maximum(component_weight_sums, 1e-30)
-            new_scales = jnp.sqrt(jnp.maximum(centered_second - mean_se_sq, 1e-8))
+        if self.estimate_locs or self.estimate_scales:
+            scale2 = jnp.square(self.scales)[None, :]  # (1, K)
+            marginal_var = jnp.square(se)[:, None] + scale2  # (n, K)
+            shrink = scale2 / marginal_var
+            post_mean = self.locs[None, :] + shrink * (
+                bhat[:, None] - self.locs[None, :]
+            )
+            post_var = shrink * jnp.square(se)[:, None]
+            denom = jnp.maximum(component_weight_sums, 1e-30)
+
+            if self.estimate_locs:
+                new_locs = (
+                    jnp.sum(weighted_responsibilities * post_mean, axis=0) / denom
+                )
+
+            if self.estimate_scales:
+                loc_ref = new_locs if self.estimate_locs else self.locs
+                second = (
+                    jnp.sum(
+                        weighted_responsibilities
+                        * (jnp.square(post_mean - loc_ref[None, :]) + post_var),
+                        axis=0,
+                    )
+                    / denom
+                )
+                new_scales = jnp.sqrt(jnp.maximum(second, 1e-8))
 
         return replace(
             self,
