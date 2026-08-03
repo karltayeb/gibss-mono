@@ -4,10 +4,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import sparse
+from scipy.special import logsumexp
 
 from gibss.operators import BCOOOperator, CenteredOperator, DenseOperator
 from gibss.response import (
     GH,
+    MixtureGH,
     Bernoulli,
     Gaussian,
     JJEnvelope,
@@ -118,6 +120,74 @@ def test_poisson_glm_ser_matches_brute():
 
     brute = np.array([_brute_glm_logbf(loglik, X, off, y, j) for j in range(p)])
     np.testing.assert_allclose(np.asarray(ps[2]), brute, atol=3e-3)
+
+
+# --------------------------------------------------------------------------- #
+# MixtureGH offset through the SER kernels (per-row Gaussian mixture offset)
+# --------------------------------------------------------------------------- #
+def _mixture_data(seed=0, n=180, p=5, Kc=2):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.4
+    y = rng.binomial(1, 1 / (1 + np.exp(-(off + 1.2 * X[:, 0]))), n).astype(float)
+    means = rng.normal(size=(n, Kc)) * 0.6
+    vars_ = np.abs(rng.normal(size=(n, Kc))) + 0.2
+    log_pi = rng.normal(size=(n, Kc))
+    return X, off, y, means, vars_, log_pi
+
+
+@pytest.mark.parametrize("kernel", [glm_ser, glm_profile_ser])
+def test_mixture_gh_one_component_equals_gh_kernel(kernel):
+    # K=1, zero shift, var=ov -> the mixture aux reproduces the single-Gaussian GH
+    # smoother THROUGH the kernel (guards broadcast_rows and the _background reshape).
+    rng = np.random.default_rng(4)
+    n, p = 160, 5
+    X = rng.normal(size=(n, p))
+    off = rng.normal(size=n) * 0.4
+    ov = np.abs(rng.normal(size=n)) + 0.5
+    y = rng.binomial(1, 1 / (1 + np.exp(-(off + 1.1 * X[:, 0]))), n).astype(float)
+    op = DenseOperator(jnp.asarray(X))
+    gh = kernel(op, (jnp.asarray(y), jnp.asarray(ov)), jnp.asarray(off), 1.0,
+                Smoothed(Bernoulli(), GH(order=15)), order=15)
+    mix_aux = (jnp.asarray(y), jnp.zeros((n, 1)), jnp.asarray(ov)[:, None], jnp.zeros((n, 1)))
+    mix = kernel(op, mix_aux, jnp.asarray(off), 1.0,
+                 Smoothed(Bernoulli(), MixtureGH(order=15)), order=15)
+    for a, b in zip(mix, gh):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-9)
+
+
+def _brute_mixture_logbf(y, X, off, means, vars_, log_pi, j, pv=1.0, gh=64):
+    """Independent brute log-BF for glm_ser with a per-row logistic mixture offset:
+    integrate the mixture-smoothed loglik over b (Gauss prior) and over the offset."""
+    xk, wk = np.polynomial.hermite_e.hermegauss(gh)
+    wk = wk / np.sqrt(2 * np.pi)
+    pi = np.exp(log_pi - logsumexp(log_pi, axis=1, keepdims=True))  # (n, Kc)
+
+    def sll_sum(eta):  # sum_i E_{o_i}[ y_i(eta_i+o) - softplus(eta_i+o) ]
+        tot = np.zeros_like(eta)
+        for k in range(means.shape[1]):
+            sd = np.sqrt(np.maximum(vars_[:, k], 0.0))
+            sh = eta[:, None] + means[:, k][:, None] + xk[None, :] * sd[:, None]
+            tot += pi[:, k] * ((y[:, None] * sh - np.logaddexp(0, sh)) @ wk)
+        return tot.sum()
+
+    zb = np.linspace(-9, 9, 401)
+    dz = zb[1] - zb[0]
+    bpri = np.exp(-(zb**2) / (2 * pv)) / np.sqrt(2 * np.pi * pv)
+    ll = np.array([sll_sum(off + X[:, j] * b) for b in zb])
+    ll0 = sll_sum(off)
+    return np.log(np.sum(np.exp(ll - ll0) * bpri) * dz)
+
+
+def test_glm_ser_mixture_matches_brute():
+    # end-to-end: glm_ser with a Smoothed(Bernoulli, MixtureGH) per-row 2-component
+    # offset reproduces an independent double integral (over b and the mixture offset).
+    X, off, y, means, vars_, log_pi = _mixture_data(seed=1, n=120, p=4, Kc=2)
+    op = DenseOperator(jnp.asarray(X))
+    aux = (jnp.asarray(y), jnp.asarray(means), jnp.asarray(vars_), jnp.asarray(log_pi))
+    g = glm_ser(op, aux, jnp.asarray(off), 1.0, Smoothed(Bernoulli(), MixtureGH(order=25)), order=25)
+    brute = np.array([_brute_mixture_logbf(y, X, off, means, vars_, log_pi, j) for j in range(X.shape[1])])
+    np.testing.assert_allclose(np.asarray(g[2]), brute, atol=3e-3)
 
 
 def test_gaussian_glm_ser_matches_closed_form():

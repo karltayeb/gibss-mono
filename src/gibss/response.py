@@ -40,6 +40,7 @@ __all__ = [
     "ExponentialFamily",
     "Smoother",
     "GH",
+    "MixtureGH",
     "Taylor",
     "TaylorFixed",
     "JJEnvelope",
@@ -152,6 +153,49 @@ class GH(Smoother):
         shft = eta[None, ...] + sd[None, ...] * nodes  # (order, *eta.shape)
         ll, g, w = base.terms(shft, jnp.asarray(y)[None, ...])
         return jnp.sum(wts * ll, 0), jnp.sum(wts * g, 0), jnp.sum(wts * w, 0)
+
+
+@dataclass(frozen=True)
+class MixtureGH(Smoother):
+    """Per-row Gaussian-MIXTURE offset: `Atilde = sum_k pi_ik E_{N(m_ik, v_ik)} A(eta + o)`.
+
+    The mixture generalization of `GH`: the offset law is a per-observation mixture
+    `o_i ~ sum_k pi_ik N(m_ik, v_ik)` instead of one Gaussian. Because Atilde is linear
+    in the offset law, the smoothed terms are just the positive-weighted sum of
+    `base.terms` over the `K * order` shifted predictors `eta + m_ik + sqrt(2 v_ik) x_j`
+    with weight `pi_ik * (w_j / sqrt(pi))`. Works for ANY base (same averaging-commutes
+    argument as `GH`); positive weights preserve convexity; NOT certified.
+
+    aux = (y, means, vars, log_pi): `means`, `vars`, `log_pi` are each (n, K) -- the
+    per-row component mean shifts (added on top of eta), variances, and mixture logits.
+    `log_pi` is normalized over the K axis internally (softmax), so pass logits or
+    log-probs. `means` are shifts ON TOP OF eta: if the overall message mean already
+    lives in the fixed offset inside eta, pass centered components (sum_k pi_ik m_ik = 0);
+    if not, pass absolute means -- the smoothed terms are identical either way, since the
+    linear term collapses to `y*(eta + sum_k pi_ik m_ik)`. K=1 with means=0 reduces
+    exactly to `GH`. Costs `K * order` likelihood passes.
+    """
+
+    order: int = 5
+
+    def terms(self, base, eta, aux):
+        y, means, vars_, log_pi = aux
+        nodes_np, wts_np = np.polynomial.hermite.hermgauss(self.order)
+        wj = jnp.asarray(wts_np / np.sqrt(np.pi))  # GH weights, sum to 1
+        pi = jax.nn.softmax(jnp.asarray(log_pi), axis=-1)  # (..., K), sum to 1 over K
+        sd = jnp.sqrt(2.0 * jnp.maximum(jnp.asarray(vars_), 0.0))
+        # K is the trailing axis of the mixture leaves; the GH order is a fresh leading
+        # axis. Open a trailing K slot on the K-free leaves (eta, y) so every array
+        # shares one rank, then broadcast to (order, *eta, K) and reduce both away.
+        eta_k = eta[..., None]
+        y_k = jnp.asarray(y)[..., None]
+        m = eta_k.ndim
+        node = jnp.asarray(nodes_np).reshape((self.order,) + (1,) * m)
+        shift = eta_k[None] + jnp.asarray(means)[None] + sd[None] * node  # (order, *eta, K)
+        ll, g, w = base.terms(shift, y_k[None])
+        W = wj.reshape((self.order,) + (1,) * m) * pi[None]  # (order, *eta, K)
+        red = lambda t: jnp.sum(W * t, axis=(0, -1))  # noqa: E731
+        return red(ll), red(g), red(w)
 
 
 @dataclass(frozen=True)

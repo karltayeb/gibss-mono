@@ -15,6 +15,7 @@ import pytest
 
 from gibss.response import (
     GH,
+    MixtureGH,
     Bernoulli,
     JJFixed,
     JJEnvelope,
@@ -102,6 +103,107 @@ def test_gh_works_for_non_exponential_base():
     got = Smoothed(TwoGroupMarginal(), GH(order=40)).terms(eta, (llr, ov))
     for a, b in zip(got, refs):
         assert jnp.allclose(a, b, atol=1e-8)
+
+
+# --------------------------------------------------------------------------- #
+# MixtureGH: per-row Gaussian-mixture offset
+# --------------------------------------------------------------------------- #
+def _dense_mixture_terms(base, eta, y, means, vars_, log_pi, K=80):
+    """Reference E_o[terms(eta+o)] for o_i ~ sum_k pi_ik N(means_ik, vars_ik),
+    each component by dense 80-node probabilists' GH, mixed by the (softmax) weights."""
+    xk, wk = np.polynomial.hermite_e.hermegauss(K)
+    wk = jnp.asarray(wk / np.sqrt(2 * np.pi))[:, None]  # (K, 1)
+    pi = jax.nn.softmax(jnp.asarray(log_pi), axis=-1)   # (n, Kc)
+    out = [jnp.zeros_like(eta) for _ in range(3)]
+    for k in range(means.shape[-1]):
+        sd = jnp.sqrt(jnp.maximum(vars_[:, k], 0.0))
+        shift = eta[None, :] + means[:, k][None, :] + jnp.asarray(xk)[:, None] * sd[None, :]
+        comp = [jnp.sum(wk * t, 0) for t in base.terms(shift, jnp.asarray(y)[None, :])]
+        out = [o + pi[:, k] * c for o, c in zip(out, comp)]
+    return out
+
+
+def test_mixture_gh_one_component_matches_gh():
+    # K=1, zero mean shift, variance = ov -> exactly the single-Gaussian GH smoother
+    eta = jnp.asarray(RNG.normal(size=20))
+    y = jnp.asarray((RNG.random(20) < 0.5).astype(float))
+    ov = jnp.asarray(np.abs(RNG.normal(size=20)) + 0.5)
+    for order in (5, 15, 40):
+        want = Smoothed(Bernoulli(), GH(order=order)).terms(eta, (y, ov))
+        got = Smoothed(Bernoulli(), MixtureGH(order=order)).terms(
+            eta, (y, jnp.zeros((20, 1)), ov[:, None], jnp.zeros((20, 1)))
+        )
+        for a, b in zip(got, want):
+            assert jnp.allclose(a, b, atol=1e-12)
+
+
+@pytest.mark.parametrize("base,mkaux", [
+    (Bernoulli(), lambda k: jnp.asarray((RNG.random(k) < 0.5).astype(float))),
+    (Poisson(), lambda k: jnp.asarray(RNG.integers(0, 4, size=k).astype(float))),
+])
+def test_mixture_gh_matches_brute_mixture(base, mkaux):
+    # per-row 3-component mixture with distinct means/vars/weights per observation
+    n, Kc = 25, 3
+    eta = jnp.asarray(RNG.normal(size=n))
+    y = mkaux(n)
+    means = jnp.asarray(RNG.normal(size=(n, Kc)) * 0.8)
+    vars_ = jnp.asarray(np.abs(RNG.normal(size=(n, Kc))) + 0.2)
+    log_pi = jnp.asarray(RNG.normal(size=(n, Kc)))
+    ref = _dense_mixture_terms(base, eta, y, means, vars_, log_pi)
+    got = Smoothed(base, MixtureGH(order=40)).terms(eta, (y, means, vars_, log_pi))
+    for a, b in zip(got, ref):
+        assert jnp.allclose(a, b, atol=1e-8)
+
+
+def test_mixture_gh_zero_variance_is_weighted_base_at_shifted_means():
+    # vars=0 -> each component collapses to a point mass at eta+means_k; the smoothed
+    # terms are the pi-weighted base terms at those shifted predictors.
+    n, Kc = 15, 2
+    eta = jnp.asarray(RNG.normal(size=n))
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    means = jnp.asarray(RNG.normal(size=(n, Kc)))
+    log_pi = jnp.asarray(RNG.normal(size=(n, Kc)))
+    pi = jax.nn.softmax(log_pi, axis=-1)
+    got = Smoothed(Bernoulli(), MixtureGH(order=7)).terms(
+        eta, (y, means, jnp.zeros((n, Kc)), log_pi)
+    )
+    ref = [jnp.zeros(n) for _ in range(3)]
+    for k in range(Kc):
+        comp = Bernoulli().terms(eta + means[:, k], y)
+        ref = [r + pi[:, k] * c for r, c in zip(ref, comp)]
+    for a, b in zip(got, ref):
+        assert jnp.allclose(a, b, atol=1e-10)
+
+
+def test_mixture_gh_grad_weight_are_derivatives_of_loglik_hat():
+    # Newton-consistency: grad = d/deta loglik_hat, weight = -d2/deta2 loglik_hat
+    n, Kc = 12, 3
+    eta = jnp.asarray(RNG.normal(size=n))
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    means = jnp.asarray(RNG.normal(size=(n, Kc)) * 0.5)
+    vars_ = jnp.asarray(np.abs(RNG.normal(size=(n, Kc))) + 0.3)
+    log_pi = jnp.asarray(RNG.normal(size=(n, Kc)))
+    sm = Smoothed(Bernoulli(), MixtureGH(order=20))
+
+    def ll_hat(e):
+        return jnp.sum(sm.terms(e, (y, means, vars_, log_pi))[0])
+
+    _, g, w = sm.terms(eta, (y, means, vars_, log_pi))
+    assert jnp.allclose(g, jax.grad(ll_hat)(eta), atol=1e-9)
+    w_ad = -jax.grad(lambda e: jnp.sum(jax.grad(ll_hat)(e)))(eta)
+    assert jnp.allclose(w, w_ad, atol=1e-8)
+
+
+def test_mixture_gh_flags_and_positive_weight():
+    assert MixtureGH().convex and not MixtureGH().certified
+    n, Kc = 30, 4
+    eta = jnp.asarray(RNG.normal(size=n) * 2.0)
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    means = jnp.asarray(RNG.normal(size=(n, Kc)))
+    vars_ = jnp.asarray(np.abs(RNG.normal(size=(n, Kc))) + 0.1)
+    log_pi = jnp.asarray(RNG.normal(size=(n, Kc)))
+    w = Smoothed(Bernoulli(), MixtureGH(order=15)).terms(eta, (y, means, vars_, log_pi))[2]
+    assert jnp.all(w > 0.0)
 
 
 @pytest.mark.parametrize("smoother", [Taylor(), GH()])

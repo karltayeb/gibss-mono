@@ -79,7 +79,10 @@ def _background(response, offset, aux, c, mode: str = "exact", degree: int = 40)
     # exact: sum over rows at eta = offset + c, for c of any shape ((p,) or (order, p))
     lead = (-1,) + (1,) * c.ndim
     eta0 = offset.reshape(lead) + c[None, ...]  # (n, *c.shape)
-    ll, g, w = response.terms(eta0, _tmap(lambda a: a.reshape(lead), aux))
+    # Insert c.ndim singletons after the row axis but KEEP each leaf's trailing axes,
+    # so a per-row mixture leaf (n, K) stays (n, 1.., K) instead of flattening n*K.
+    reshape_row = lambda a: a.reshape((a.shape[0],) + (1,) * c.ndim + a.shape[1:])  # noqa: E731
+    ll, g, w = response.terms(eta0, _tmap(reshape_row, aux))
     return jnp.sum(w, 0), jnp.sum(g, 0), jnp.sum(ll, 0)
 
 
