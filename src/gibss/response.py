@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._numerics import _cheb_fit_matrix, _clenshaw_batched
+from ._numerics import _cheb_fit_matrix, _clenshaw_batched, _gh_rule
 
 __all__ = [
     "ResponseModel",
@@ -201,6 +201,31 @@ class MixtureGH(Smoother):
         return red(ll), red(g), red(w)
 
 
+def _mixture_gh_points(znodes, means, vars_, log_pi, xgh, wgh):
+    """The Gauss-Hermite-over-mixture evaluation grid for `E_o[f(z + o)]` with
+    `o_i ~ sum_k pi_ik N(means_ik, vars_ik)`. Returns (points, W) of shapes
+    (n, Z, K, Q) and (n, 1, K, Q): `points[i, z, k, q] = znodes[i, z] + means_ik +
+    sqrt(2 vars_ik) x_q` and `W = pi_ik * wgh_q`, summing to 1 over the (K, Q) axes.
+    `znodes` is (n, Z) node grid, the mixture leaves (n, K), `xgh`/`wgh` (Q,)."""
+    sd = jnp.sqrt(2.0 * jnp.maximum(vars_, 0.0))  # (n, K)
+    o = means[:, None, :, None] + sd[:, None, :, None] * xgh[None, None, None, :]
+    points = znodes[:, :, None, None] + o  # (n, Z, K, Q)
+    pi = jax.nn.softmax(log_pi, axis=-1)  # (n, K)
+    W = pi[:, None, :, None] * wgh[None, None, None, :]  # (n, 1, K, Q)
+    return points, W
+
+
+def _eval_resid_grid(coef, center, halfwidth, points):
+    """Evaluate a per-row Chebyshev residual (coeffs (n, D+1), interval center/
+    halfwidth (n,)) on a (n, Z, K, Q) `points` grid, clamped to [-1, 1] so values
+    outside the fit interval return the endpoint (~0)."""
+    t = jnp.clip(
+        (points - center[:, None, None, None]) / halfwidth[:, None, None, None],
+        -1.0, 1.0,
+    )
+    return _clenshaw_batched(coef[:, None, None, None, :], t)  # (n, Z, K, Q)
+
+
 @dataclass(frozen=True)
 class Compress(Smoother):
     """Amortized Chebyshev compression of a per-row offset correction.
@@ -284,6 +309,88 @@ class Compress(Smoother):
         coef_g = fit(sg - bg)
         coef_w = fit(sw - bw)
         return y, obar, center, halfwidth, coef_ll, coef_g, coef_w
+
+    def build_aux_sequential(self, base, y, effects):
+        """Build the compressed aux for a SUM of independent per-row offsets by folding
+        one effect at a time -- the exact way to handle the product mixture without
+        materializing its `prod_l K_l` components.
+
+        `effects` is an iterable of `(means, vars, log_pi)` mixtures (each (n, K), the
+        `MixtureGH` contract, K free per effect). Under mean-field independence the
+        offset cumulant is an iterated expectation `Atilde = E_o1 ... E_oL[A(z + sum o)]`,
+        so we peel the effects: `A^(m)(z) = E_{o^(m)}[A^(m-1)(z + o^(m))]`, starting from
+        `A^(0) = A`. Each fold costs O(K * order) per node, not O(prod K), and is exact
+        up to the fold quadrature (`inner.order`) and the per-stage Chebyshev refit.
+
+        We keep the plug-in/residual split of `build_aux` at every stage: carry the
+        analytic plug-in `A(z + s_m)` (s_m = cumulative mean, valid everywhere) plus a
+        compressed residual `r^(m) = A^(m) - A(z + s_m)` and its first two derivatives
+        (all y-free, bounded, and decaying at both ends -- the Jensen gap accumulated so
+        far). The residual recurrence per stage is the fresh single-effect residual of A
+        over `o^(m)` plus the folded previous residual `E_{o^(m)}[r^(m-1)(z + o^(m))]`.
+
+        Intervals stay well behaved because variances ADD: stage m centers at `-s_m`
+        with half-width `T + kappa sqrt(V_m)`, V_m the cumulative offset variance. That
+        grows monotonically and tracks the true (CLT) spread of the aggregate offset --
+        including between-component dispersion, so multimodal offsets are covered too --
+        and the residual clamp keeps a fold that reaches slightly past a previous stage's
+        interval safe (it reads ~0 there, which is correct). Because the fold is a
+        sup-norm contraction, per-stage refit errors accumulate additively, not
+        multiplicatively; and each fold smooths, so later stages only get easier.
+
+        Returns the same aux as `build_aux`; with a single effect it matches it (up to
+        the interval convention). Reduces to `A` when `effects` is empty."""
+        y = jnp.asarray(y)
+        n = y.shape[0]
+        xgh_np, logw_np = _gh_rule(self.inner.order)
+        xgh = jnp.asarray(xgh_np)
+        wgh = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))  # sum to 1
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+
+        s = jnp.zeros(n)  # cumulative mean shift s_m
+        V = jnp.zeros(n)  # cumulative variance V_m
+        center = -s  # current residual interval
+        halfwidth = self.T + self.kappa * jnp.sqrt(V)
+        # cumulant residual r^(m) and its first two derivatives, as Chebyshev coeffs;
+        # r^(0) = 0 (A^(0) = A exactly).
+        cr0 = jnp.zeros((n, self.M + 1))
+        cr1 = jnp.zeros((n, self.M + 1))
+        cr2 = jnp.zeros((n, self.M + 1))
+
+        for means, vars_, log_pi in effects:
+            means, vars_ = jnp.asarray(means), jnp.asarray(vars_)
+            log_pi = jnp.asarray(log_pi)
+            pi = jax.nn.softmax(log_pi, axis=-1)
+            obar = jnp.sum(pi * means, axis=-1)  # (n,) effect mean
+            var_eff = jnp.sum(pi * (vars_ + means**2), axis=-1) - obar**2  # effect var
+            s_prev, center_prev, hw_prev = s, center, halfwidth
+            s = s + obar
+            V = V + var_eff
+            center = -s
+            halfwidth = self.T + self.kappa * jnp.sqrt(V)
+            znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+            points, W = _mixture_gh_points(znodes, means, vars_, log_pi, xgh, wgh)
+            # fresh single-effect cumulant residual F = E_o[A(z + s_prev + o)] - A(z + s).
+            # base.terms(., 0) = (-A, -A', A''), isolating the y-free cumulant derivs.
+            pts_b = points + s_prev[:, None, None, None]
+            nll, ng, nw = base.terms(pts_b, jnp.zeros_like(pts_b))
+            EA0 = -jnp.sum(W * nll, axis=(-1, -2))  # E_o[A]
+            EA1 = -jnp.sum(W * ng, axis=(-1, -2))  # E_o[A']
+            EA2 = jnp.sum(W * nw, axis=(-1, -2))  # E_o[A'']
+            pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+            F0, F1, F2 = EA0 - (-pll), EA1 - (-pg), EA2 - pw
+            # fold the previous residual: E_o[r^(m-1)(z + o)] (r arg has no s shift)
+            Er0 = jnp.sum(W * _eval_resid_grid(cr0, center_prev, hw_prev, points), (-1, -2))
+            Er1 = jnp.sum(W * _eval_resid_grid(cr1, center_prev, hw_prev, points), (-1, -2))
+            Er2 = jnp.sum(W * _eval_resid_grid(cr2, center_prev, hw_prev, points), (-1, -2))
+            cr0, cr1, cr2 = fit(F0 + Er0), fit(F1 + Er1), fit(F2 + Er2)
+
+        # aux residuals are the term residuals: ll,g pick up a minus sign, w a plus
+        # (coef_ll = fit(-r), etc.; fit is linear so negate the coeffs).
+        return y, s, center, halfwidth, -cr0, -cr1, cr2
 
     def terms(self, base, eta, aux):
         y, obar, center, halfwidth, coef_ll, coef_g, coef_w = aux

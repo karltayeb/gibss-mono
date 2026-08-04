@@ -321,6 +321,110 @@ def test_compress_positive_weight_and_grad_near_consistent():
     assert jnp.allclose(w, w_ad, atol=1e-2)
 
 
+# --------------------------------------------------------------------------- #
+# Compress.build_aux_sequential: exact per-effect folding of a sum of offsets
+# --------------------------------------------------------------------------- #
+def _product_mixture(effects):
+    """The exact convolution of independent per-row Gaussian mixtures: component
+    (k1,...,kL) has mean sum_l mu_l,kl, var sum_l v_l,kl, weight prod_l pi_l,kl.
+    MixtureGH on this product IS the exact offset-summed Atilde."""
+    n = effects[0][0].shape[0]
+    means = jnp.zeros((n, 1))
+    vars_ = jnp.zeros((n, 1))
+    logpi = jnp.zeros((n, 1))
+    for m, v, lp in effects:
+        pi = jax.nn.softmax(jnp.asarray(lp), axis=-1)
+        means = (means[:, :, None] + jnp.asarray(m)[:, None, :]).reshape(n, -1)
+        vars_ = (vars_[:, :, None] + jnp.asarray(v)[:, None, :]).reshape(n, -1)
+        prev = jnp.exp(logpi - jax.nn.logsumexp(logpi, -1, keepdims=True))
+        logpi = jnp.log((prev[:, :, None] * pi[:, None, :]).reshape(n, -1) + 1e-30)
+    return means, vars_, logpi
+
+
+def _mk_effects(seed, n, Ks, scale=0.8):
+    rng = np.random.default_rng(seed)
+    return [
+        (jnp.asarray(rng.normal(size=(n, K)) * scale),
+         jnp.asarray(np.abs(rng.normal(size=(n, K))) + 0.1),
+         jnp.asarray(rng.normal(size=(n, K))))
+        for K in Ks
+    ]
+
+
+@pytest.mark.parametrize("Ks", [[2, 3], [2, 2, 3]])
+def test_compress_sequential_matches_product_mixture(Ks):
+    # folding the effects one at a time must reproduce MixtureGH on the EXACT product
+    # mixture (prod_l K_l components) -- the sequential fold is exact, no blowup.
+    n = 30
+    base = Bernoulli()
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    effects = _mk_effects(7, n, Ks)
+    pm = _product_mixture(effects)
+    comp = Compress(inner=MixtureGH(order=40), M=80, T=8.0)
+    seq_aux = comp.build_aux_sequential(base, y, effects)
+    for eta_val in np.linspace(-6.0, 6.0, 13):
+        eta = jnp.full(n, float(eta_val))
+        got = comp.terms(base, eta, seq_aux)
+        want = MixtureGH(order=40).terms(base, eta, (y, *pm))
+        for a, b in zip(got, want):
+            assert jnp.allclose(a, b, atol=1e-6)
+
+
+def test_compress_sequential_one_effect_matches_single_stage():
+    # a single folded effect is the same offset law as build_aux -> same function
+    n, K = 22, 3
+    base = Bernoulli()
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    (means, vars_, log_pi), = _mk_effects(3, n, [K])
+    comp = Compress(inner=MixtureGH(order=30), M=72, T=8.0)
+    seq = comp.build_aux_sequential(base, y, [(means, vars_, log_pi)])
+    single = comp.build_aux(base, y, means, vars_, log_pi)
+    for eta_val in np.linspace(-6.0, 6.0, 11):
+        eta = jnp.full(n, float(eta_val))
+        for a, b in zip(comp.terms(base, eta, seq), comp.terms(base, eta, single)):
+            assert jnp.allclose(a, b, atol=1e-6)
+
+
+def test_compress_sequential_empty_is_base():
+    # no other effects -> zero offset -> the bare base terms
+    n = 12
+    eta = jnp.asarray(RNG.normal(size=n))
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    comp = Compress()
+    aux = comp.build_aux_sequential(Bernoulli(), y, [])
+    for a, b in zip(comp.terms(Bernoulli(), eta, aux), Bernoulli().terms(eta, y)):
+        assert jnp.allclose(a, b, atol=1e-9)
+
+
+def test_compress_sequential_intervals_well_behaved():
+    # center = -(cumulative mean), half-width = T + kappa sqrt(cumulative var), and the
+    # half-width GROWS monotonically as effects are folded in (variances add).
+    n = 20
+    base = Bernoulli()
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    effects = _mk_effects(5, n, [2, 3, 2])
+    comp = Compress(M=48, T=10.0, kappa=4.0)
+
+    s_cum = jnp.zeros(n)
+    v_cum = jnp.zeros(n)
+    prev_hw = jnp.full(n, 10.0)
+    for m in range(1, len(effects) + 1):
+        _, s, center, hw, _, _, cw = comp.build_aux_sequential(base, y, effects[:m])
+        me, ve, lp = effects[m - 1]
+        pi = jax.nn.softmax(lp, -1)
+        s_cum = s_cum + jnp.sum(pi * me, -1)
+        v_cum = v_cum + (jnp.sum(pi * (ve + me**2), -1) - jnp.sum(pi * me, -1) ** 2)
+        assert jnp.allclose(s, s_cum, atol=1e-6)
+        assert jnp.allclose(center, -s_cum, atol=1e-6)
+        assert jnp.allclose(hw, 10.0 + 4.0 * jnp.sqrt(v_cum), atol=1e-6)
+        assert jnp.all(hw >= prev_hw - 1e-6)  # monotone non-decreasing
+        prev_hw = hw
+    # positive weight over a wide grid (convex contract, floored)
+    for eta_val in np.linspace(-9, 9, 30):
+        aux = comp.build_aux_sequential(base, y, effects)
+        assert jnp.all(comp.terms(base, jnp.full(n, float(eta_val)), aux)[2] > 0.0)
+
+
 @pytest.mark.parametrize("smoother", [Taylor(), GH()])
 def test_collapses_to_base_as_variance_vanishes(smoother):
     eta = jnp.asarray(RNG.normal(size=10))
