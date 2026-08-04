@@ -201,29 +201,42 @@ class MixtureGH(Smoother):
         return red(ll), red(g), red(w)
 
 
-def _mixture_gh_points(znodes, means, vars_, log_pi, xgh, wgh):
-    """The Gauss-Hermite-over-mixture evaluation grid for `E_o[f(z + o)]` with
-    `o_i ~ sum_k pi_ik N(means_ik, vars_ik)`. Returns (points, W) of shapes
-    (n, Z, K, Q) and (n, 1, K, Q): `points[i, z, k, q] = znodes[i, z] + means_ik +
-    sqrt(2 vars_ik) x_q` and `W = pi_ik * wgh_q`, summing to 1 over the (K, Q) axes.
-    `znodes` is (n, Z) node grid, the mixture leaves (n, K), `xgh`/`wgh` (Q,)."""
-    sd = jnp.sqrt(2.0 * jnp.maximum(vars_, 0.0))  # (n, K)
-    o = means[:, None, :, None] + sd[:, None, :, None] * xgh[None, None, None, :]
-    points = znodes[:, :, None, None] + o  # (n, Z, K, Q)
-    pi = jax.nn.softmax(log_pi, axis=-1)  # (n, K)
-    W = pi[:, None, :, None] * wgh[None, None, None, :]  # (n, 1, K, Q)
-    return points, W
+def _fold_over_components(
+    base, znodes, s_prev, means, vars_, pi, xgh, wgh, cr0, cr1, cr2, center_prev, hw_prev
+):
+    """One sequential-fold step, reduced component by component to bound memory.
 
+    Accumulates, over the K mixture components of one effect, the fresh cumulant fold
+    `E_o[(A, A', A'')(z + s_prev + o)]` and the previous-residual fold
+    `E_o[(r, r', r'')(z + o)]` at the Chebyshev nodes `znodes` (n, Z). The reduction
+    is a `lax.scan` over components: only ONE component's (n, Z, Q) grid is live at a
+    time, so peak memory is O(n Z Q), independent of K -- the exact K=p offset law
+    stays feasible without materializing the (n, Z, K, Q) tensor. `base.terms(., 0)`
+    isolates the y-free cumulant derivs `(-A, -A', A'')`; `cr*` are the previous stage's
+    residual coeffs (n, D+1). Returns six (n, Z) node-value sums."""
+    n, Z = znodes.shape
+    xs = (jnp.moveaxis(means, 1, 0), jnp.moveaxis(vars_, 1, 0), jnp.moveaxis(pi, 1, 0))
 
-def _eval_resid_grid(coef, center, halfwidth, points):
-    """Evaluate a per-row Chebyshev residual (coeffs (n, D+1), interval center/
-    halfwidth (n,)) on a (n, Z, K, Q) `points` grid, clamped to [-1, 1] so values
-    outside the fit interval return the endpoint (~0)."""
-    t = jnp.clip(
-        (points - center[:, None, None, None]) / halfwidth[:, None, None, None],
-        -1.0, 1.0,
-    )
-    return _clenshaw_batched(coef[:, None, None, None, :], t)  # (n, Z, K, Q)
+    def body(carry, comp):
+        EA0, EA1, EA2, Er0, Er1, Er2 = carry
+        mk, vk, pk = comp  # each (n,)
+        sd = jnp.sqrt(2.0 * jnp.maximum(vk, 0.0))
+        o = mk[:, None] + sd[:, None] * xgh[None, :]  # (n, Q)
+        pts = znodes[:, :, None] + o[:, None, :]  # (n, Z, Q)
+        Wk = pk[:, None, None] * wgh[None, None, :]  # (n, 1, Q)
+        nll, ng, nw = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))
+        EA0 = EA0 - jnp.sum(Wk * nll, -1)  # E_o[A]  (reduce Q)
+        EA1 = EA1 - jnp.sum(Wk * ng, -1)  # E_o[A']
+        EA2 = EA2 + jnp.sum(Wk * nw, -1)  # E_o[A'']
+        t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1.0, 1.0)
+        Er0 = Er0 + jnp.sum(Wk * _clenshaw_batched(cr0[:, None, None, :], t), -1)
+        Er1 = Er1 + jnp.sum(Wk * _clenshaw_batched(cr1[:, None, None, :], t), -1)
+        Er2 = Er2 + jnp.sum(Wk * _clenshaw_batched(cr2[:, None, None, :], t), -1)
+        return (EA0, EA1, EA2, Er0, Er1, Er2), None
+
+    init = tuple(jnp.zeros((n, Z)) for _ in range(6))
+    (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, init, xs)
+    return EA0, EA1, EA2, Er0, Er1, Er2
 
 
 @dataclass(frozen=True)
@@ -372,20 +385,17 @@ class Compress(Smoother):
             halfwidth = self.T + self.kappa * jnp.sqrt(V)
             znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
 
-            points, W = _mixture_gh_points(znodes, means, vars_, log_pi, xgh, wgh)
-            # fresh single-effect cumulant residual F = E_o[A(z + s_prev + o)] - A(z + s).
-            # base.terms(., 0) = (-A, -A', A''), isolating the y-free cumulant derivs.
-            pts_b = points + s_prev[:, None, None, None]
-            nll, ng, nw = base.terms(pts_b, jnp.zeros_like(pts_b))
-            EA0 = -jnp.sum(W * nll, axis=(-1, -2))  # E_o[A]
-            EA1 = -jnp.sum(W * ng, axis=(-1, -2))  # E_o[A']
-            EA2 = jnp.sum(W * nw, axis=(-1, -2))  # E_o[A'']
+            # fold this effect, reducing over its K components one at a time (memory
+            # is O(n M Q), not O(n M K Q)); EA* = E_o[A,A',A''] at z + s_prev + o,
+            # Er* = E_o[r,r',r''] at z + o (the previous residual, r-arg has no s shift).
+            EA0, EA1, EA2, Er0, Er1, Er2 = _fold_over_components(
+                base, znodes, s_prev, means, vars_, pi, xgh, wgh,
+                cr0, cr1, cr2, center_prev, hw_prev,
+            )
+            # fresh single-effect cumulant residual F = E_o[A(z + s_prev + o)] - A(z + s);
+            # base.terms(., 0) = (-A, -A', A'') gives the y-free plug-in at z + s.
             pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
             F0, F1, F2 = EA0 - (-pll), EA1 - (-pg), EA2 - pw
-            # fold the previous residual: E_o[r^(m-1)(z + o)] (r arg has no s shift)
-            Er0 = jnp.sum(W * _eval_resid_grid(cr0, center_prev, hw_prev, points), (-1, -2))
-            Er1 = jnp.sum(W * _eval_resid_grid(cr1, center_prev, hw_prev, points), (-1, -2))
-            Er2 = jnp.sum(W * _eval_resid_grid(cr2, center_prev, hw_prev, points), (-1, -2))
             cr0, cr1, cr2 = fit(F0 + Er0), fit(F1 + Er1), fit(F2 + Er2)
 
         # aux residuals are the term residuals: ll,g pick up a minus sign, w a plus

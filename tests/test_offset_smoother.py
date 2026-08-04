@@ -370,6 +370,27 @@ def test_compress_sequential_matches_product_mixture(Ks):
             assert jnp.allclose(a, b, atol=1e-6)
 
 
+def test_compress_sequential_large_K_is_feasible():
+    # the fold reduces over components one at a time (lax.scan), so a K=p offset law
+    # never materializes the (n, M+1, K, Q) grid -- a K that would be multi-GB dense
+    # still fits and stays exact vs the product mixture.
+    n, K = 40, 400  # dense grid n*M*K*Q would be ~ 40*49*400*15 floats per array
+    base = Bernoulli()
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    effects = _mk_effects(11, n, [K, K], scale=0.3)
+    pm = _product_mixture(effects)  # K*K = 160k components (reference only)
+    # cumulative variance widens the interval (half-width ~15 here), so M scales up
+    # with it -- the usual degree-vs-interval tradeoff, not a K effect.
+    comp = Compress(inner=MixtureGH(order=20), M=64, T=10.0)
+    aux = comp.build_aux_sequential(base, y, effects)
+    for eta_val in np.linspace(-5.0, 5.0, 7):
+        eta = jnp.full(n, float(eta_val))
+        got = comp.terms(base, eta, aux)
+        want = MixtureGH(order=20).terms(base, eta, (y, *pm))
+        for a, b in zip(got, want):
+            assert jnp.allclose(a, b, atol=3e-5)
+
+
 def test_compress_sequential_one_effect_matches_single_stage():
     # a single folded effect is the same offset law as build_aux -> same function
     n, K = 22, 3
