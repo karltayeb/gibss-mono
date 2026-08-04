@@ -407,6 +407,116 @@ class Compress(Smoother):
         # (coef_ll = fit(-r), etc.; fit is linear so negate the coeffs).
         return y, s, center, halfwidth, -cr0, -cr1, cr2
 
+    def build_aux_sequential_sparse(self, base, y, X, effects, entry_chunk=1 << 16):
+        """Sparse sequential fold that exploits zeros for free.
+
+        Same result as `build_aux_sequential`, but the per-effect offset law comes from
+        a sparse design `X` (BCOO, n x p) plus per-effect SER posteriors `(alpha, mu,
+        var)` (each length p): component j of row i is `N(X_ij mu_j, X_ij^2 var_j)` with
+        weight `alpha_j`. Where `X_ij = 0` the component is a point mass at 0, so ALL
+        zero columns of a row collapse into ONE identity component with weight
+        `pi_0i = 1 - sum_{j: X_ij != 0} alpha_j` that folds as `pi_0i * g(z)` -- no
+        quadrature. Real GH work therefore touches only the `nnz` nonzero entries,
+        segment-summed over rows, so a fold is O(nnz Q M) not O(n p Q M); on a design
+        with `r` nonzeros per row that is a `p/r` speedup (e.g. GO:BP: ~7500/19). The
+        zero-clumping is EXACT (a zero column truly cannot shift the predictor), and the
+        nonzero grid is chunked over entries (`entry_chunk`) to bound memory. Emits the
+        same aux as `build_aux_sequential`.
+
+        `effects` is a list of `(alpha, mu, var)` for the OTHER effects; `alpha` sums to
+        1 over all p features (the SER `alpha`), so `pi_0i` is the PIP mass on the sets
+        NOT containing row i. The interval moments (`s`, `V`) are the exact mixture mean
+        and variance, unchanged by the lumping."""
+        y = jnp.asarray(y)
+        idx = X.indices
+        rows_all, cols_all = idx[:, 0], idx[:, 1]
+        vals_all = X.data
+        n = X.shape[0]
+        nnz = vals_all.shape[0]
+        xgh_np, logw_np = _gh_rule(self.inner.order)
+        xgh = jnp.asarray(xgh_np)
+        wgh = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        fit = lambda v: v @ Vinv.T  # noqa: E731
+
+        # entries padded to a whole number of chunks; padding carries weight 0.
+        C = min(int(entry_chunk), nnz)
+        nchunks = -(-nnz // C)
+        pad = nchunks * C - nnz
+        def _pad(a, fill):  # noqa: E731
+            return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
+                    if pad else a)
+
+        s = jnp.zeros(n)
+        V = jnp.zeros(n)
+        center = -s
+        halfwidth = self.T + self.kappa * jnp.sqrt(V)
+        cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
+
+        for alpha, mu, var in effects:
+            alpha, mu, var = map(jnp.asarray, (alpha, mu, var))
+            muC, varC, wA = mu[cols_all], var[cols_all], alpha[cols_all]
+            m_e = vals_all * muC  # component mean X_ij mu_j
+            sd_e = jnp.sqrt(2.0 * jnp.maximum(vals_all**2 * varC, 0.0))  # GH sd
+            # exact mixture moments (== the engine's message): zeros drop out of both
+            obar = jax.ops.segment_sum(wA * m_e, rows_all, num_segments=n)
+            eo2 = jax.ops.segment_sum(wA * vals_all**2 * (varC + muC**2), rows_all, num_segments=n)
+            var_eff = jnp.maximum(eo2 - obar**2, 0.0)
+            pi0 = jnp.maximum(1.0 - jax.ops.segment_sum(wA, rows_all, num_segments=n), 0.0)
+
+            s_prev, center_prev, hw_prev = s, center, halfwidth
+            cr0_p, cr1_p, cr2_p = cr0, cr1, cr2
+            s = s + obar
+            V = V + var_eff
+            center = -s
+            halfwidth = self.T + self.kappa * jnp.sqrt(V)
+            znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+            # fold the nonzero components, chunked over entries (peak O(C M Q))
+            rr = _pad(rows_all, 0).reshape(nchunks, C)
+            me = _pad(m_e, 0.0).reshape(nchunks, C)
+            sde = _pad(sd_e, 0.0).reshape(nchunks, C)
+            we = _pad(wA, 0.0).reshape(nchunks, C)
+
+            def body(carry, ent):
+                EA0, EA1, EA2, Er0, Er1, Er2 = carry
+                rc, mc, sc, wc = ent  # (C,) each
+                zc = znodes[rc]  # (C, M+1)
+                o = mc[:, None] + sc[:, None] * xgh[None, :]  # (C, Q)
+                a_arg = zc[:, :, None] + s_prev[rc][:, None, None] + o[:, None, :]  # (C,M+1,Q)
+                nll, ng, nw = base.terms(a_arg, jnp.zeros_like(a_arg))
+                Wc = wc[:, None, None] * wgh[None, None, :]
+                r_arg = zc[:, :, None] + o[:, None, :]  # residual arg (no s shift)
+                tt = jnp.clip((r_arg - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
+                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
+                return (
+                    EA0 + ss(-jnp.sum(Wc * nll, -1)),
+                    EA1 + ss(-jnp.sum(Wc * ng, -1)),
+                    EA2 + ss(jnp.sum(Wc * nw, -1)),
+                    Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[rc][:, None, None, :], tt), -1)),
+                    Er1 + ss(jnp.sum(Wc * _clenshaw_batched(cr1_p[rc][:, None, None, :], tt), -1)),
+                    Er2 + ss(jnp.sum(Wc * _clenshaw_batched(cr2_p[rc][:, None, None, :], tt), -1)),
+                ), None
+
+            zero6 = tuple(jnp.zeros((n, self.M + 1)) for _ in range(6))
+            (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, zero6, (rr, me, sde, we))
+
+            # lumped zero component: point mass at 0, so g(z) with no quadrature
+            znll, zng, znw = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))
+            EA0 = EA0 + pi0[:, None] * (-znll)
+            EA1 = EA1 + pi0[:, None] * (-zng)
+            EA2 = EA2 + pi0[:, None] * znw
+            tz = jnp.clip((znodes - center_prev[:, None]) / hw_prev[:, None], -1., 1.)
+            Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
+            Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
+            Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
+
+            pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+            cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
+
+        return y, s, center, halfwidth, -cr0, -cr1, cr2
+
     def terms(self, base, eta, aux):
         y, obar, center, halfwidth, coef_ll, coef_g, coef_w = aux
         bll, bg, bw = base.terms(eta + obar, y)  # exact plug-in at the mean shift

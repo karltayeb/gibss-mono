@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import sparse
 
 from gibss.response import (
     GH,
@@ -389,6 +390,37 @@ def test_compress_sequential_large_K_is_feasible():
         want = MixtureGH(order=20).terms(base, eta, (y, *pm))
         for a, b in zip(got, want):
             assert jnp.allclose(a, b, atol=3e-5)
+
+
+@pytest.mark.parametrize("entry_chunk", [8, 1 << 16])
+def test_compress_sequential_sparse_matches_dense(entry_chunk):
+    # zero-clumping is EXACT: folding a BCOO design (per-effect SER (alpha, mu, var))
+    # with build_aux_sequential_sparse must equal build_aux_sequential on the full
+    # dense (n, p) mixture -- to machine precision, both with and without entry chunking.
+    n, p = 50, 20
+    base = Bernoulli()
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(np.float64))
+    Xd = ((RNG.random((n, p)) < 0.25) * RNG.normal(1.0, 0.3, (n, p))).astype(np.float64)
+    X = sparse.BCOO.fromdense(jnp.asarray(Xd))
+
+    sparse_eff, dense_eff = [], []
+    for _ in range(3):
+        lp = RNG.normal(size=p)
+        alpha = jnp.asarray(np.exp(lp - np.log(np.sum(np.exp(lp)))))
+        mu = jnp.asarray(RNG.normal(size=p) * 0.8)
+        var = jnp.asarray(np.abs(RNG.normal(size=p)) * 0.3 + 0.05)
+        sparse_eff.append((alpha, mu, var))
+        dense_eff.append((jnp.asarray(Xd) * mu[None, :],
+                          jnp.asarray(Xd**2) * var[None, :],
+                          jnp.broadcast_to(jnp.log(alpha)[None, :], (n, p))))
+
+    comp = Compress(inner=MixtureGH(order=15), M=64, T=10.0)
+    aux_sp = comp.build_aux_sequential_sparse(base, y, X, sparse_eff, entry_chunk=entry_chunk)
+    aux_de = comp.build_aux_sequential(base, y, dense_eff)
+    for eta_val in np.linspace(-6.0, 6.0, 13):
+        eta = jnp.full(n, float(eta_val))
+        for a, b in zip(comp.terms(base, eta, aux_sp), comp.terms(base, eta, aux_de)):
+            assert jnp.allclose(a, b, atol=1e-10)
 
 
 def test_compress_sequential_one_effect_matches_single_stage():
