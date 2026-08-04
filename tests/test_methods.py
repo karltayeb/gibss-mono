@@ -138,31 +138,35 @@ def _feature_log_marginal(state):
 
 
 @pytest.mark.parametrize("intercept", ["shared", "profiled"])
-def test_compress_offset_matches_gh(intercept):
-    # M1: offset_integration="compress" wires Compress through the quad kernel. With the
-    # aggregate offset as a single Gaussian (K=1), it must reproduce the GH smoother's
-    # per-feature log evidence to Chebyshev-interpolation error -- the whole
-    # _resolve/_aux/terms path.
+def test_compress_offset_matches_gh_near_gaussian(intercept):
+    # M2: offset_integration="compress" folds the EXACT per-target offset (the other
+    # effects' mixtures + the shared intercept's variance) through the quad kernel.
+    # When that aggregate offset is near-Gaussian (here, a near-null offset), the exact
+    # fold reduces to the GH single-Gaussian smoother -- so the per-feature log evidence
+    # agrees closely. This exercises the whole _resolve -> fold -> re-center -> terms path.
     X, y = _data("logistic")
     kw = dict(L=3, offset_quadrature_points=15, intercept=intercept, max_iter=60)
     gh = fit_glm_susie(X, y, offset_integration="gh", **kw)
     cp = fit_glm_susie(X, y, offset_integration="compress", **kw)
-    np.testing.assert_allclose(_feature_log_marginal(cp), _feature_log_marginal(gh), atol=1e-4)
+    np.testing.assert_allclose(_feature_log_marginal(cp), _feature_log_marginal(gh), atol=2e-3)
 
 
-def test_compress_offset_matches_gh_sparse():
+def test_compress_offset_sparse_runs_and_recovers():
+    # the sparse zero-clumping fold runs end to end (profiled intercept) and recovers the
+    # causal feature. We do NOT assert equality with GH here: a spiky sparse offset is
+    # genuinely non-Gaussian, so the exact fold *should* differ from GH's single Gaussian
+    # -- that difference is the whole point. Fold exactness is covered in test_response.
     import jax
     from jax.experimental import sparse
 
     rng = np.random.default_rng(1)
     n, p = 400, 20
     Xd = (rng.random((n, p)) < 0.25) * rng.normal(1.0, 0.3, (n, p))
-    y = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + 1.5 * Xd[:, 0]))), n).astype(float)
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + 2.0 * Xd[:, 0]))), n).astype(float)
     X = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
-    kw = dict(L=3, offset_quadrature_points=15, max_iter=60)
-    gh = fit_glm_susie(X, y, offset_integration="gh", **kw)
-    cp = fit_glm_susie(X, y, offset_integration="compress", **kw)
-    np.testing.assert_allclose(_feature_log_marginal(cp), _feature_log_marginal(gh), atol=1e-4)
+    cp = fit_glm_susie(X, y, L=3, offset_integration="compress",
+                       offset_quadrature_points=15, intercept="profiled", max_iter=60)
+    assert _feat_pip(cp, 0) > 0.9  # causal feature recovered
 
 
 def test_compress_offset_rejects_vi_kernel():

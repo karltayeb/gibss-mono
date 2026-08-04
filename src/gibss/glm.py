@@ -30,7 +30,11 @@ from .engine import (
     subtract_message_index_step,
     to_numpy_state_step,
 )
-from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
+from .linear import (  # noqa: F401 (re-export)
+    is_bcoo,
+    prep_data,
+    update_prior_variance_index_step,
+)
 from .operators import CenteredOperator, as_operator
 from .response import Bernoulli, Compress, ResponseModel, Smoothed
 from .response_ser import (
@@ -424,14 +428,64 @@ def _effect_offset(fs, state):
     return base + state.total_message.mean
 
 
+def _compress_fold_aux(data, state, l):
+    """M2: the per-target offset aux for Compress. The EXACT offset of target l is the
+    SUM of the other effects, so we fold their per-row mixtures one at a time (sparse
+    zero-clumping on BCOO, dense otherwise) -- not a single moment-matched Gaussian.
+
+    The fold's `obar` is the offset mean; the engine keeps that mean in `eta` (the fixed
+    offset = LOO message mean + base), so we RE-CENTER the aux to obar=0, center=0 (the
+    coefficients are unchanged, since the fit interval was centered at -obar). Then
+    `Compress.terms(eta, aux)` evaluates Atilde at eta - obar = the mean-free predictor,
+    with no double-counting and no change to the engine's mean-in-eta convention. Null/
+    empty effects fold as point masses at 0, so they cost ~nothing and need no special
+    casing."""
+    fs = state.family_state
+    comp, base = fs.response.smoother, fs.response.base
+    y = jnp.asarray(data.y)
+    n = y.shape[0]
+    others = [e for i, e in enumerate(state.single_effects) if i != l]
+    # the shared intercept's posterior uncertainty is part of the offset too (as it is
+    # in the GH path's ov); fold it as one extra N(0, intercept_var) Gaussian. Zero
+    # under profiled (intercept_var stays 0) and under MeanMessage (mean-only mode).
+    iv = 0.0 if isinstance(state.total_message, MeanMessage) else float(fs.intercept_var)
+    if is_bcoo(data.X):
+        # sparse zero-clumping fold of the X-effects. NOTE: the intercept-variance fold
+        # is not yet threaded here (a trailing single-Gaussian fold); sparse designs use
+        # intercept="profiled" (iv=0), where this is exact. shared-intercept + sparse is
+        # a follow-up.
+        effects = [(e.alpha, e.mu, e.var) for e in others]
+        aux = comp.build_aux_sequential_sparse(base, y, data.X, effects)
+    else:
+        Xd = jnp.asarray(data.X)
+        effects = [
+            (Xd * jnp.asarray(e.mu)[None, :],
+             Xd**2 * jnp.asarray(e.var)[None, :],
+             jnp.broadcast_to(jnp.log(jnp.asarray(e.alpha))[None, :], Xd.shape))
+            for e in others
+        ]
+        if iv > 0:  # intercept as a zero-mean single-Gaussian "effect"
+            zc = jnp.zeros((n, 1))
+            effects.append((zc, jnp.full((n, 1), iv), zc))
+        aux = comp.build_aux_sequential(base, y, effects)
+    y_, _obar, _center, hw, cll, cg, cw = aux
+    z = jnp.zeros_like(hw)  # re-center: obar -> 0, center -> 0 (coeffs unchanged)
+    return (y_, z, z, hw, cll, cg, cw)
+
+
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
     fs = state.family_state
     # profiled: offset is the leave-one-out message (+ base glm_offset; b0 profiled
     # per feature); shared-intercept (quad/jj): also add the estimated intercept. A
-    # Smoothed response additionally receives the LOO message variance through aux.
+    # Smoothed response additionally receives the LOO message variance through aux --
+    # or, for Compress, the EXACT per-target offset folded from the other effects.
     offset = _effect_offset(fs, state)
-    new_effect = _fit_effect(data, fs, _aux(data, state), offset, effect.prior_variance, fs.quadrature_order)
+    if isinstance(fs.response, Smoothed) and isinstance(fs.response.smoother, Compress):
+        aux = _compress_fold_aux(data, state, l)
+    else:
+        aux = _aux(data, state)
+    new_effect = _fit_effect(data, fs, aux, offset, effect.prior_variance, fs.quadrature_order)
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
