@@ -143,44 +143,43 @@ def test_compress_offset_matches_gh_near_gaussian(intercept):
     # effects' mixtures + the shared intercept's variance) through the quad kernel.
     # When that aggregate offset is near-Gaussian (here, a near-null offset), the exact
     # fold reduces to the GH single-Gaussian smoother -- so the per-feature log evidence
-    # agrees closely. This exercises the whole _resolve -> fold -> re-center -> terms path.
+    # agrees closely. Compare against GH at center=False (compress always integrates the
+    # uncentered offset, so this is the matching parameterization).
     X, y = _data("logistic")
-    kw = dict(L=3, offset_quadrature_points=15, intercept=intercept, max_iter=60)
+    kw = dict(L=3, offset_quadrature_points=15, intercept=intercept, max_iter=60, center=False)
     gh = fit_glm_susie(X, y, offset_integration="gh", **kw)
     cp = fit_glm_susie(X, y, offset_integration="compress", **kw)
     np.testing.assert_allclose(_feature_log_marginal(cp), _feature_log_marginal(gh), atol=2e-3)
 
 
-def test_compress_offset_sparse_runs_and_recovers():
-    # the sparse zero-clumping fold runs end to end (profiled intercept) and recovers the
-    # causal feature. We do NOT assert equality with GH here: a spiky sparse offset is
-    # genuinely non-Gaussian, so the exact fold *should* differ from GH's single Gaussian
-    # -- that difference is the whole point. Fold exactness is covered in test_response.
+@pytest.mark.parametrize("intercept", ["shared", "profiled"])
+def test_compress_offset_layout_consistent(intercept):
+    # the compress fit is LAYOUT-consistent: the sparse zero-clumping fold (incl. the
+    # shared intercept, folded first as N(0, iv)) reproduces the dense fold on the same
+    # data to interpolation error. This is the strong correctness check.
     import jax
     from jax.experimental import sparse
 
     rng = np.random.default_rng(1)
     n, p = 400, 20
-    Xd = (rng.random((n, p)) < 0.25) * rng.normal(1.0, 0.3, (n, p))
-    y = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + 2.0 * Xd[:, 0]))), n).astype(float)
-    X = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
-    cp = fit_glm_susie(X, y, L=3, offset_integration="compress",
-                       offset_quadrature_points=15, intercept="profiled", max_iter=60)
-    assert _feat_pip(cp, 0) > 0.9  # causal feature recovered
+    Xd = ((rng.random((n, p)) < 0.25) * rng.normal(1.0, 0.3, (n, p))).astype(np.float64)
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.5 + 1.5 * Xd[:, 0]))), n).astype(float)
+    Xb = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+    kw = dict(L=3, offset_quadrature_points=15, intercept=intercept, max_iter=80)
+    dense = fit_glm_susie(Xd, y, offset_integration="compress", **kw)
+    sparse_ = fit_glm_susie(Xb, y, offset_integration="compress", **kw)
+    np.testing.assert_allclose(
+        _feature_log_marginal(sparse_), _feature_log_marginal(dense), atol=1e-4
+    )
+    assert _feat_pip(sparse_, 0) > 0.9  # and recovers the causal feature
 
 
-def test_compress_offset_sparse_shared_intercept_rejected():
-    # the shared intercept's variance fold isn't threaded through the sparse path yet,
-    # so sparse + shared + compress must fail loudly (not silently drop it).
-    import jax
-    from jax.experimental import sparse
-
-    rng = np.random.default_rng(2)
-    Xd = (rng.random((200, 15)) < 0.25) * 1.0
-    y = rng.binomial(1, 0.4, 200).astype(float)
-    X = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
-    with pytest.raises(ValueError, match="profiled"):
-        fit_glm_susie(X, y, L=2, offset_integration="compress", intercept="shared", max_iter=5)
+def test_compress_offset_rejects_center_true():
+    # compress integrates the UNCENTERED offset; center=True changes the per-row offset
+    # variance and breaks the sparse zero-clumping fold, so it's an error.
+    X, y = _data("logistic")
+    with pytest.raises(ValueError, match="UNCENTERED|center=False"):
+        fit_glm_susie(X, y, L=2, offset_integration="compress", center=True, max_iter=5)
 
 
 def test_compress_offset_rejects_vi_kernel():

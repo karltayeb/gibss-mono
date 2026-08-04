@@ -230,25 +230,6 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
-    # offset_integration="compress" folds the shared intercept's variance as an extra
-    # Gaussian, but that trailing fold is only threaded on the DENSE path so far; on a
-    # sparse (BCOO) design the intercept variance would be silently dropped. Fail loudly
-    # (a silently-wrong fit is worse) -- intercept="profiled" has no shared-intercept
-    # variance, so it is exact on sparse.
-    if (
-        isinstance(getattr(response, "smoother", None), Compress)
-        and is_bcoo(X)
-        and cfg["intercept"] == "shared"
-        and estimate_intercept
-    ):
-        raise ValueError(
-            "offset_integration='compress' on a sparse (BCOO) design needs "
-            "intercept='profiled': the shared intercept's variance fold is not yet "
-            "threaded through the sparse zero-clumping path (it would be silently "
-            "dropped). Use intercept='profiled' (exact on sparse), pass a dense X, or "
-            "set estimate_intercept=False."
-        )
-
     # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
     # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row
     # background) and linear (row-wise exact through a CenteredOperator) consume it; the
@@ -256,19 +237,37 @@ def fit_glm_susie(
     # center=None -> on wherever supported (so the default centers everything it can
     # without crashing a method sweep); an EXPLICIT center=True on an unsupported
     # sparse + vi/jj combo is a clear error, not a fit.
-    center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear")
-    if center is None:
-        center = center_supported
-    elif center and not center_supported:
-        raise ValueError(
-            f"center=True is not supported for the resolved kernel={kernel!r} on a "
-            f"sparse (BCOO) design (only 'quad' and 'linear' consume sparse "
-            f"pre-centering; the vi/jj kernels' per-entry variance/tilt would drop the "
-            f"off-support fill-in). For the SAME intercept-decoupling benefit on sparse, "
-            f"use intercept='profiled' (a per-feature intercept, invariant to column "
-            f"shifts -- so centering is unnecessary). Otherwise pass center=False, or "
-            f"densify X."
-        )
+    # compress integrates the offset from the UNCENTERED design, always. Its per-row
+    # offset variance is X_ij^2 * var, which centering would change (to (X_ij - cbar)^2 *
+    # var) -- so centering is a genuine modeling change, not a free reparameterization as
+    # it is for the non-integrated fit. Using the uncentered design keeps the fit
+    # LAYOUT-consistent (dense == sparse) and, on sparse, keeps the zero-clumping fold
+    # valid (X_ij = 0 must be a true point mass at 0). The intercept is handled by
+    # intercept="shared" (folded as N(0, iv)) or "profiled".
+    if isinstance(getattr(response, "smoother", None), Compress):
+        if center is True:
+            raise ValueError(
+                "offset_integration='compress' does not support center=True: it "
+                "integrates the UNCENTERED offset (centering changes the per-row offset "
+                "variance and, on sparse, breaks the zero-clumping fold). Use "
+                "center=False; the intercept is handled by intercept='shared' or "
+                "'profiled'."
+            )
+        center = False
+    else:
+        center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear")
+        if center is None:
+            center = center_supported
+        elif center and not center_supported:
+            raise ValueError(
+                f"center=True is not supported for the resolved kernel={kernel!r} on a "
+                f"sparse (BCOO) design (only 'quad' and 'linear' consume sparse "
+                f"pre-centering; the vi/jj kernels' per-entry variance/tilt would drop "
+                f"the off-support fill-in). For the SAME intercept-decoupling benefit on "
+                f"sparse, use intercept='profiled' (a per-feature intercept, invariant to "
+                f"column shifts -- so centering is unnecessary). Otherwise pass "
+                f"center=False, or densify X."
+            )
 
     data = glm.prep_data(X, y, center=center)
     init = (

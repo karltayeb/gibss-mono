@@ -450,12 +450,17 @@ def _compress_fold_aux(data, state, l):
     # under profiled (intercept_var stays 0) and under MeanMessage (mean-only mode).
     iv = 0.0 if isinstance(state.total_message, MeanMessage) else float(fs.intercept_var)
     if is_bcoo(data.X):
-        # sparse zero-clumping fold of the X-effects. NOTE: the intercept-variance fold
-        # is not yet threaded here (a trailing single-Gaussian fold); sparse designs use
-        # intercept="profiled" (iv=0), where this is exact. shared-intercept + sparse is
-        # a follow-up.
+        # sparse zero-clumping fold of the X-effects. The shared intercept's N(0, iv) is
+        # folded FIRST (as the starting cumulant) rather than appended: convolution
+        # commutes, so we seed the fold with the intercept's residual (a cheap K=1 build)
+        # and cumulative variance iv, then fold the X-effects on top.
         effects = [(e.alpha, e.mu, e.var) for e in others]
-        aux = comp.build_aux_sequential_sparse(base, y, data.X, effects)
+        init = None
+        if iv > 0:
+            z1 = jnp.zeros((n, 1))
+            _, _, _, _, cll0, cg0, cw0 = comp.build_aux(base, y, z1, jnp.full((n, 1), iv), z1)
+            init = (-cll0, -cg0, cw0, iv)  # (cr0, cr1, cr2, V0)
+        aux = comp.build_aux_sequential_sparse(base, y, data.X, effects, init=init)
     else:
         Xd = jnp.asarray(data.X)
         effects = [

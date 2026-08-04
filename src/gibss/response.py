@@ -455,7 +455,7 @@ class Compress(Smoother):
         return y, s, center, halfwidth, -cr0, -cr1, cr2
 
     def build_aux_sequential_sparse(self, base, y, X, effects, entry_chunk=1 << 16,
-                                    derivatives="differentiate"):
+                                    derivatives="differentiate", init=None):
         """Sparse sequential fold that exploits zeros for free.
 
         Same result as `build_aux_sequential`, but the per-effect offset law comes from
@@ -499,11 +499,19 @@ class Compress(Smoother):
             return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
                     if pad else a)
 
+        # Optional initial state: a zero-mean Gaussian already folded (e.g. the shared
+        # intercept's N(0, intercept_var)). Convolution commutes, so folding it FIRST as
+        # the starting cumulant is exact -- the X-effects then fold on top with no change
+        # to the entry loop. init = (cr0, cr1, cr2, V0) with V0 scalar/(n,).
         s = jnp.zeros(n)
-        V = jnp.zeros(n)
+        if init is None:
+            V = jnp.zeros(n)
+            cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
+        else:
+            cr0, cr1, cr2, V0 = init
+            V = jnp.broadcast_to(jnp.asarray(V0), (n,))
         center = -s
         halfwidth = self.T + self.kappa * jnp.sqrt(V)
-        cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
 
         for alpha, mu, var in effects:
             alpha, mu, var = map(jnp.asarray, (alpha, mu, var))
