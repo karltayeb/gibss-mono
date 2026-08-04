@@ -237,23 +237,21 @@ def fit_glm_susie(
     # center=None -> on wherever supported (so the default centers everything it can
     # without crashing a method sweep); an EXPLICIT center=True on an unsupported
     # sparse + vi/jj combo is a clear error, not a fit.
-    # compress integrates the offset from the UNCENTERED design, always. Its per-row
-    # offset variance is X_ij^2 * var, which centering would change (to (X_ij - cbar)^2 *
-    # var) -- so centering is a genuine modeling change, not a free reparameterization as
-    # it is for the non-integrated fit. Using the uncentered design keeps the fit
-    # LAYOUT-consistent (dense == sparse) and, on sparse, keeps the zero-clumping fold
-    # valid (X_ij = 0 must be a true point mass at 0). The intercept is handled by
-    # intercept="shared" (folded as N(0, iv)) or "profiled".
+    # compress on a DENSE design can center (the fold reads the eagerly-centered X, so it
+    # stays consistent with the kernel). On SPARSE it fundamentally cannot: zero-clumping
+    # needs X_ij = 0 to be a true point mass at 0, but centering shifts every entry
+    # (zeros included) by -cbar_j, leaving no zeros to clump. Default is uncentered
+    # (layout-consistent: dense == sparse); dense users may opt into center=True.
     if isinstance(getattr(response, "smoother", None), Compress):
-        if center is True:
+        if center is True and is_bcoo(X):
             raise ValueError(
-                "offset_integration='compress' does not support center=True: it "
-                "integrates the UNCENTERED offset (centering changes the per-row offset "
-                "variance and, on sparse, breaks the zero-clumping fold). Use "
-                "center=False; the intercept is handled by intercept='shared' or "
-                "'profiled'."
+                "offset_integration='compress' cannot center a sparse (BCOO) design: the "
+                "zero-clumping fold needs X_ij = 0 to be a point mass at 0, but centering "
+                "shifts every entry (zeros included) so nothing clumps. Use center=False "
+                "(the intercept is handled by intercept='shared'/'profiled'), or densify X."
             )
-        center = False
+        if center is None:
+            center = False
     else:
         center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear")
         if center is None:

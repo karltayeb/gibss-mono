@@ -174,11 +174,27 @@ def test_compress_offset_layout_consistent(intercept):
     assert _feat_pip(sparse_, 0) > 0.9  # and recovers the causal feature
 
 
-def test_compress_offset_rejects_center_true():
-    # compress integrates the UNCENTERED offset; center=True changes the per-row offset
-    # variance and breaks the sparse zero-clumping fold, so it's an error.
+def test_compress_offset_dense_center_true_matches_gh():
+    # compress CAN center a dense design (the fold reads the eagerly-centered X, so it
+    # stays consistent with the kernel); near-Gaussian, it matches centered GH.
     X, y = _data("logistic")
-    with pytest.raises(ValueError, match="UNCENTERED|center=False"):
+    kw = dict(L=3, offset_quadrature_points=15, intercept="shared", max_iter=60, center=True)
+    gh = fit_glm_susie(X, y, offset_integration="gh", **kw)
+    cp = fit_glm_susie(X, y, offset_integration="compress", **kw)
+    np.testing.assert_allclose(_feature_log_marginal(cp), _feature_log_marginal(gh), atol=2e-3)
+
+
+def test_compress_offset_sparse_rejects_center_true():
+    # on sparse, centering shifts every entry (zeros included) so zero-clumping has
+    # nothing to clump -- it's fundamentally incompatible, so center=True is an error.
+    import jax
+    from jax.experimental import sparse
+
+    rng = np.random.default_rng(2)
+    Xd = (rng.random((200, 15)) < 0.25) * 1.0
+    y = rng.binomial(1, 0.4, 200).astype(float)
+    X = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+    with pytest.raises(ValueError, match="sparse"):
         fit_glm_susie(X, y, L=2, offset_integration="compress", center=True, max_iter=5)
 
 
