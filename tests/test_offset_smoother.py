@@ -16,6 +16,7 @@ import pytest
 from gibss.response import (
     GH,
     MixtureGH,
+    Compress,
     Bernoulli,
     JJFixed,
     JJEnvelope,
@@ -204,6 +205,120 @@ def test_mixture_gh_flags_and_positive_weight():
     log_pi = jnp.asarray(RNG.normal(size=(n, Kc)))
     w = Smoothed(Bernoulli(), MixtureGH(order=15)).terms(eta, (y, means, vars_, log_pi))[2]
     assert jnp.all(w > 0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Compress: amortized Chebyshev compression of the MixtureGH offset correction
+# --------------------------------------------------------------------------- #
+def _mixture(n, Kc, spread=0.8):
+    means = jnp.asarray(RNG.normal(size=(n, Kc)) * spread)
+    vars_ = jnp.asarray(np.abs(RNG.normal(size=(n, Kc))) + 0.2)
+    log_pi = jnp.asarray(RNG.normal(size=(n, Kc)))
+    return means, vars_, log_pi
+
+
+def test_compress_flags_and_reuses_inner_validation():
+    assert Compress().convex and not Compress().certified
+    # Compress delegates base validation to its inner scheme (MixtureGH: any base)
+    Smoothed(Bernoulli(), Compress())  # constructs without error
+    Smoothed(Poisson(), Compress())
+
+
+def test_compress_matches_mixture_gh_at_high_degree():
+    # the whole contract: the compressed correction reproduces the exact MixtureGH
+    # terms (same inner order) across the eta grid, to Chebyshev interpolation error.
+    n, Kc = 25, 3
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    means, vars_, log_pi = _mixture(n, Kc)
+    base = Bernoulli()
+    mix = MixtureGH(order=40)
+    comp = Compress(inner=MixtureGH(order=40), M=80, T=8.0)
+    aux = comp.build_aux(base, y, means, vars_, log_pi)
+    for eta_val in np.linspace(-7.0, 7.0, 15):
+        eta = jnp.full(n, float(eta_val))
+        got = comp.terms(base, eta, aux)
+        want = mix.terms(base, eta, (y, means, vars_, log_pi))
+        for a, b in zip(got, want):
+            assert jnp.allclose(a, b, atol=1e-6)
+
+
+def test_compress_degree_converges_geometrically():
+    # error must fall geometrically with M (the analytic-in-a-strip Chebyshev rate) --
+    # guards against a systematic bug that a single-M check would miss.
+    n, Kc = 20, 2
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    means, vars_, log_pi = _mixture(n, Kc, spread=0.6)
+    base, mix = Bernoulli(), MixtureGH(order=40)
+    grid = [jnp.full(n, float(e)) for e in np.linspace(-6, 6, 21)]
+
+    def err(M):
+        comp = Compress(inner=MixtureGH(order=40), M=M, T=8.0)
+        aux = comp.build_aux(base, y, means, vars_, log_pi)
+        return max(
+            float(jnp.max(jnp.abs(comp.terms(base, e, aux)[2]
+                                  - mix.terms(base, e, (y, means, vars_, log_pi))[2])))
+            for e in grid
+        )
+
+    e32, e48, e64 = err(32), err(48), err(64)
+    assert e64 < e48 < e32
+    assert e64 < 0.05 * e32  # at least ~1 order of magnitude per +32 nodes
+
+
+def test_compress_recovers_plugin_when_offset_degenerate():
+    # a single zero-variance component at mean 0 is a point mass at o=0: Atilde = A,
+    # the residual is identically zero, and Compress reduces to the bare base terms.
+    n = 15
+    eta = jnp.asarray(RNG.normal(size=n))
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    comp = Compress()
+    aux = comp.build_aux(Bernoulli(), y, jnp.zeros((n, 1)), jnp.zeros((n, 1)), jnp.zeros((n, 1)))
+    got = comp.terms(Bernoulli(), eta, aux)
+    ref = Bernoulli().terms(eta, y)
+    for a, b in zip(got, ref):
+        assert jnp.allclose(a, b, atol=1e-7)
+
+
+def test_compress_plugin_shift_when_zero_variance_mixture():
+    # zero-variance K-component mixture: the offset is a DISCRETE mixture (not a point
+    # mass), so Atilde is the pi-weighted base at the shifted means -- Compress must
+    # reproduce it (its plug-in A(eta+obar) is wrong here; the table carries the rest).
+    n, Kc = 18, 3
+    eta = jnp.asarray(RNG.normal(size=n))
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    means = jnp.asarray(RNG.normal(size=(n, Kc)))
+    log_pi = jnp.asarray(RNG.normal(size=(n, Kc)))
+    pi = jax.nn.softmax(log_pi, axis=-1)
+    comp = Compress(inner=MixtureGH(order=7), M=64, T=8.0)
+    aux = comp.build_aux(Bernoulli(), y, means, jnp.zeros((n, Kc)), log_pi)
+    got = comp.terms(Bernoulli(), eta, aux)
+    ref = [jnp.zeros(n) for _ in range(3)]
+    for k in range(Kc):
+        comp_k = Bernoulli().terms(eta + means[:, k], y)
+        ref = [r + pi[:, k] * c for r, c in zip(ref, comp_k)]
+    for a, b in zip(got, ref):
+        assert jnp.allclose(a, b, atol=1e-6)
+
+
+def test_compress_positive_weight_and_grad_near_consistent():
+    # weight stays > 0 (convex contract, floored), and grad/weight are the derivatives
+    # of the compressed loglik to interpolation error (the ll/g/w tables are fit
+    # INDEPENDENTLY, so consistency is O(rho^-M), not exact -- documented here).
+    n, Kc = 12, 3
+    eta = jnp.asarray(RNG.normal(size=n) * 2.0)
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    means, vars_, log_pi = _mixture(n, Kc, spread=0.5)
+    comp = Compress(inner=MixtureGH(order=25), M=64, T=8.0)
+    aux = comp.build_aux(Bernoulli(), y, means, vars_, log_pi)
+    assert jnp.all(comp.terms(Bernoulli(), eta, aux)[2] > 0.0)
+
+    def ll_hat(e):
+        return jnp.sum(comp.terms(Bernoulli(), e, aux)[0])
+
+    _, g, w = comp.terms(Bernoulli(), eta, aux)
+    assert jnp.allclose(g, jax.grad(ll_hat)(eta), atol=1e-3)
+    w_ad = -jax.grad(lambda e: jnp.sum(jax.grad(ll_hat)(e)))(eta)
+    assert jnp.allclose(w, w_ad, atol=1e-2)
 
 
 @pytest.mark.parametrize("smoother", [Taylor(), GH()])

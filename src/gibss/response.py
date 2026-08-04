@@ -29,11 +29,13 @@ the reason schemes are objects, not method strings.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from ._numerics import _cheb_fit_matrix, _clenshaw_batched
 
 __all__ = [
     "ResponseModel",
@@ -41,6 +43,7 @@ __all__ = [
     "Smoother",
     "GH",
     "MixtureGH",
+    "Compress",
     "Taylor",
     "TaylorFixed",
     "JJEnvelope",
@@ -196,6 +199,100 @@ class MixtureGH(Smoother):
         W = wj.reshape((self.order,) + (1,) * m) * pi[None]  # (order, *eta, K)
         red = lambda t: jnp.sum(W * t, axis=(0, -1))  # noqa: E731
         return red(ll), red(g), red(w)
+
+
+@dataclass(frozen=True)
+class Compress(Smoother):
+    """Amortized Chebyshev compression of a per-row offset correction.
+
+    A wrapper scheme: `inner` (a MixtureGH-style smoother) supplies the EXACT smoothed
+    terms `inner.terms(eta) = (y*eta - Atilde, y - Atilde', Atilde'')` for the per-row
+    offset law, but paying `inner`'s `K * order` likelihood passes on EVERY in-loop
+    evaluation is wasteful: `Atilde_i` is a fixed univariate function of `eta` for the
+    whole SER fit, hit O(p * newton * gh-nodes) times. So we split off the plug-in mean
+    shift and compress only the residual once, out of the loop.
+
+    Write `obar_i = E[o_i]` (the mixture mean). The plug-in `base.terms(eta + obar_i)`
+    carries the dominant shape and convexity; the residual
+
+        R_i(eta) = inner.terms(eta) - base.terms(eta + obar_i)   (per term: ll, g, w)
+
+    is a small, smooth, exponentially-localized bump (its g/w components vanish at both
+    ends; the ll component tends to the constant -y*obar). We interpolate each of the
+    three residuals by a degree-`M` Chebyshev series on a per-row interval that just
+    covers where the offset mass overlaps the logistic transition, precomputed by
+    `build_aux`. In the loop `terms` is then one exact `base.terms` plus three Clenshaw
+    passes -- O(M) fused mul-adds, independent of `K` and `inner.order`, so the offset
+    law can be made as rich as the model wants without touching in-loop cost.
+
+    aux = (y, obar, center, halfwidth, coef_ll, coef_g, coef_w), all per-row, built by
+    `build_aux` from the SAME `(y, means, vars, log_pi)` mixture `MixtureGH` consumes.
+    `coef_*` are (n, M+1); the rest are (n,). The clamp `t = clip((eta - center)/
+    halfwidth, -1, 1)` makes evaluation outside the fit interval return the endpoint
+    (~0 correction), which is asymptotically exact because R vanishes there. NOT
+    certified; convex (the assembled weight is floored at 0, and Atilde'' >= 0 anyway).
+    All-zero `coef_*` recovers the naive plug-in-offset fit exactly.
+
+    Like `MixtureGH`, this is a fixed-per-row-offset scheme: use it with the
+    quadrature/Laplace kernels (glm_ser / glm_profile_ser), where the offset law does
+    not depend on the feature being fit, NOT the vi/linear kernels (which fold the
+    effect's own variance into the per-entry offset).
+    """
+
+    inner: Smoother = field(default_factory=lambda: MixtureGH(order=30))
+    M: int = 48
+    T: float = 10.0
+    kappa: float = 4.0
+
+    def validate(self, base):
+        self.inner.validate(base)
+
+    def build_aux(self, base, y, means, vars_, log_pi):
+        """Precompute the compressed aux from a per-row Gaussian-mixture offset law
+        `o_i ~ sum_k pi_ik N(means_ik, vars_ik)` (shapes (n, K), same as `MixtureGH`).
+        Runs once per SER fit, out of the hot loop, so `inner.order` can be large."""
+        y = jnp.asarray(y)
+        means, vars_ = jnp.asarray(means), jnp.asarray(vars_)
+        log_pi = jnp.asarray(log_pi)
+        pi = jax.nn.softmax(log_pi, axis=-1)  # (n, K)
+        obar = jnp.sum(pi * means, axis=-1)  # (n,) plug-in mean shift
+        sd = jnp.sqrt(jnp.maximum(vars_, 0.0))
+        lo = jnp.min(means - self.kappa * sd, axis=-1)  # leftmost offset edge (n,)
+        hi = jnp.max(means + self.kappa * sd, axis=-1)  # rightmost offset edge
+        # R_i is nonzero only where eta + m_ik hits the transition (0); in eta that is
+        # the negated, padded offset window [-hi - T, -lo + T].
+        center = -0.5 * (lo + hi)
+        halfwidth = self.T + 0.5 * (hi - lo)
+
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)  # CGL nodes, samples->coeffs
+        xnodes = jnp.asarray(xnodes_np)  # (M+1,) on [-1, 1]
+        Vinv = jnp.asarray(Vinv_np)  # (M+1, M+1)
+        znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+        # exact smoothed terms at the nodes; reshape mixture leaves to (n, 1, K) so the
+        # (M+1) node axis is the "columns" slot inner.terms broadcasts over.
+        inner_aux = (
+            y[:, None],
+            means[:, None, :],
+            vars_[:, None, :],
+            log_pi[:, None, :],
+        )
+        sll, sg, sw = self.inner.terms(base, znodes, inner_aux)  # each (n, M+1)
+        bll, bg, bw = base.terms(znodes + obar[:, None], y[:, None])  # plug-in at shift
+        fit = lambda vals: vals @ Vinv.T  # (n, M+1) samples -> (n, M+1) coeffs  # noqa: E731
+        coef_ll = fit(sll - bll)
+        coef_g = fit(sg - bg)
+        coef_w = fit(sw - bw)
+        return y, obar, center, halfwidth, coef_ll, coef_g, coef_w
+
+    def terms(self, base, eta, aux):
+        y, obar, center, halfwidth, coef_ll, coef_g, coef_w = aux
+        bll, bg, bw = base.terms(eta + obar, y)  # exact plug-in at the mean shift
+        t = jnp.clip((eta - center) / halfwidth, -1.0, 1.0)
+        ll = bll + _clenshaw_batched(coef_ll, t)
+        g = bg + _clenshaw_batched(coef_g, t)
+        w = jnp.maximum(bw + _clenshaw_batched(coef_w, t), 0.0)
+        return ll, g, w
 
 
 @dataclass(frozen=True)

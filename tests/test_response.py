@@ -10,6 +10,7 @@ from gibss.operators import BCOOOperator, CenteredOperator, DenseOperator
 from gibss.response import (
     GH,
     MixtureGH,
+    Compress,
     Bernoulli,
     Gaussian,
     JJEnvelope,
@@ -187,6 +188,39 @@ def test_glm_ser_mixture_matches_brute():
     aux = (jnp.asarray(y), jnp.asarray(means), jnp.asarray(vars_), jnp.asarray(log_pi))
     g = glm_ser(op, aux, jnp.asarray(off), 1.0, Smoothed(Bernoulli(), MixtureGH(order=25)), order=25)
     brute = np.array([_brute_mixture_logbf(y, X, off, means, vars_, log_pi, j) for j in range(X.shape[1])])
+    np.testing.assert_allclose(np.asarray(g[2]), brute, atol=3e-3)
+
+
+@pytest.mark.parametrize("kernel", [glm_ser, glm_profile_ser])
+def test_glm_ser_compress_matches_mixture_gh(kernel):
+    # amortization correctness: precomputing the Chebyshev tables with build_aux and
+    # running the SER with Compress reproduces the exact-MixtureGH per-feature SER
+    # outputs (mu, var, log_bf) through the whole kernel, to interpolation error.
+    X, off, y, means, vars_, log_pi = _mixture_data(seed=2, n=140, p=4, Kc=3)
+    op = DenseOperator(jnp.asarray(X))
+    y, off = jnp.asarray(y), jnp.asarray(off)
+    means, vars_, log_pi = map(jnp.asarray, (means, vars_, log_pi))
+    order = 30
+    mix = kernel(op, (y, means, vars_, log_pi), off, 1.0,
+                 Smoothed(Bernoulli(), MixtureGH(order=order)), order=order)
+    comp_sm = Compress(inner=MixtureGH(order=order), M=64, T=8.0)
+    aux = comp_sm.build_aux(Bernoulli(), y, means, vars_, log_pi)
+    comp = kernel(op, aux, off, 1.0, Smoothed(Bernoulli(), comp_sm), order=order)
+    for a, b in zip(comp, mix):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-4)
+
+
+def test_glm_ser_compress_matches_brute():
+    # end-to-end against the independent double integral (over b and the mixture
+    # offset): Compress must land on the same per-feature log-BF as the brute force.
+    X, off, y, means, vars_, log_pi = _mixture_data(seed=1, n=120, p=4, Kc=2)
+    op = DenseOperator(jnp.asarray(X))
+    comp_sm = Compress(inner=MixtureGH(order=25), M=64, T=8.0)
+    aux = comp_sm.build_aux(Bernoulli(), jnp.asarray(y), jnp.asarray(means),
+                            jnp.asarray(vars_), jnp.asarray(log_pi))
+    g = glm_ser(op, aux, jnp.asarray(off), 1.0, Smoothed(Bernoulli(), comp_sm), order=25)
+    brute = np.array([_brute_mixture_logbf(y, X, off, means, vars_, log_pi, j)
+                      for j in range(X.shape[1])])
     np.testing.assert_allclose(np.asarray(g[2]), brute, atol=3e-3)
 
 
