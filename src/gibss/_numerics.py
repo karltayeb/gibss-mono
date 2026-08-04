@@ -36,6 +36,20 @@ def _cheb_fit_matrix(degree: int):
     return x, np.linalg.inv(V)  # exact interpolant on CGL nodes
 
 
+@lru_cache(maxsize=None)
+def _cheb_diff_matrix(degree: int):
+    """(D+1, D+1) matrix mapping Chebyshev coeffs of f to coeffs of df/dt (on [-1,1]).
+    Exact for a degree-D polynomial. `D @ c` are the derivative-series coefficients;
+    for a fit on [c-h, c+h] the z-derivative is `(D @ coeffs) / h` (chain rule)."""
+    M = np.zeros((degree + 1, degree + 1))
+    for j in range(degree + 1):
+        e = np.zeros(degree + 1)
+        e[j] = 1.0
+        d = np.polynomial.chebyshev.chebder(e)  # degree drops by 1
+        M[: d.shape[0], j] = d
+    return M
+
+
 def _clenshaw(coeffs, t):
     """sum_j coeffs[j] T_j(t) at t (any shape). coeffs (D+1,) static length."""
     b1 = jnp.zeros_like(t)

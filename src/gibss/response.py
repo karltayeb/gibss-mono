@@ -35,7 +35,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._numerics import _cheb_fit_matrix, _clenshaw_batched, _gh_rule
+from ._numerics import (
+    _cheb_diff_matrix,
+    _cheb_fit_matrix,
+    _clenshaw_batched,
+    _gh_rule,
+)
 
 __all__ = [
     "ResponseModel",
@@ -201,21 +206,48 @@ class MixtureGH(Smoother):
         return red(ll), red(g), red(w)
 
 
+def _diff_residual(cr0, halfwidth, M):
+    """First and second z-derivative coefficient tables of a value residual `cr0`
+    (n, M+1), by the Chebyshev differentiation matrix and the interval chain rule
+    (the fit lives on [center +- halfwidth], so d/dz = (D coeffs) / halfwidth)."""
+    D = jnp.asarray(_cheb_diff_matrix(M)).T  # (M+1, M+1); apply as cr @ D
+    cr1 = (cr0 @ D) / halfwidth[:, None]
+    cr2 = (cr1 @ D) / halfwidth[:, None]
+    return cr1, cr2
+
+
 def _fold_over_components(
-    base, znodes, s_prev, means, vars_, pi, xgh, wgh, cr0, cr1, cr2, center_prev, hw_prev
+    base, znodes, s_prev, means, vars_, pi, xgh, wgh,
+    cr0, cr1, cr2, center_prev, hw_prev, value_only=False,
 ):
     """One sequential-fold step, reduced component by component to bound memory.
 
     Accumulates, over the K mixture components of one effect, the fresh cumulant fold
-    `E_o[(A, A', A'')(z + s_prev + o)]` and the previous-residual fold
-    `E_o[(r, r', r'')(z + o)]` at the Chebyshev nodes `znodes` (n, Z). The reduction
-    is a `lax.scan` over components: only ONE component's (n, Z, Q) grid is live at a
-    time, so peak memory is O(n Z Q), independent of K -- the exact K=p offset law
-    stays feasible without materializing the (n, Z, K, Q) tensor. `base.terms(., 0)`
-    isolates the y-free cumulant derivs `(-A, -A', A'')`; `cr*` are the previous stage's
-    residual coeffs (n, D+1). Returns six (n, Z) node-value sums."""
+    `E_o[A(z + s_prev + o)]` and the previous-residual fold `E_o[r(z + o)]` at the
+    Chebyshev nodes `znodes` (n, Z). The reduction is a `lax.scan` over components: only
+    ONE component's (n, Z, Q) grid is live at a time, so peak memory is O(n Z Q),
+    independent of K. `base.terms(., 0)` isolates the y-free cumulant `-A` (and, in full
+    mode, `-A', A''`). With `value_only` the fold carries just the value (EA0, Er0) --
+    the derivatives are recovered by differentiating the final interpolant, cheaper and
+    at least as accurate; otherwise it also folds `(A', A'')` and `(r', r'')`, returning
+    six sums."""
     n, Z = znodes.shape
     xs = (jnp.moveaxis(means, 1, 0), jnp.moveaxis(vars_, 1, 0), jnp.moveaxis(pi, 1, 0))
+
+    if value_only:
+        def body(carry, comp):
+            EA0, Er0 = carry
+            mk, vk, pk = comp
+            sd = jnp.sqrt(2.0 * jnp.maximum(vk, 0.0))
+            o = mk[:, None] + sd[:, None] * xgh[None, :]
+            pts = znodes[:, :, None] + o[:, None, :]
+            Wk = pk[:, None, None] * wgh[None, None, :]
+            nll = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))[0]
+            t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
+            return (EA0 - jnp.sum(Wk * nll, -1),
+                    Er0 + jnp.sum(Wk * _clenshaw_batched(cr0[:, None, None, :], t), -1)), None
+        (EA0, Er0), _ = jax.lax.scan(body, (jnp.zeros((n, Z)), jnp.zeros((n, Z))), xs)
+        return EA0, Er0
 
     def body(carry, comp):
         EA0, EA1, EA2, Er0, Er1, Er2 = carry
@@ -328,7 +360,7 @@ class Compress(Smoother):
         coef_w = fit(sw - bw)
         return y, obar, center, halfwidth, coef_ll, coef_g, coef_w
 
-    def build_aux_sequential(self, base, y, effects):
+    def build_aux_sequential(self, base, y, effects, derivatives="differentiate"):
         """Build the compressed aux for a SUM of independent per-row offsets by folding
         one effect at a time -- the exact way to handle the product mixture without
         materializing its `prod_l K_l` components.
@@ -356,8 +388,17 @@ class Compress(Smoother):
         sup-norm contraction, per-stage refit errors accumulate additively, not
         multiplicatively; and each fold smooths, so later stages only get easier.
 
+        `derivatives`: how the returned g/w tables are formed. "differentiate" (default)
+        carries ONLY the value residual through the fold (one integrand, ~3x cheaper) and
+        gets r', r'' by differentiating the final interpolant -- at least as accurate as
+        fitting them, since the fold value is well-resolved. "fit" folds (A', A'') and
+        (r', r'') too and fits all three tables (the independent-derivative reference).
+
         Returns the same aux as `build_aux`; with a single effect it matches it (up to
         the interval convention). Reduces to `A` when `effects` is empty."""
+        if derivatives not in ("differentiate", "fit"):
+            raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
+        value_only = derivatives == "differentiate"
         y = jnp.asarray(y)
         n = y.shape[0]
         xgh_np, logw_np = _gh_rule(self.inner.order)
@@ -391,23 +432,30 @@ class Compress(Smoother):
             znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
 
             # fold this effect, reducing over its K components one at a time (memory
-            # is O(n M Q), not O(n M K Q)); EA* = E_o[A,A',A''] at z + s_prev + o,
-            # Er* = E_o[r,r',r''] at z + o (the previous residual, r-arg has no s shift).
-            EA0, EA1, EA2, Er0, Er1, Er2 = _fold_over_components(
-                base, znodes, s_prev, means, vars_, pi, xgh, wgh,
-                cr0, cr1, cr2, center_prev, hw_prev,
-            )
-            # fresh single-effect cumulant residual F = E_o[A(z + s_prev + o)] - A(z + s);
-            # base.terms(., 0) = (-A, -A', A'') gives the y-free plug-in at z + s.
-            pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
-            F0, F1, F2 = EA0 - (-pll), EA1 - (-pg), EA2 - pw
-            cr0, cr1, cr2 = fit(F0 + Er0), fit(F1 + Er1), fit(F2 + Er2)
+            # is O(n M Q), not O(n M K Q)). value_only carries just the value residual.
+            if value_only:
+                EA0, Er0 = _fold_over_components(
+                    base, znodes, s_prev, means, vars_, pi, xgh, wgh,
+                    cr0, cr1, cr2, center_prev, hw_prev, value_only=True,
+                )
+                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                cr0 = fit((EA0 + pll) + Er0)  # F0 = E_o[A] - A(z+s), A(z+s) = -pll
+            else:
+                EA0, EA1, EA2, Er0, Er1, Er2 = _fold_over_components(
+                    base, znodes, s_prev, means, vars_, pi, xgh, wgh,
+                    cr0, cr1, cr2, center_prev, hw_prev,
+                )
+                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 
+        if value_only:  # derivatives of the value interpolant, on the final interval
+            cr1, cr2 = _diff_residual(cr0, halfwidth, self.M)
         # aux residuals are the term residuals: ll,g pick up a minus sign, w a plus
         # (coef_ll = fit(-r), etc.; fit is linear so negate the coeffs).
         return y, s, center, halfwidth, -cr0, -cr1, cr2
 
-    def build_aux_sequential_sparse(self, base, y, X, effects, entry_chunk=1 << 16):
+    def build_aux_sequential_sparse(self, base, y, X, effects, entry_chunk=1 << 16,
+                                    derivatives="differentiate"):
         """Sparse sequential fold that exploits zeros for free.
 
         Same result as `build_aux_sequential`, but the per-effect offset law comes from
@@ -427,6 +475,9 @@ class Compress(Smoother):
         1 over all p features (the SER `alpha`), so `pi_0i` is the PIP mass on the sets
         NOT containing row i. The interval moments (`s`, `V`) are the exact mixture mean
         and variance, unchanged by the lumping."""
+        if derivatives not in ("differentiate", "fit"):
+            raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
+        value_only = derivatives == "differentiate"
         y = jnp.asarray(y)
         idx = X.indices
         rows_all, cols_all = idx[:, 0], idx[:, 1]
@@ -479,42 +530,60 @@ class Compress(Smoother):
             sde = _pad(sd_e, 0.0).reshape(nchunks, C)
             we = _pad(wA, 0.0).reshape(nchunks, C)
 
-            def body(carry, ent):
-                EA0, EA1, EA2, Er0, Er1, Er2 = carry
-                rc, mc, sc, wc = ent  # (C,) each
+            def _pts_and_t(ent):  # shared per-entry geometry
+                rc, mc, sc, wc = ent
                 zc = znodes[rc]  # (C, M+1)
                 o = mc[:, None] + sc[:, None] * xgh[None, :]  # (C, Q)
-                a_arg = zc[:, :, None] + s_prev[rc][:, None, None] + o[:, None, :]  # (C,M+1,Q)
-                nll, ng, nw = base.terms(a_arg, jnp.zeros_like(a_arg))
-                Wc = wc[:, None, None] * wgh[None, None, :]
-                r_arg = zc[:, :, None] + o[:, None, :]  # residual arg (no s shift)
+                a_arg = zc[:, :, None] + s_prev[rc][:, None, None] + o[:, None, :]
+                r_arg = zc[:, :, None] + o[:, None, :]
                 tt = jnp.clip((r_arg - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
+                Wc = wc[:, None, None] * wgh[None, None, :]
                 ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
-                return (
-                    EA0 + ss(-jnp.sum(Wc * nll, -1)),
-                    EA1 + ss(-jnp.sum(Wc * ng, -1)),
-                    EA2 + ss(jnp.sum(Wc * nw, -1)),
-                    Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[rc][:, None, None, :], tt), -1)),
-                    Er1 + ss(jnp.sum(Wc * _clenshaw_batched(cr1_p[rc][:, None, None, :], tt), -1)),
-                    Er2 + ss(jnp.sum(Wc * _clenshaw_batched(cr2_p[rc][:, None, None, :], tt), -1)),
-                ), None
+                return a_arg, tt, Wc, ss
 
-            zero6 = tuple(jnp.zeros((n, self.M + 1)) for _ in range(6))
-            (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, zero6, (rr, me, sde, we))
-
-            # lumped zero component: point mass at 0, so g(z) with no quadrature
-            znll, zng, znw = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))
-            EA0 = EA0 + pi0[:, None] * (-znll)
-            EA1 = EA1 + pi0[:, None] * (-zng)
-            EA2 = EA2 + pi0[:, None] * znw
             tz = jnp.clip((znodes - center_prev[:, None]) / hw_prev[:, None], -1., 1.)
-            Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
-            Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
-            Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
+            if value_only:
+                def body(carry, ent):
+                    EA0, Er0 = carry
+                    a_arg, tt, Wc, ss = _pts_and_t(ent)
+                    nll = base.terms(a_arg, jnp.zeros_like(a_arg))[0]
+                    return (EA0 + ss(-jnp.sum(Wc * nll, -1)),
+                            Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[ent[0]][:, None, None, :], tt), -1))), None
+                z2 = (jnp.zeros((n, self.M + 1)), jnp.zeros((n, self.M + 1)))
+                (EA0, Er0), _ = jax.lax.scan(body, z2, (rr, me, sde, we))
+                znll = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))[0]
+                EA0 = EA0 + pi0[:, None] * (-znll)
+                Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
+                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                cr0 = fit((EA0 + pll) + Er0)
+            else:
+                def body(carry, ent):
+                    EA0, EA1, EA2, Er0, Er1, Er2 = carry
+                    a_arg, tt, Wc, ss = _pts_and_t(ent)
+                    nll, ng, nw = base.terms(a_arg, jnp.zeros_like(a_arg))
+                    rc = ent[0]
+                    return (
+                        EA0 + ss(-jnp.sum(Wc * nll, -1)),
+                        EA1 + ss(-jnp.sum(Wc * ng, -1)),
+                        EA2 + ss(jnp.sum(Wc * nw, -1)),
+                        Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[rc][:, None, None, :], tt), -1)),
+                        Er1 + ss(jnp.sum(Wc * _clenshaw_batched(cr1_p[rc][:, None, None, :], tt), -1)),
+                        Er2 + ss(jnp.sum(Wc * _clenshaw_batched(cr2_p[rc][:, None, None, :], tt), -1)),
+                    ), None
+                zero6 = tuple(jnp.zeros((n, self.M + 1)) for _ in range(6))
+                (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, zero6, (rr, me, sde, we))
+                znll, zng, znw = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))
+                EA0 = EA0 + pi0[:, None] * (-znll)
+                EA1 = EA1 + pi0[:, None] * (-zng)
+                EA2 = EA2 + pi0[:, None] * znw
+                Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
+                Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
+                Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
+                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 
-            pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
-            cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
-
+        if value_only:
+            cr1, cr2 = _diff_residual(cr0, halfwidth, self.M)
         return y, s, center, halfwidth, -cr0, -cr1, cr2
 
     def terms(self, base, eta, aux):

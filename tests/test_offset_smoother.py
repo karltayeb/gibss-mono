@@ -352,6 +352,26 @@ def _mk_effects(seed, n, Ks, scale=0.8):
     ]
 
 
+@pytest.mark.parametrize("derivatives", ["differentiate", "fit"])
+def test_compress_sequential_derivative_modes_match_reference(derivatives):
+    # both derivative strategies reproduce the exact product mixture: "fit" folds
+    # (r', r'') independently; "differentiate" carries only the value residual and
+    # differentiates the final interpolant (cheaper, at least as accurate).
+    n = 30
+    base = Bernoulli()
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    effects = _mk_effects(9, n, [2, 3])
+    pm = _product_mixture(effects)
+    comp = Compress(inner=MixtureGH(order=20), M=80, T=8.0)
+    aux = comp.build_aux_sequential(base, y, effects, derivatives=derivatives)
+    for eta_val in np.linspace(-6.0, 6.0, 13):
+        eta = jnp.full(n, float(eta_val))
+        got = comp.terms(base, eta, aux)
+        want = MixtureGH(order=20).terms(base, eta, (y, *pm))
+        for a, b in zip(got, want):
+            assert jnp.allclose(a, b, atol=1e-5)
+
+
 @pytest.mark.parametrize("Ks", [[2, 3], [2, 2, 3]])
 def test_compress_sequential_matches_product_mixture(Ks):
     # folding the effects one at a time must reproduce MixtureGH on the EXACT product
@@ -472,9 +492,12 @@ def test_compress_sequential_intervals_well_behaved():
         assert jnp.allclose(hw, 10.0 + 4.0 * jnp.sqrt(v_cum), atol=1e-6)
         assert jnp.all(hw >= prev_hw - 1e-6)  # monotone non-decreasing
         prev_hw = hw
-    # positive weight over a wide grid (convex contract, floored)
+    # convex contract: weight >= 0 everywhere (floored), and strictly > 0 in the bulk
+    # where the offset mass makes the curvature non-negligible.
+    aux = comp.build_aux_sequential(base, y, effects)
     for eta_val in np.linspace(-9, 9, 30):
-        aux = comp.build_aux_sequential(base, y, effects)
+        assert jnp.all(comp.terms(base, jnp.full(n, float(eta_val)), aux)[2] >= 0.0)
+    for eta_val in np.linspace(-2, 2, 9):
         assert jnp.all(comp.terms(base, jnp.full(n, float(eta_val)), aux)[2] > 0.0)
 
 
