@@ -169,6 +169,20 @@ def test_compress_offset_sparse_runs_and_recovers():
     assert _feat_pip(cp, 0) > 0.9  # causal feature recovered
 
 
+def test_compress_offset_sparse_shared_intercept_rejected():
+    # the shared intercept's variance fold isn't threaded through the sparse path yet,
+    # so sparse + shared + compress must fail loudly (not silently drop it).
+    import jax
+    from jax.experimental import sparse
+
+    rng = np.random.default_rng(2)
+    Xd = (rng.random((200, 15)) < 0.25) * 1.0
+    y = rng.binomial(1, 0.4, 200).astype(float)
+    X = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+    with pytest.raises(ValueError, match="profiled"):
+        fit_glm_susie(X, y, L=2, offset_integration="compress", intercept="shared", max_iter=5)
+
+
 def test_compress_offset_rejects_vi_kernel():
     # Compress is a fixed-per-row-offset scheme (quad kernel only); the vi kernel folds
     # the effect's own variance into the offset, which its tables can't express.

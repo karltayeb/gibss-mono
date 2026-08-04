@@ -230,6 +230,25 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
+    # offset_integration="compress" folds the shared intercept's variance as an extra
+    # Gaussian, but that trailing fold is only threaded on the DENSE path so far; on a
+    # sparse (BCOO) design the intercept variance would be silently dropped. Fail loudly
+    # (a silently-wrong fit is worse) -- intercept="profiled" has no shared-intercept
+    # variance, so it is exact on sparse.
+    if (
+        isinstance(getattr(response, "smoother", None), Compress)
+        and is_bcoo(X)
+        and cfg["intercept"] == "shared"
+        and estimate_intercept
+    ):
+        raise ValueError(
+            "offset_integration='compress' on a sparse (BCOO) design needs "
+            "intercept='profiled': the shared intercept's variance fold is not yet "
+            "threaded through the sparse zero-clumping path (it would be silently "
+            "dropped). Use intercept='profiled' (exact on sparse), pass a dense X, or "
+            "set estimate_intercept=False."
+        )
+
     # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
     # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row
     # background) and linear (row-wise exact through a CenteredOperator) consume it; the
