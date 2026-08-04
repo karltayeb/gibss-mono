@@ -32,7 +32,7 @@ from .engine import (
 )
 from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
 from .operators import CenteredOperator, as_operator
-from .response import Bernoulli, ResponseModel, Smoothed
+from .response import Bernoulli, Compress, ResponseModel, Smoothed
 from .response_ser import (
     _profile_null,
     build_ser_state,
@@ -178,7 +178,16 @@ def _aux(data, state, include_intercept_var=True):
     if not isinstance(fs.response, Smoothed):
         return y
     ov = _offset_var(state, include_intercept_var)
-    if fs.response.smoother.takes_row_param and fs.kernel != "jj":
+    smoother = fs.response.smoother
+    if isinstance(smoother, Compress):
+        # M1: the offset is the aggregate message, treated as a single Gaussian
+        # o ~ N(0, ov) (its mean already lives in the fixed offset). Compress
+        # precomputes the K=1 residual tables once here; M2 replaces this with the
+        # per-target sequential fold over the OTHER effects' mixtures.
+        ov = jnp.broadcast_to(ov, (y.shape[0],))
+        z = jnp.zeros((y.shape[0], 1))
+        return smoother.build_aux(fs.response.base, y, z, ov[:, None], z)
+    if smoother.takes_row_param and fs.kernel != "jj":
         return y, ov, jnp.asarray(fs.row_param)
     return y, ov
 

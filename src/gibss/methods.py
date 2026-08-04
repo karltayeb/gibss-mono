@@ -23,9 +23,11 @@ from .linear import is_bcoo
 from .response import (
     GH,
     Bernoulli,
+    Compress,
     Gaussian,
     JJEnvelope,
     JJFixed,
+    MixtureGH,
     Poisson,
     ResponseModel,
     Smoothed,
@@ -45,6 +47,10 @@ _FAMILIES = {
 # smoother constructors, keyed by public name; each receives the resolved config
 _SMOOTHERS = {
     "gh": lambda cfg: GH(order=cfg["offset_quadrature_points"]),
+    "compress": lambda cfg: Compress(
+        inner=MixtureGH(order=cfg["offset_quadrature_points"]),
+        M=cfg["compress_degree"],
+    ),
     "taylor2": lambda cfg: Taylor(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),
@@ -57,6 +63,7 @@ _DEFAULTS = {
     "variational_family": "unconstrained",  # "unconstrained" | "gaussian"
     "offset_integration": "none",  # "none" | key of _SMOOTHERS
     "offset_quadrature_points": 15,
+    "compress_degree": 48,  # Chebyshev degree M for offset_integration="compress"
     "effect_quadrature_points": 15,
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
@@ -131,6 +138,13 @@ def _resolve(cfg):
 
     if getattr(response, "quadratic", False):
         return response, "linear"
+    if isinstance(getattr(response, "smoother", None), Compress) and vfam != "unconstrained":
+        raise ValueError(
+            "offset_integration='compress' needs variational_family='unconstrained' "
+            "(the 'quad' kernel): Compress precomputes fixed-per-row offset tables, but "
+            "the 'vi' kernel folds the effect's OWN variance into the per-entry offset, "
+            "which those tables can't express. Use variational_family='unconstrained'."
+        )
     if vfam == "unconstrained":
         return response, "quad"
     if not isinstance(response, Smoothed):

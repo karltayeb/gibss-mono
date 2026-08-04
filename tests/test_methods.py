@@ -131,6 +131,49 @@ def test_family_object_passthrough():
     np.testing.assert_array_equal(np.asarray(a.alpha), np.asarray(b.alpha))
 
 
+def _feature_log_marginal(state):
+    # per-feature log evidence, stacked over effects (L, p): the pre-softmax quantity
+    # PIP saturates away, so a far more sensitive equivalence check than PIP.
+    return np.stack([np.asarray(e.feature_log_marginal) for e in state.single_effects])
+
+
+@pytest.mark.parametrize("intercept", ["shared", "profiled"])
+def test_compress_offset_matches_gh(intercept):
+    # M1: offset_integration="compress" wires Compress through the quad kernel. With the
+    # aggregate offset as a single Gaussian (K=1), it must reproduce the GH smoother's
+    # per-feature log evidence to Chebyshev-interpolation error -- the whole
+    # _resolve/_aux/terms path.
+    X, y = _data("logistic")
+    kw = dict(L=3, offset_quadrature_points=15, intercept=intercept, max_iter=60)
+    gh = fit_glm_susie(X, y, offset_integration="gh", **kw)
+    cp = fit_glm_susie(X, y, offset_integration="compress", **kw)
+    np.testing.assert_allclose(_feature_log_marginal(cp), _feature_log_marginal(gh), atol=1e-4)
+
+
+def test_compress_offset_matches_gh_sparse():
+    import jax
+    from jax.experimental import sparse
+
+    rng = np.random.default_rng(1)
+    n, p = 400, 20
+    Xd = (rng.random((n, p)) < 0.25) * rng.normal(1.0, 0.3, (n, p))
+    y = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + 1.5 * Xd[:, 0]))), n).astype(float)
+    X = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+    kw = dict(L=3, offset_quadrature_points=15, max_iter=60)
+    gh = fit_glm_susie(X, y, offset_integration="gh", **kw)
+    cp = fit_glm_susie(X, y, offset_integration="compress", **kw)
+    np.testing.assert_allclose(_feature_log_marginal(cp), _feature_log_marginal(gh), atol=1e-4)
+
+
+def test_compress_offset_rejects_vi_kernel():
+    # Compress is a fixed-per-row-offset scheme (quad kernel only); the vi kernel folds
+    # the effect's own variance into the offset, which its tables can't express.
+    X, y = _data("logistic")
+    with pytest.raises(ValueError, match="unconstrained"):
+        fit_glm_susie(X, y, L=2, offset_integration="compress",
+                      variational_family="gaussian", max_iter=5)
+
+
 def test_prior_variance_threads_through():
     X, y = _data("logistic")
     st = fit_glm_susie(
