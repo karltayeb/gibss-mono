@@ -277,7 +277,12 @@ class Compress(Smoother):
     effect's own variance into the per-entry offset).
     """
 
-    inner: Smoother = field(default_factory=lambda: MixtureGH(order=30))
+    # inner supplies the per-fold GH quadrature (its `order` is the number of GH nodes
+    # per Gaussian component). order=5 already reaches the Chebyshev interpolation floor
+    # -- the fold integrand (softplus + a small, effectively low-order residual against a
+    # Gaussian) is smooth, so accuracy is set by M, not the quadrature; raise `order`
+    # only for the exact-reference path.
+    inner: Smoother = field(default_factory=lambda: MixtureGH(order=5))
     M: int = 48
     T: float = 10.0
     kappa: float = 4.0
