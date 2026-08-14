@@ -340,6 +340,56 @@ def _fold_over_components(
     return EA0, EA1, EA2, Er0, Er1, Er2
 
 
+def _fold_selfnorm_components(
+    base, znodes, s_prev, x, b_nodes, W,
+    cr0, cr1, cr2, center_prev, hw_prev, value_only=False,
+):
+    """Self-normalized analogue of `_fold_over_components`: fold ONE effect supplied as
+    raw quadrature -- design scalings `x` (n, C), row-INDEPENDENT effect-value nodes
+    `b_nodes` (C, Q), and shared self-normalized weights `W` (C, Q, a `softmax` over all
+    (C, Q), summing to 1). Reduces over the C components (features) with a `lax.scan`,
+    forming the offset `o = x (x) b` on the fly, so peak memory is O(n Z Q) and the full
+    tensor is never materialized. Same accumulation as the Gaussian fold: the fresh
+    cumulant `E_o[A(z + s_prev + o)]` and the folded previous residual `E_o[r(z + o)]`
+    (the weights are row-independent, so `W_c` broadcasts over rows)."""
+    n, Z = znodes.shape
+    xs = (x.T, b_nodes, W)  # (C, n), (C, Q), (C, Q)
+
+    if value_only:
+        def body(carry, comp):
+            EA0, Er0 = carry
+            xc, bc, Wc = comp
+            o = xc[:, None] * bc[None, :]  # (n, Q)
+            pts = znodes[:, :, None] + o[:, None, :]  # (n, Z, Q)
+            Wc_ = Wc[None, None, :]  # (1, 1, Q), shared across rows
+            nll = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))[0]
+            t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
+            return (EA0 - jnp.sum(Wc_ * nll, -1),
+                    Er0 + jnp.sum(Wc_ * _clenshaw_batched(cr0[:, None, None, :], t), -1)), None
+        (EA0, Er0), _ = jax.lax.scan(body, (jnp.zeros((n, Z)), jnp.zeros((n, Z))), xs)
+        return EA0, Er0
+
+    def body(carry, comp):
+        EA0, EA1, EA2, Er0, Er1, Er2 = carry
+        xc, bc, Wc = comp
+        o = xc[:, None] * bc[None, :]  # (n, Q)
+        pts = znodes[:, :, None] + o[:, None, :]  # (n, Z, Q)
+        Wc_ = Wc[None, None, :]
+        nll, ng, nw = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))
+        EA0 = EA0 - jnp.sum(Wc_ * nll, -1)
+        EA1 = EA1 - jnp.sum(Wc_ * ng, -1)
+        EA2 = EA2 + jnp.sum(Wc_ * nw, -1)
+        t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
+        Er0 = Er0 + jnp.sum(Wc_ * _clenshaw_batched(cr0[:, None, None, :], t), -1)
+        Er1 = Er1 + jnp.sum(Wc_ * _clenshaw_batched(cr1[:, None, None, :], t), -1)
+        Er2 = Er2 + jnp.sum(Wc_ * _clenshaw_batched(cr2[:, None, None, :], t), -1)
+        return (EA0, EA1, EA2, Er0, Er1, Er2), None
+
+    init = tuple(jnp.zeros((n, Z)) for _ in range(6))
+    (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, init, xs)
+    return EA0, EA1, EA2, Er0, Er1, Er2
+
+
 @dataclass(frozen=True)
 class Compress(Smoother):
     """Amortized Chebyshev compression of a per-row offset correction.
@@ -468,6 +518,196 @@ class Compress(Smoother):
         bll, bg, bw = base.terms(znodes + obar[:, None], y[:, None])  # plug-in at shift
         fit = lambda vals: vals @ Vinv.T  # noqa: E731
         return y, obar, center, halfwidth, fit(sll - bll), fit(sg - bg), fit(sw - bw)
+
+    def build_aux_selfnorm_sequential(self, base, y, effects, derivatives="differentiate"):
+        """Self-normalized analogue of `build_aux_sequential` for a SUM of independent
+        effects (the offset when fitting one block: `o = sum_{l' != l} X_l' b_l'`). Each
+        effect is supplied as RAW quadrature `(x, b_nodes, logW)` -- design scalings `x`
+        (n, C_l), row-independent effect-value nodes `b_nodes` (C_l, Q_l), and their
+        log-unnormalized weights `logW` (C_l, Q_l) -- NOT a Gaussian mixture. The offset
+        cumulant is the iterated expectation `E_o1 ... E_oL[A(z + sum o)]`; we peel the
+        effects `A^(m)(z) = E_{o^(m)}[A^(m-1)(z + o^(m))]`, each fold self-normalized. Under
+        mean-field independence the joint self-normalization factorizes into the per-effect
+        ones, so peeling is exact up to the per-stage Chebyshev refit.
+
+        Same plug-in/residual carry as `build_aux_sequential`: a compressed residual
+        `r^(m) = A^(m) - A(z + s_m)` on the interval `[-s_m +- (T + kappa sqrt(V_m))]`, with
+        `s_m`, `V_m` the cumulative self-normalized offset mean and variance. Emits the
+        `Compress.terms` aux; a single effect matches `build_aux_selfnorm` up to the
+        interval convention, and empty `effects` reduces to `A`. `derivatives` as in
+        `build_aux_sequential`."""
+        if derivatives not in ("differentiate", "fit"):
+            raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
+        value_only = derivatives == "differentiate"
+        y = jnp.asarray(y)
+        n = y.shape[0]
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+
+        s = jnp.zeros(n)  # cumulative mean shift
+        V = jnp.zeros(n)  # cumulative variance
+        center = -s
+        halfwidth = self.T + self.kappa * jnp.sqrt(V)
+        cr0 = jnp.zeros((n, self.M + 1))
+        cr1 = jnp.zeros((n, self.M + 1))
+        cr2 = jnp.zeros((n, self.M + 1))
+
+        for x, b_nodes, logW in effects:
+            x, b_nodes = jnp.asarray(x), jnp.asarray(b_nodes)
+            W = jax.nn.softmax(jnp.asarray(logW).reshape(-1)).reshape(b_nodes.shape)  # (C, Q)
+            s_c = jnp.sum(W * b_nodes, axis=-1)  # (C,) per-component mean node
+            q_c = jnp.sum(W * b_nodes**2, axis=-1)  # (C,) per-component 2nd moment
+            obar = x @ s_c  # (n,) effect mean E[o]
+            var_eff = jnp.maximum((x**2) @ q_c - obar**2, 0.0)  # (n,) effect var
+
+            s_prev, center_prev, hw_prev = s, center, halfwidth
+            s = s + obar
+            V = V + var_eff
+            center = -s
+            halfwidth = self.T + self.kappa * jnp.sqrt(V)
+            znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+            if value_only:
+                EA0, Er0 = _fold_selfnorm_components(
+                    base, znodes, s_prev, x, b_nodes, W,
+                    cr0, cr1, cr2, center_prev, hw_prev, value_only=True,
+                )
+                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                cr0 = fit((EA0 + pll) + Er0)
+            else:
+                EA0, EA1, EA2, Er0, Er1, Er2 = _fold_selfnorm_components(
+                    base, znodes, s_prev, x, b_nodes, W,
+                    cr0, cr1, cr2, center_prev, hw_prev,
+                )
+                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
+
+        if value_only:
+            cr1, cr2 = _diff_residual(cr0, halfwidth, self.M)
+        return y, s, center, halfwidth, -cr0, -cr1, cr2
+
+    def build_aux_selfnorm_sequential_sparse(self, base, y, X, effects,
+                                             entry_chunk=1 << 16, derivatives="differentiate"):
+        """Sparse self-normalized sequential fold -- the raw-quadrature analogue of
+        `build_aux_sequential_sparse`, exploiting the design zeros for free. `X` is a
+        sparse (BCOO, n x p) design shared by the effects; each effect is `(b_nodes, logW)`
+        with (p, Q) rows -- feature j's effect-value quadrature nodes and their
+        log-unnormalized weights (the selection evidence `q(j)` folded in globally). The
+        self-normalized weights `W = softmax(logW)` over all (p, Q) give per-feature mass
+        `alpha_j = sum_m W_jm`; a row's zero columns collapse to a point mass at o=0 with
+        weight `pi0_i = 1 - sum_{j: X_ij != 0} alpha_j`, folded as `pi0 * A(z)` -- no
+        quadrature. Real work touches only the `nnz` nonzero entries (node `X_ij b_jm`,
+        weight `W_jm`), segment-summed over rows and chunked over entries (`entry_chunk`),
+        so a fold is O(nnz Q M) not O(n p Q M). Emits the `build_aux_sequential` aux."""
+        if derivatives not in ("differentiate", "fit"):
+            raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
+        value_only = derivatives == "differentiate"
+        y = jnp.asarray(y)
+        idx = X.indices
+        rows_all, cols_all = idx[:, 0], idx[:, 1]
+        vals_all = X.data
+        n = X.shape[0]
+        nnz = vals_all.shape[0]
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        fit = lambda v: v @ Vinv.T  # noqa: E731
+
+        C = min(int(entry_chunk), nnz)
+        nchunks = -(-nnz // C)
+        pad = nchunks * C - nnz
+        def _pad(a, fill):  # noqa: E731
+            return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
+                    if pad else a)
+
+        s = jnp.zeros(n)
+        V = jnp.zeros(n)
+        center = -s
+        halfwidth = self.T + self.kappa * jnp.sqrt(V)
+        cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
+
+        for b_nodes, logW in effects:
+            b_nodes = jnp.asarray(b_nodes)
+            p_, Q = b_nodes.shape
+            W_all = jax.nn.softmax(jnp.asarray(logW).reshape(-1)).reshape(p_, Q)  # global
+            alpha = jnp.sum(W_all, axis=-1)  # (p,) feature mass
+            g = jnp.sum(W_all * b_nodes, axis=-1)  # (p,) sum_m W_jm b_jm
+            h = jnp.sum(W_all * b_nodes**2, axis=-1)  # (p,) sum_m W_jm b_jm^2
+
+            # exact mixture moments: zeros drop out (they contribute o=0).
+            obar = jax.ops.segment_sum(vals_all * g[cols_all], rows_all, num_segments=n)
+            eo2 = jax.ops.segment_sum(vals_all**2 * h[cols_all], rows_all, num_segments=n)
+            var_eff = jnp.maximum(eo2 - obar**2, 0.0)
+            pi0 = jnp.maximum(1.0 - jax.ops.segment_sum(alpha[cols_all], rows_all, num_segments=n), 0.0)
+
+            s_prev, center_prev, hw_prev = s, center, halfwidth
+            cr0_p, cr1_p, cr2_p = cr0, cr1, cr2
+            s = s + obar
+            V = V + var_eff
+            center = -s
+            halfwidth = self.T + self.kappa * jnp.sqrt(V)
+            znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+            rr = _pad(rows_all, 0).reshape(nchunks, C)
+            vv = _pad(vals_all, 0.0).reshape(nchunks, C)
+            bb = _pad(b_nodes[cols_all], 0.0).reshape(nchunks, C, Q)  # entry feature nodes
+            ww = _pad(W_all[cols_all], 0.0).reshape(nchunks, C, Q)  # entry node weights
+
+            def _pts_and_t(ent):
+                rc, vc, bnc, wwc = ent  # (C,), (C,), (C, Q), (C, Q)
+                zc = znodes[rc]  # (C, M+1)
+                o = vc[:, None] * bnc  # (C, Q) node = X_ij b_jm
+                a_arg = zc[:, :, None] + s_prev[rc][:, None, None] + o[:, None, :]
+                r_arg = zc[:, :, None] + o[:, None, :]
+                tt = jnp.clip((r_arg - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
+                Wc = wwc[:, None, :]  # (C, 1, Q)
+                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
+                return a_arg, tt, Wc, ss
+
+            tz = jnp.clip((znodes - center_prev[:, None]) / hw_prev[:, None], -1., 1.)
+            if value_only:
+                def body(carry, ent):
+                    EA0, Er0 = carry
+                    a_arg, tt, Wc, ss = _pts_and_t(ent)
+                    nll = base.terms(a_arg, jnp.zeros_like(a_arg))[0]
+                    return (EA0 + ss(-jnp.sum(Wc * nll, -1)),
+                            Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[ent[0]][:, None, None, :], tt), -1))), None
+                z2 = (jnp.zeros((n, self.M + 1)), jnp.zeros((n, self.M + 1)))
+                (EA0, Er0), _ = jax.lax.scan(body, z2, (rr, vv, bb, ww))
+                znll = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))[0]
+                EA0 = EA0 + pi0[:, None] * (-znll)
+                Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
+                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                cr0 = fit((EA0 + pll) + Er0)
+            else:
+                def body(carry, ent):
+                    EA0, EA1, EA2, Er0, Er1, Er2 = carry
+                    a_arg, tt, Wc, ss = _pts_and_t(ent)
+                    nll, ng, nw = base.terms(a_arg, jnp.zeros_like(a_arg))
+                    rc = ent[0]
+                    return (
+                        EA0 + ss(-jnp.sum(Wc * nll, -1)),
+                        EA1 + ss(-jnp.sum(Wc * ng, -1)),
+                        EA2 + ss(jnp.sum(Wc * nw, -1)),
+                        Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[rc][:, None, None, :], tt), -1)),
+                        Er1 + ss(jnp.sum(Wc * _clenshaw_batched(cr1_p[rc][:, None, None, :], tt), -1)),
+                        Er2 + ss(jnp.sum(Wc * _clenshaw_batched(cr2_p[rc][:, None, None, :], tt), -1)),
+                    ), None
+                zero6 = tuple(jnp.zeros((n, self.M + 1)) for _ in range(6))
+                (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, zero6, (rr, vv, bb, ww))
+                znll, zng, znw = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))
+                EA0 = EA0 + pi0[:, None] * (-znll)
+                EA1 = EA1 + pi0[:, None] * (-zng)
+                EA2 = EA2 + pi0[:, None] * znw
+                Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
+                Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
+                Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
+                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
+
+        if value_only:
+            cr1, cr2 = _diff_residual(cr0, halfwidth, self.M)
+        return y, s, center, halfwidth, -cr0, -cr1, cr2
 
     def build_aux_sequential(self, base, y, effects, derivatives="differentiate"):
         """Build the compressed aux for a SUM of independent per-row offsets by folding

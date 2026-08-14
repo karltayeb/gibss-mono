@@ -19,6 +19,7 @@ a row enters only through the design scaling `x_ic`, so the offset contribution 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse
 
 from gibss.response import GH, Bernoulli, Compress, SelfNormQuad
 
@@ -188,3 +189,99 @@ def test_compress_selfnorm_matches_direct_fold():
         assert jnp.allclose(ll_c, ll_d[:, 0], atol=1e-6)
         assert jnp.allclose(g_c, g_d[:, 0], atol=1e-6)
         assert jnp.allclose(w_c, w_d[:, 0], atol=1e-6)
+
+
+def _effect(n, C, Q, kappa=0.0, scale=0.6):
+    """A random single-effect raw-quadrature offset law (x, b_nodes, logW): C features,
+    per-row design scalings x (n, C), value nodes/weights (C, Q) with equal feature mass."""
+    x = jnp.asarray(RNG.normal(size=(n, C)) * scale)
+    bl, wl = zip(*[_gh_component(RNG.normal() * 0.5, 0.2 + RNG.random(), Q, kappa) for _ in range(C)])
+    b_nodes = jnp.concatenate(bl, axis=0)  # (C, Q)
+    logW = jnp.concatenate(wl, axis=0) - np.log(C)  # equal feature masses
+    return x, b_nodes, logW
+
+
+def test_sequential_single_effect_matches_direct():
+    """build_aux_selfnorm_sequential([e]) equals build_aux_selfnorm(e) as a function (up
+    to the interval convention), mirroring the Gaussian one-effect check."""
+    n = 6
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    x, b_nodes, logW = _effect(n, 2, 20)
+    comp = Compress(M=80, T=8.0)
+    a_seq = comp.build_aux_selfnorm_sequential(BASE, y, [(x, b_nodes, logW)])
+    a_dir = comp.build_aux_selfnorm(BASE, y, x, b_nodes, logW)
+    for eta_val in np.linspace(-5.0, 5.0, 11):
+        eta = jnp.full(n, float(eta_val))
+        for t_seq, t_dir in zip(comp.terms(BASE, eta, a_seq), comp.terms(BASE, eta, a_dir)):
+            assert jnp.allclose(t_seq, t_dir, atol=1e-5)
+
+
+def _brute_two_effects(eta, y, e1, e2):
+    """Exact product-mixture fold E[base.terms(eta + o1 + o2)] over both effects' node
+    grids (materialized reference; small Q only). Each e = (x, b_nodes, logW)."""
+    def nodes(e):
+        x, b, lw = e
+        o = (x[:, :, None] * b[None, :, :]).reshape(x.shape[0], -1)  # (n, C*Q)
+        W = jax.nn.softmax(lw.reshape(-1))  # (C*Q,)
+        return o, W
+    o1, W1 = nodes(e1)
+    o2, W2 = nodes(e2)
+    shift = eta[:, None, None] + o1[:, :, None] + o2[:, None, :]  # (n, A1, A2)
+    ll, g, w = BASE.terms(shift, y[:, None, None])
+    red = lambda t: jnp.einsum("a,iab,b->i", W1, t, W2)
+    return red(ll), red(g), red(w)
+
+
+def test_sequential_two_effects_matches_bruteforce():
+    """The peel of two independent effects reproduces the exact product-mixture fold."""
+    n = 6
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    e1 = _effect(n, 2, 16, kappa=0.3)
+    e2 = _effect(n, 1, 16, kappa=0.0)
+    comp = Compress(M=96, T=8.0)
+    aux = comp.build_aux_selfnorm_sequential(BASE, y, [e1, e2])
+    _, _s, center, halfwidth, *_ = aux
+    for f in np.linspace(-0.85, 0.85, 13):
+        eta = center + halfwidth * float(f)  # (n,), inside the fit interval
+        got = comp.terms(BASE, eta, aux)
+        ref = _brute_two_effects(eta, y, e1, e2)
+        for a, b in zip(got, ref):
+            assert jnp.allclose(a, b, atol=2e-5)
+
+
+def test_sparse_matches_dense_sequential():
+    """The sparse fold equals the dense sequential fold on the same effects (zeros handled
+    by clumping vs. by an all-zero design column -- identical result)."""
+    n, p, Q = 6, 5, 16
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    Xd = RNG.normal(size=(n, p)) * (RNG.random((n, p)) < 0.5)  # ~50% zeros
+    Xd = jnp.asarray(Xd)
+    Xsp = sparse.BCOO.fromdense(Xd)
+
+    def effect(kappa):
+        bl, wl = zip(*[_gh_component(RNG.normal() * 0.5, 0.2 + RNG.random(), Q, kappa) for _ in range(p)])
+        return jnp.concatenate(bl, axis=0), jnp.concatenate(wl, axis=0)  # (p, Q) each
+
+    e1 = effect(0.3)
+    e2 = effect(0.0)
+    comp = Compress(M=80, T=8.0)
+    dense = comp.build_aux_selfnorm_sequential(BASE, y, [(Xd, e1[0], e1[1]), (Xd, e2[0], e2[1])])
+    spar = comp.build_aux_selfnorm_sequential_sparse(BASE, y, Xsp, [e1, e2])
+    for d, s in zip(dense, spar):
+        assert jnp.allclose(d, s, atol=1e-9)
+
+
+def test_sequential_fit_mode_matches_differentiate():
+    """derivatives='fit' (independent A',A'' folds) agrees with the default differentiate
+    path on the value residual and gives consistent g/w."""
+    n = 6
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    effs = [_effect(n, 2, 20, kappa=0.3), _effect(n, 1, 20)]
+    comp = Compress(M=96, T=8.0)
+    a_diff = comp.build_aux_selfnorm_sequential(BASE, y, effs, derivatives="differentiate")
+    a_fit = comp.build_aux_selfnorm_sequential(BASE, y, effs, derivatives="fit")
+    _, _s, center, halfwidth, *_ = a_diff
+    for f in np.linspace(-0.8, 0.8, 11):
+        eta = center + halfwidth * float(f)
+        for a, b in zip(comp.terms(BASE, eta, a_diff), comp.terms(BASE, eta, a_fit)):
+            assert jnp.allclose(a, b, atol=1e-4)
