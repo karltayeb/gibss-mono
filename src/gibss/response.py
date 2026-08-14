@@ -48,7 +48,7 @@ __all__ = [
     "Smoother",
     "GH",
     "MixtureGH",
-    "TiltedMixtureGH",
+    "SelfNormQuad",
     "Compress",
     "Taylor",
     "TaylorFixed",
@@ -208,70 +208,46 @@ class MixtureGH(Smoother):
 
 
 @dataclass(frozen=True)
-class TiltedMixtureGH(Smoother):
-    """Self-normalized Gauss-Hermite fold against a TILTED offset law.
+class SelfNormQuad(Smoother):
+    """Self-normalized quadrature fold against an offset law given by RAW quadrature.
 
-    Generalizes `MixtureGH` from folding the exact cumulant against the Gaussian-mixture
-    WORKING posterior `qhat(o) = sum_k pi_ik N(m_ik, v_ik)` to folding against the TRUE
-    (CAVI) posterior `q*(o) prop qhat(o) exp(-r_i(o))`, where `r_i` is a per-row tilt --
-    the manuscript's `r_l`, the Jensen-gap correction that turns the gIBSS update into the
-    exact CAVI coordinate update `q*_l prop q_l exp(-r_l)`. By the manuscript's
-    self-normalized quadrature identity, with `qhat` as the proposal the offset
-    expectation is a RATIO of reweighted node sums:
+    The manuscript's self-normalized quadrature (eq:self-normalized-quadrature) with NO
+    Gaussian working model. An offset effect's posterior `q_{l'}` is NOT approximated by a
+    Gaussian (mixture): when it is fit by a quadrature kernel we only ever have the
+    UNNORMALIZED posterior `p~_{l'}` at its nodes -- never a normalized density, never a
+    parametric form. So `q_{l'}` rides here exactly as the kernel produces it -- per-row
+    offset nodes and log-unnormalized weights -- and the expectation is self-normalized:
 
-        Atilde*(eta) = E_{q*}[A(eta + o)] = (sum_m W_m A(eta + o_m)) / (sum_m W_m),
-        W_m = pi_ik (w_j / sqrt(pi)) exp(-r_i(o_m)),   o_m = m_ik + sqrt(2 v_ik) x_j.
+        Atilde*(eta) = E_{q_{l'}}[A(eta + o)] = sum_m softmax(logW)_m A(eta + o_m),
+        softmax(logW)_m = W~_m / sum_m' W~_m',   W~_m = p~_{l'}(b_m) x (quadrature weight).
 
-    The normalizer `sum_m W_m` is the tilted-law constant: it weights the OFFSET value
-    `o`, not the predictor `eta`, so it does NOT depend on eta -- one per-row scalar. Grad
-    and weight are the same self-normalized sums of `A', A''` (q* is eta-free, so d/deta
-    commutes through the ratio), keeping the terms Newton-consistent; the weights stay
-    >= 0 (exp(-r) > 0, pi >= 0, GH weights > 0), so convexity is preserved.
+    The nodes `o_m` are the offset CONTRIBUTIONS -- design-scaled effect values, with the
+    SER mixture over selected features and the fitting quadrature already flattened into
+    the node axis. The tilt `exp(-r)` that turns the gIBSS posterior into the exact CAVI
+    posterior is IMPLICIT in `p~`, not a separate table; there is nothing Gaussian to
+    approximate away. The normalizer `sum_m W~_m` weights the OFFSET value `o`, not the
+    predictor `eta`, so it is eta-free (one per-row scalar); grad/weight are the same
+    self-normalized sums of `A', A''` (q* is eta-free, so d/deta commutes through the
+    ratio), keeping the terms Newton-consistent; softmax weights are >= 0, so convex.
 
-    Because the tilt only DOWN-weights -- `r >= 0` is a Jensen gap and the cumulant `A`
-    is convex, so `exp(-r) <= 1` and q* is pointwise dominated by the Gaussian proposal --
-    the importance weights are bounded and the self-normalized rule converges
-    unconditionally as `order -> infinity`. That is the whole point: in the limit of many
-    nodes (and, downstream, a high-degree wide-interval `Compress` fit) this reproduces
-    the EXACT CAVI offset integration; `r == 0` collapses it back to `MixtureGH` (Laplace/
-    gIBSS). More nodes than `MixtureGH` are warranted (default 32) since the reweighted
-    integrand is less smooth.
+    As the node set refines this is the EXACT CAVI offset integration; a single node (or a
+    point mass) collapses to the plug-in cumulant `A(eta + o)`. Like `MixtureGH` this is a
+    fixed-per-row-offset scheme -- use it with the quadrature/Laplace kernels.
 
-    aux = (y, means, vars, log_pi, tcenter, thalf, tcoef): the `MixtureGH` mixture
-    `(means, vars, log_pi)` (each (n, K)) plus the per-row tilt evaluated by Clenshaw,
-    `r_i(o) = sum_j tcoef[i, j] T_j(clip((o - tcenter_i) / thalf_i, -1, 1))`. The clamp
-    makes the tilt read its endpoint outside the fit interval, where q* has negligible
-    mass. `tcenter, thalf` are (n,); `tcoef` is (n, Mt+1). Zero `tcoef` recovers
-    `MixtureGH` EXACTLY (exp(0) = 1, normalizer = sum of mixture/GH weights = 1). Like
-    `MixtureGH` this is a fixed-per-row-offset scheme (use it with the quadrature/Laplace
-    kernels). `eta` is (n, Z).
+    aux = (y, o_nodes, logW): `o_nodes`, `logW` are (n, Q) -- per-row offset nodes and
+    their log-unnormalized weights (self-normalized internally by `softmax` over Q).
+    `eta` is (n, Z).
     """
 
-    order: int = 32
-
     def terms(self, base, eta, aux):
-        y, means, vars_, log_pi, tcenter, thalf, tcoef = aux
+        y, o_nodes, logW = aux
         eta = jnp.asarray(eta)
         y = jnp.asarray(y)
-        means, vars_ = jnp.asarray(means), jnp.asarray(vars_)
-        tcenter, thalf, tcoef = jnp.asarray(tcenter), jnp.asarray(thalf), jnp.asarray(tcoef)
-        pi = jax.nn.softmax(jnp.asarray(log_pi), axis=-1)  # (n, K)
-        nodes_np, wts_np = np.polynomial.hermite.hermgauss(self.order)
-        nodes = jnp.asarray(nodes_np)  # (order,)
-        wts = jnp.asarray(wts_np / np.sqrt(np.pi))  # (order,), sum to 1
-        sd = jnp.sqrt(2.0 * jnp.maximum(vars_, 0.0))  # (n, K)
-
-        # offset node values o = m_ik + sqrt(2 v_ik) x_j -- eta-FREE, (n, order, K).
-        o = means[:, None, :] + sd[:, None, :] * nodes[None, :, None]
-        # tilt r_i(o) by per-row Clenshaw, clamped outside the fit interval.
-        targ = jnp.clip((o - tcenter[:, None, None]) / thalf[:, None, None], -1.0, 1.0)
-        r = _clenshaw_batched(tcoef[:, None, None, :], targ)  # (n, order, K)
-        Wt = wts[None, :, None] * pi[:, None, :] * jnp.exp(-r)  # (n, order, K)
-        Z = jnp.sum(Wt, axis=(1, 2))  # (n,) tilted-law normalizer, eta-free
-
-        shift = eta[:, :, None, None] + o[:, None, :, :]  # (n, Z, order, K)
-        ll, g, w = base.terms(shift, y[:, None, None, None])
-        red = lambda t: jnp.sum(Wt[:, None, :, :] * t, axis=(2, 3)) / Z[:, None]  # noqa: E731
+        o_nodes = jnp.asarray(o_nodes)
+        W = jax.nn.softmax(jnp.asarray(logW), axis=-1)  # (n, Q), self-normalized
+        shift = eta[:, :, None] + o_nodes[:, None, :]  # (n, Z, Q)
+        ll, g, w = base.terms(shift, y[:, None, None])
+        red = lambda t: jnp.sum(W[:, None, :] * t, axis=-1)  # noqa: E731
         return red(ll), red(g), red(w)
 
 
@@ -429,49 +405,34 @@ class Compress(Smoother):
         coef_w = fit(sw - bw)
         return y, obar, center, halfwidth, coef_ll, coef_g, coef_w
 
-    def build_aux_tilted(self, base, y, means, vars_, log_pi, tcenter, thalf, tcoef):
-        """Compress a SELF-NORMALIZED offset correction: same amortized aux as
-        `build_aux`, but the node-level exact fold is `TiltedMixtureGH` against the TRUE
-        posterior `q* prop qhat exp(-r)` instead of the Gaussian-mixture working posterior
-        `qhat`. The per-row tilt `r_i(o)` rides as a Chebyshev series `(tcenter, thalf,
-        tcoef)` (see `TiltedMixtureGH`); zero `tcoef` reproduces `build_aux` exactly.
+    def build_aux_selfnorm(self, base, y, o_nodes, logW):
+        """Compress a SELF-NORMALIZED offset correction: same amortized aux as `build_aux`,
+        but the node-level exact fold is `SelfNormQuad` against the offset effect's RAW
+        quadrature posterior -- per-row nodes `o_nodes` (n, Q) and log-unnormalized weights
+        `logW` (n, Q) as produced by its own quadrature fit -- NOT a Gaussian-mixture
+        working model. There is no separate tilt table; the CAVI tilt is implicit in the
+        unnormalized `logW`.
 
-        The plug-in mean shift is the TILTED offset mean `E_{q*}[o]` (not the working mean)
-        so the compressed residual stays small; the Chebyshev interval [center +- halfwidth]
-        is the untilted transition window, a safe superset since the tilt only narrows the
-        offset mass. Emits `(y, obar, center, halfwidth, coef_ll, coef_g, coef_w)` -- the
-        same contract `Compress.terms` consumes, so the hot loop is untouched. Runs once
-        per SER fit, out of the loop, so `inner.order` can be large."""
+        The plug-in mean shift is the self-normalized offset mean `E[o] = sum softmax(logW)
+        o` so the compressed residual stays small; the Chebyshev interval [center +-
+        halfwidth] spans the node support (+ T pad), a safe superset of where the offset
+        correction is nonzero. Emits `(y, obar, center, halfwidth, coef_ll, coef_g,
+        coef_w)` -- the same contract `Compress.terms` consumes, so the hot loop is
+        untouched. Runs once per SER fit, out of the loop, so the node set can be large."""
         y = jnp.asarray(y)
-        means, vars_ = jnp.asarray(means), jnp.asarray(vars_)
-        log_pi = jnp.asarray(log_pi)
-        tcenter, thalf, tcoef = jnp.asarray(tcenter), jnp.asarray(thalf), jnp.asarray(tcoef)
-        pi = jax.nn.softmax(log_pi, axis=-1)  # (n, K)
-        sd = jnp.sqrt(jnp.maximum(vars_, 0.0))
-        # eta-window covering the transition -- same untilted edges as build_aux.
-        lo = jnp.min(means - self.kappa * sd, axis=-1)
-        hi = jnp.max(means + self.kappa * sd, axis=-1)
+        o_nodes = jnp.asarray(o_nodes)
+        W = jax.nn.softmax(jnp.asarray(logW), axis=-1)  # (n, Q), self-normalized
+        obar = jnp.sum(W * o_nodes, axis=-1)  # (n,) offset mean E[o]
+        # eta-window covering the transition: the offset node support + T pad.
+        lo = jnp.min(o_nodes, axis=-1)
+        hi = jnp.max(o_nodes, axis=-1)
         center = -0.5 * (lo + hi)
         halfwidth = self.T + 0.5 * (hi - lo)
-
-        inner = TiltedMixtureGH(order=max(self.inner.order, 32))
-        # tilted offset mean E_{q*}[o] for the plug-in split (self-normalized GH).
-        nds_np, wraw_np = np.polynomial.hermite.hermgauss(inner.order)
-        nds = jnp.asarray(nds_np)
-        wj = jnp.asarray(wraw_np / np.sqrt(np.pi))
-        sd2 = jnp.sqrt(2.0 * jnp.maximum(vars_, 0.0))
-        o = means[:, None, :] + sd2[:, None, :] * nds[None, :, None]  # (n, order, K)
-        targ = jnp.clip((o - tcenter[:, None, None]) / thalf[:, None, None], -1.0, 1.0)
-        rt = _clenshaw_batched(tcoef[:, None, None, :], targ)
-        Wt = wj[None, :, None] * pi[:, None, :] * jnp.exp(-rt)
-        Zt = jnp.sum(Wt, axis=(1, 2))  # (n,)
-        obar = jnp.sum(Wt * o, axis=(1, 2)) / Zt  # (n,) tilted mean shift
 
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
         znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
-        aux = (y, means, vars_, log_pi, tcenter, thalf, tcoef)
-        sll, sg, sw = inner.terms(base, znodes, aux)  # exact tilted terms at nodes
+        sll, sg, sw = SelfNormQuad().terms(base, znodes, (y, o_nodes, logW))
         bll, bg, bw = base.terms(znodes + obar[:, None], y[:, None])  # plug-in at shift
         fit = lambda vals: vals @ Vinv.T  # noqa: E731
         return y, obar, center, halfwidth, fit(sll - bll), fit(sg - bg), fit(sw - bw)
