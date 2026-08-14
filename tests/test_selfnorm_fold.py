@@ -2,15 +2,17 @@
 
 The manuscript's self-normalized quadrature (eq:self-normalized-quadrature) integrates the
 cumulant against the offset effect's TRUE posterior `q_{l'}` using only its UNNORMALIZED
-density at the quadrature nodes -- no Gaussian working model. The offset law rides as raw
-per-row nodes `o_m` and log-unnormalized weights `logW_m`; the fold is
-`E_{q_{l'}}[f] = sum_m softmax(logW)_m f(o_m)`. These tests pin the mechanism:
+density at the quadrature nodes -- no Gaussian working model. The offset law over the
+effect VALUE `b` is row-INDEPENDENT (nodes `b_cm`, log-weights `logW_cm`, per feature `c`);
+a row enters only through the design scaling `x_ic`, so the offset contribution is
+`o_icm = x_ic b_cm` and the fold is `E[f] = sum_cm softmax(logW)_cm f(x_ic b_cm)`. The full
+(rows x features x nodes) tensor is never materialized. These tests pin the mechanism:
 
-  * with a Gaussian law it matches the plain `GH` fold (sanity),
-  * it recovers `E_{q}[.]` for an arbitrary NON-Gaussian unnormalized law (a dense grid
-    reference) -- the point of dropping the Gaussian working model,
-  * it converges to a dense reference of a tilted law as the node set grows,
-  * grad/weight remain the eta-derivatives of the smoothed loglik (Newton-consistent),
+  * with a Gaussian value-law it matches the plain `GH` fold (sanity),
+  * it recovers `E_{q}[.]` for an arbitrary NON-Gaussian value-law (a dense reference),
+  * it converges to a dense tilted reference as the node set grows,
+  * grad/weight are eta-derivatives (Newton-consistent), a point mass -> plug-in,
+  * the streaming component-scan equals the full weighted sum (multi-feature),
   * `Compress.build_aux_selfnorm` (amortized) matches the direct fold.
 """
 
@@ -25,93 +27,88 @@ RNG = np.random.default_rng(0)
 BASE = Bernoulli()
 
 
-def _gh_proposal_nodes(m, v, Q, kappa=0.0):
-    """Raw (o_nodes, logW) for a Gaussian PROPOSAL N(m, v) with optional quadratic tilt:
-    unnormalized law p~(o) prop N(o; m, v) exp(-0.5 kappa (o - m)^2). The N(m,v) part is
-    carried by the GH weights, so logW = log(w_j) - 0.5 kappa (o_j - m)^2 (the softmax
-    absorbs the sqrt(pi) constant)."""
+def _gh_component(mu, sigma2, Q, kappa=0.0):
+    """Row-independent (b_nodes, logW), shape (1, Q), for ONE feature whose effect value
+    b ~ N(mu, sigma2) (proposal) optionally tilted by exp(-0.5 kappa (b-mu)^2). The N part
+    is carried by the GH weights; softmax absorbs the sqrt(pi) constant."""
     x, w = np.polynomial.hermite.hermgauss(Q)
-    o = m[:, None] + np.sqrt(2.0 * v)[:, None] * x[None, :]  # (n, Q)
-    logW = np.log(w)[None, :] - 0.5 * kappa * (o - m[:, None]) ** 2
-    return jnp.asarray(o), jnp.asarray(logW)
+    b = mu + np.sqrt(2.0 * sigma2) * x  # (Q,)
+    logW = np.log(w) - 0.5 * kappa * (b - mu) ** 2
+    return jnp.asarray(b[None, :]), jnp.asarray(logW[None, :])
 
 
-def test_gaussian_law_matches_plain_gh():
-    """Zero-mean Gaussian offset via raw nodes == the plain GH fold E_{N(0,v)}[.]."""
+def _dense(eta, y, xscale, b_grid, logp):
+    """Dense reference E_{q}[base.terms(eta_i + x_i b)] for value-law q(b) prop exp(logp)
+    on a shared grid, per-row design scaling `xscale`."""
+    wq = np.exp(logp - logp.max())
+    wq = wq / np.trapezoid(wq, b_grid)
+    sh = eta[:, None] + xscale[:, None] * b_grid[None, :]
+    s = 1.0 / (1.0 + np.exp(-sh))
+    ll = np.trapezoid((y[:, None] * sh - np.logaddexp(0.0, sh)) * wq[None, :], b_grid, axis=1)
+    g = np.trapezoid((y[:, None] - s) * wq[None, :], b_grid, axis=1)
+    w = np.trapezoid((s * (1 - s)) * wq[None, :], b_grid, axis=1)
+    return ll, g, w
+
+
+def test_gaussian_value_law_matches_plain_gh():
+    """b ~ N(0, 1) with per-row scaling x -> offset N(0, x^2); matches GH with ov = x^2."""
     n, Q = 8, 20
     eta = jnp.asarray(RNG.normal(size=n))
     y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
-    v = np.abs(RNG.normal(size=n)) * 1.2 + 0.2
-    o, logW = _gh_proposal_nodes(np.zeros(n), v, Q)  # mean 0 -> matches GH convention
+    xscale = RNG.normal(size=n)  # design scaling (n,)
+    b_nodes, logW = _gh_component(0.0, 1.0, Q)  # value law N(0,1)
 
-    ll_g, g_g, w_g = GH(order=Q).terms(BASE, eta, (y, jnp.asarray(v)))
-    ll_s, g_s, w_s = SelfNormQuad().terms(BASE, eta[:, None], (y, o, logW))
+    ll_g, g_g, w_g = GH(order=Q).terms(BASE, eta, (y, jnp.asarray(xscale**2)))
+    aux = (y, jnp.asarray(xscale)[:, None], b_nodes, logW)  # x is (n, 1)
+    ll_s, g_s, w_s = SelfNormQuad().terms(BASE, eta[:, None], aux)
     assert jnp.allclose(ll_s[:, 0], ll_g, atol=1e-10)
     assert jnp.allclose(g_s[:, 0], g_g, atol=1e-10)
     assert jnp.allclose(w_s[:, 0], w_g, atol=1e-10)
 
 
-def _dense_law_terms(eta, y, o_grid, logp_grid):
-    """Dense reference E_{q}[base.terms(eta + o)] for an arbitrary law q(o) prop
-    exp(logp_grid) on a shared fine grid `o_grid` (trapezoid). Rows independent."""
-    wq = np.exp(logp_grid - logp_grid.max())
-    wq = wq / np.trapezoid(wq, o_grid)
-    sh = eta[:, None] + o_grid[None, :]
-    s = 1.0 / (1.0 + np.exp(-sh))
-    ll = np.trapezoid((y[:, None] * sh - np.logaddexp(0.0, sh)) * wq[None, :], o_grid, axis=1)
-    g = np.trapezoid((y[:, None] - s) * wq[None, :], o_grid, axis=1)
-    w = np.trapezoid((s * (1 - s)) * wq[None, :], o_grid, axis=1)
-    return ll, g, w
-
-
 def test_recovers_arbitrary_non_gaussian_law():
-    """The whole point: NO Gaussian working model. Feed a skewed/bimodal unnormalized law
-    as raw (nodes, logW) and recover its exact expectation from a dense reference."""
+    """NO Gaussian working model: a bimodal/asymmetric value-law fed as raw (nodes, logW),
+    recovered against a dense reference, with per-row design scaling."""
     n = 5
     eta = RNG.normal(size=n)
     y = (RNG.random(n) < 0.5).astype(float)
+    xscale = 0.5 + RNG.random(n)  # positive per-row scalings
 
-    # a bimodal, asymmetric unnormalized offset law (same for every row here)
-    grid = np.linspace(-9.0, 9.0, 3001)
+    grid = np.linspace(-9.0, 9.0, 4001)
     logp = np.log(np.exp(-0.5 * (grid + 1.5) ** 2) + 0.6 * np.exp(-0.5 * (grid - 2.0) ** 2 / 0.5))
-    ll_ref, g_ref, w_ref = _dense_law_terms(eta, y, grid, logp)
+    ll_ref, g_ref, w_ref = _dense(eta, y, xscale, grid, logp)
 
-    # fold over the SAME nodes (a fine grid is a valid raw quadrature of the law)
-    o_nodes = jnp.asarray(np.tile(grid, (n, 1)))
-    logW = jnp.asarray(np.tile(logp, (n, 1)))
-    ll, g, w = SelfNormQuad().terms(BASE, jnp.asarray(eta)[:, None], (jnp.asarray(y), o_nodes, logW))
+    aux = (jnp.asarray(y), jnp.asarray(xscale)[:, None], jnp.asarray(grid[None, :]), jnp.asarray(logp[None, :]))
+    ll, g, w = SelfNormQuad().terms(BASE, jnp.asarray(eta)[:, None], aux)
     assert jnp.allclose(ll[:, 0], ll_ref, atol=1e-4)
     assert jnp.allclose(g[:, 0], g_ref, atol=1e-4)
     assert jnp.allclose(w[:, 0], w_ref, atol=1e-4)
 
 
 def test_converges_to_dense_tilted_reference():
-    """A Gaussian proposal reweighted by exp(-0.5 kappa (o-m)^2) -> a narrower Gaussian;
-    the self-normalized GH fold converges to its dense reference as the node count grows."""
+    """Value law N(mu, s2) tilted by exp(-0.5 kappa (b-mu)^2); the self-normalized fold
+    converges to its dense reference as the node count grows."""
     n = 6
     eta = RNG.normal(size=n)
     y = (RNG.random(n) < 0.5).astype(float)
-    m = RNG.normal(size=n) * 0.7
-    v = np.abs(RNG.normal(size=n)) * 0.6 + 0.2
-    kappa = 0.5
+    xscale = 0.6 + RNG.random(n)
+    mu, s2, kappa = 0.4, 0.8, 0.5
 
-    # dense reference over the tilted law q*(o) prop N(o;m,v) exp(-0.5 kappa (o-m)^2)
-    ll_ref = np.empty(n); g_ref = np.empty(n); w_ref = np.empty(n)
-    for i in range(n):
-        grid = np.linspace(m[i] - 8 * np.sqrt(v[i]), m[i] + 8 * np.sqrt(v[i]), 40001)
-        logp = -0.5 * (grid - m[i]) ** 2 / v[i] - 0.5 * kappa * (grid - m[i]) ** 2
-        a, b, c = _dense_law_terms(eta[i : i + 1], y[i : i + 1], grid, logp)
-        ll_ref[i], g_ref[i], w_ref[i] = a[0], b[0], c[0]
+    grid = np.linspace(mu - 9 * np.sqrt(s2), mu + 9 * np.sqrt(s2), 40001)
+    logp = -0.5 * (grid - mu) ** 2 / s2 - 0.5 * kappa * (grid - mu) ** 2
+    ll_ref, g_ref, w_ref = _dense(eta, y, xscale, grid, logp)
 
     errs = []
     for Q in (8, 16, 48):
-        o, logW = _gh_proposal_nodes(m, v, Q, kappa=kappa)
-        ll, _, _ = SelfNormQuad().terms(BASE, jnp.asarray(eta)[:, None], (jnp.asarray(y), o, logW))
+        b_nodes, logW = _gh_component(mu, s2, Q, kappa=kappa)
+        aux = (jnp.asarray(y), jnp.asarray(xscale)[:, None], b_nodes, logW)
+        ll, _, _ = SelfNormQuad().terms(BASE, jnp.asarray(eta)[:, None], aux)
         errs.append(float(jnp.max(jnp.abs(ll[:, 0] - ll_ref))))
     assert errs[-1] < errs[0] and errs[-1] < 1e-6
 
-    o, logW = _gh_proposal_nodes(m, v, 64, kappa=kappa)
-    ll, g, w = SelfNormQuad().terms(BASE, jnp.asarray(eta)[:, None], (jnp.asarray(y), o, logW))
+    b_nodes, logW = _gh_component(mu, s2, 64, kappa=kappa)
+    aux = (jnp.asarray(y), jnp.asarray(xscale)[:, None], b_nodes, logW)
+    ll, g, w = SelfNormQuad().terms(BASE, jnp.asarray(eta)[:, None], aux)
     assert jnp.allclose(ll[:, 0], ll_ref, atol=1e-7)
     assert jnp.allclose(g[:, 0], g_ref, atol=1e-7)
     assert jnp.allclose(w[:, 0], w_ref, atol=1e-7)
@@ -120,8 +117,8 @@ def test_converges_to_dense_tilted_reference():
 def test_grad_weight_are_eta_derivatives():
     """grad = d/deta loglik_hat, weight = -d^2/deta^2 loglik_hat for the fold."""
     y = jnp.asarray([1.0])
-    o, logW = _gh_proposal_nodes(np.asarray([0.4]), np.asarray([0.5]), 48, kappa=0.8)
-    aux = (y, o, logW)
+    b_nodes, logW = _gh_component(0.4, 0.5, 48, kappa=0.8)
+    aux = (y, jnp.asarray([[1.3]]), b_nodes, logW)  # x = 1.3
     sm = SelfNormQuad()
 
     def loglik(e):
@@ -134,12 +131,12 @@ def test_grad_weight_are_eta_derivatives():
 
 
 def test_point_mass_is_plugin():
-    """A single node (point-mass offset law) collapses to the plug-in cumulant."""
+    """A single node with unit value and x = o0 (a point-mass offset) -> plug-in cumulant."""
     n = 6
     eta = jnp.asarray(RNG.normal(size=n))
     y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
     o0 = jnp.asarray(RNG.normal(size=n))
-    aux = (y, o0[:, None], jnp.zeros((n, 1)))
+    aux = (y, o0[:, None], jnp.ones((1, 1)), jnp.zeros((1, 1)))  # o = o0 * 1
     ll, g, w = SelfNormQuad().terms(BASE, eta[:, None], aux)
     ref = BASE.terms(eta + o0, y)
     assert jnp.allclose(ll[:, 0], ref[0], atol=1e-12)
@@ -147,24 +144,47 @@ def test_point_mass_is_plugin():
     assert jnp.allclose(w[:, 0], ref[2], atol=1e-12)
 
 
+def test_component_scan_equals_full_sum():
+    """The streaming lax.scan over features equals the full weighted sum sum_cm W_cm
+    base.terms(eta + x_ic b_cm) (multi-feature; the fold never forms this tensor)."""
+    n, C, Q, Z = 7, 4, 6, 3
+    eta = jnp.asarray(RNG.normal(size=(n, Z)))
+    y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
+    x = jnp.asarray(RNG.normal(size=(n, C)))
+    b_nodes = jnp.asarray(RNG.normal(size=(C, Q)))
+    logW = jnp.asarray(RNG.normal(size=(C, Q)))
+
+    ll, g, w = SelfNormQuad().terms(BASE, eta, (y, x, b_nodes, logW))
+
+    # brute-force materialized reference (n, Z, C, Q)
+    W = jax.nn.softmax(logW.reshape(-1)).reshape(C, Q)
+    shift = eta[:, :, None, None] + x[:, None, :, None] * b_nodes[None, None, :, :]
+    bll, bg, bw = BASE.terms(shift, y[:, None, None, None])
+    red = lambda t: jnp.sum(W[None, None, :, :] * t, axis=(2, 3))
+    assert jnp.allclose(ll, red(bll), atol=1e-12)
+    assert jnp.allclose(g, red(bg), atol=1e-12)
+    assert jnp.allclose(w, red(bw), atol=1e-12)
+
+
 def test_compress_selfnorm_matches_direct_fold():
     """Amortized `build_aux_selfnorm` + `Compress.terms` reproduces the direct fold to
-    Chebyshev-interpolation accuracy inside the fit interval."""
-    n, Q = 5, 40
+    Chebyshev-interpolation accuracy inside the fit interval (multi-feature offset)."""
+    n, C, Q = 5, 3, 24
     y = jnp.asarray((RNG.random(n) < 0.5).astype(float))
-    m = RNG.normal(size=n) * 0.6
-    v = np.abs(RNG.normal(size=n)) * 0.4 + 0.2
-    o, logW = _gh_proposal_nodes(m, v, Q, kappa=0.4)
+    x = jnp.asarray(RNG.normal(size=(n, C)) * 0.6)
+    b_list, w_list = zip(*[_gh_component(RNG.normal() * 0.5, 0.3 + RNG.random(), Q, kappa=0.4) for _ in range(C)])
+    b_nodes = jnp.concatenate(b_list, axis=0)  # (C, Q)
+    logW = jnp.concatenate(w_list, axis=0) - jnp.log(C)  # equal feature masses
 
     comp = Compress(M=96)
-    aux = comp.build_aux_selfnorm(BASE, y, o, logW)
+    aux = comp.build_aux_selfnorm(BASE, y, x, b_nodes, logW)
     _, _obar, center, halfwidth, *_ = aux
     direct = SelfNormQuad()
 
     for f in np.linspace(-0.9, 0.9, 15):
         eta = center + halfwidth * float(f)  # (n,)
         ll_c, g_c, w_c = comp.terms(BASE, eta, aux)
-        ll_d, g_d, w_d = direct.terms(BASE, eta[:, None], (y, o, logW))
+        ll_d, g_d, w_d = direct.terms(BASE, eta[:, None], (y, x, b_nodes, logW))
         assert jnp.allclose(ll_c, ll_d[:, 0], atol=1e-6)
         assert jnp.allclose(g_c, g_d[:, 0], atol=1e-6)
         assert jnp.allclose(w_c, w_d[:, 0], atol=1e-6)

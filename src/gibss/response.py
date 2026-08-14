@@ -215,40 +215,64 @@ class SelfNormQuad(Smoother):
     Gaussian working model. An offset effect's posterior `q_{l'}` is NOT approximated by a
     Gaussian (mixture): when it is fit by a quadrature kernel we only ever have the
     UNNORMALIZED posterior `p~_{l'}` at its nodes -- never a normalized density, never a
-    parametric form. So `q_{l'}` rides here exactly as the kernel produces it -- per-row
-    offset nodes and log-unnormalized weights -- and the expectation is self-normalized:
+    parametric form. So `q_{l'}` rides here exactly as the kernel produces it, and the
+    expectation is self-normalized.
 
-        Atilde*(eta) = E_{q_{l'}}[A(eta + o)] = sum_m softmax(logW)_m A(eta + o_m),
-        softmax(logW)_m = W~_m / sum_m' W~_m',   W~_m = p~_{l'}(b_m) x (quadrature weight).
+    Crucially the offset law is NOT stored as a full (rows x nodes) tensor -- that would
+    replicate the row axis onto data that is row-INDEPENDENT. The effect's posterior over
+    its VALUE `b` (the quadrature nodes `b_cm` over component/feature `c`, and their
+    log-unnormalized weights `logW_cm`) is the same for every observation; a row enters
+    only through the design scaling `x_ic`, since the offset CONTRIBUTION is `o_icm =
+    x_ic * b_cm`. So we carry `b_nodes, logW` at (C, Q) and the design `x` at (n, C) (which
+    the model already holds), and form `o = x (x) b` on the fly:
 
-    The nodes `o_m` are the offset CONTRIBUTIONS -- design-scaled effect values, with the
-    SER mixture over selected features and the fitting quadrature already flattened into
-    the node axis. The tilt `exp(-r)` that turns the gIBSS posterior into the exact CAVI
-    posterior is IMPLICIT in `p~`, not a separate table; there is nothing Gaussian to
-    approximate away. The normalizer `sum_m W~_m` weights the OFFSET value `o`, not the
-    predictor `eta`, so it is eta-free (one per-row scalar); grad/weight are the same
-    self-normalized sums of `A', A''` (q* is eta-free, so d/deta commutes through the
-    ratio), keeping the terms Newton-consistent; softmax weights are >= 0, so convex.
+        Atilde*(eta_i) = E_{q_{l'}}[A(eta_i + o)] = sum_cm W_cm A(eta_i + x_ic b_cm),
+        W = softmax(logW) over all (C, Q)   -- shared across rows, sums to 1.
+
+    The tilt `exp(-r)` that turns the gIBSS posterior into the exact CAVI posterior is
+    IMPLICIT in `p~` (in `logW`), not a separate table; there is nothing Gaussian to
+    approximate away. The softmax normalizer weights the offset VALUE, not the predictor,
+    so grad/weight are the same shared-weight sums of `A', A''` (Newton-consistent), and
+    the weights are >= 0 (convex). The fold reduces component by component under a
+    `lax.scan`, so peak memory is O(n * Z * Q) -- independent of C, never the full tensor.
 
     As the node set refines this is the EXACT CAVI offset integration; a single node (or a
-    point mass) collapses to the plug-in cumulant `A(eta + o)`. Like `MixtureGH` this is a
-    fixed-per-row-offset scheme -- use it with the quadrature/Laplace kernels.
+    point-mass component) collapses to the plug-in cumulant `A(eta + o)`. Like `MixtureGH`
+    this is a fixed-per-row-offset scheme -- use it with the quadrature/Laplace kernels.
+    Zero columns of `x` fold as `A(eta)` weighted by the component mass; a sparse design
+    lets that clump be skipped (see `Compress.build_aux_selfnorm`), but the dense fold here
+    handles them correctly with no special case.
 
-    aux = (y, o_nodes, logW): `o_nodes`, `logW` are (n, Q) -- per-row offset nodes and
-    their log-unnormalized weights (self-normalized internally by `softmax` over Q).
-    `eta` is (n, Z).
+    aux = (y, x, b_nodes, logW): `x` is (n, C) design scalings; `b_nodes`, `logW` are
+    (C, Q) row-independent effect-value nodes and their log-unnormalized weights. `eta` is
+    (n, Z).
     """
 
     def terms(self, base, eta, aux):
-        y, o_nodes, logW = aux
+        y, x, b_nodes, logW = aux
         eta = jnp.asarray(eta)
         y = jnp.asarray(y)
-        o_nodes = jnp.asarray(o_nodes)
-        W = jax.nn.softmax(jnp.asarray(logW), axis=-1)  # (n, Q), self-normalized
-        shift = eta[:, :, None] + o_nodes[:, None, :]  # (n, Z, Q)
-        ll, g, w = base.terms(shift, y[:, None, None])
-        red = lambda t: jnp.sum(W[:, None, :] * t, axis=-1)  # noqa: E731
-        return red(ll), red(g), red(w)
+        x = jnp.asarray(x)
+        b_nodes = jnp.asarray(b_nodes)
+        # shared self-normalized weights over ALL (C, Q); rows differ only via x.
+        W = jax.nn.softmax(jnp.asarray(logW).reshape(-1)).reshape(b_nodes.shape)  # (C, Q)
+        n, Z = eta.shape
+
+        # reduce one component (feature) at a time: only one (n, Z, Q) grid is ever live,
+        # so peak memory is O(n Z Q), independent of C -- the full tensor is never formed.
+        def body(acc, comp):
+            all0, ag0, aw0 = acc
+            xc, bc, Wc = comp  # (n,), (Q,), (Q,)
+            shift = eta[:, :, None] + xc[:, None, None] * bc[None, None, :]  # (n, Z, Q)
+            ll, g, w = base.terms(shift, y[:, None, None])
+            Wc_ = Wc[None, None, :]
+            return (all0 + jnp.sum(Wc_ * ll, -1),
+                    ag0 + jnp.sum(Wc_ * g, -1),
+                    aw0 + jnp.sum(Wc_ * w, -1)), None
+
+        init = (jnp.zeros((n, Z)), jnp.zeros((n, Z)), jnp.zeros((n, Z)))
+        (ll, g, w), _ = jax.lax.scan(body, init, (x.T, b_nodes, W))
+        return ll, g, w
 
 
 def _diff_residual(cr0, halfwidth, M):
@@ -405,34 +429,42 @@ class Compress(Smoother):
         coef_w = fit(sw - bw)
         return y, obar, center, halfwidth, coef_ll, coef_g, coef_w
 
-    def build_aux_selfnorm(self, base, y, o_nodes, logW):
+    def build_aux_selfnorm(self, base, y, x, b_nodes, logW):
         """Compress a SELF-NORMALIZED offset correction: same amortized aux as `build_aux`,
         but the node-level exact fold is `SelfNormQuad` against the offset effect's RAW
-        quadrature posterior -- per-row nodes `o_nodes` (n, Q) and log-unnormalized weights
-        `logW` (n, Q) as produced by its own quadrature fit -- NOT a Gaussian-mixture
-        working model. There is no separate tilt table; the CAVI tilt is implicit in the
-        unnormalized `logW`.
+        quadrature posterior -- NOT a Gaussian-mixture working model, and NOT materialized
+        as a full (rows x nodes) tensor. The effect-value nodes `b_nodes` (C, Q) and their
+        log-unnormalized weights `logW` (C, Q) are row-INDEPENDENT; a row enters only
+        through the design scaling `x` (n, C), and the offset contribution `o = x (x) b` is
+        formed on the fly. There is no separate tilt table; the CAVI tilt is implicit in
+        `logW`.
 
-        The plug-in mean shift is the self-normalized offset mean `E[o] = sum softmax(logW)
-        o` so the compressed residual stays small; the Chebyshev interval [center +-
-        halfwidth] spans the node support (+ T pad), a safe superset of where the offset
-        correction is nonzero. Emits `(y, obar, center, halfwidth, coef_ll, coef_g,
-        coef_w)` -- the same contract `Compress.terms` consumes, so the hot loop is
-        untouched. Runs once per SER fit, out of the loop, so the node set can be large."""
+        The plug-in mean shift is the self-normalized offset mean `E[o]_i = sum_c x_ic
+        (sum_m W_cm b_cm)` so the compressed residual stays small; the Chebyshev interval
+        [center +- halfwidth] spans the per-row node support `{x_ic b_cm}` (+ T pad),
+        computed from the component extremes without forming the tensor. Emits `(y, obar,
+        center, halfwidth, coef_ll, coef_g, coef_w)` -- the same contract `Compress.terms`
+        consumes, so the hot loop is untouched. Runs once per SER fit, out of the loop."""
         y = jnp.asarray(y)
-        o_nodes = jnp.asarray(o_nodes)
-        W = jax.nn.softmax(jnp.asarray(logW), axis=-1)  # (n, Q), self-normalized
-        obar = jnp.sum(W * o_nodes, axis=-1)  # (n,) offset mean E[o]
-        # eta-window covering the transition: the offset node support + T pad.
-        lo = jnp.min(o_nodes, axis=-1)
-        hi = jnp.max(o_nodes, axis=-1)
+        x = jnp.asarray(x)
+        b_nodes = jnp.asarray(b_nodes)
+        W = jax.nn.softmax(jnp.asarray(logW).reshape(-1)).reshape(b_nodes.shape)  # (C, Q)
+        s_c = jnp.sum(W * b_nodes, axis=-1)  # (C,) per-component mean node
+        obar = x @ s_c  # (n,) offset mean E[o], no tensor formed
+        # per-row node support {x_ic b_cm}: each component's range is x_ic * [min_m b_cm,
+        # max_m b_cm] (sign-aware), reduced over C. No (n, C, Q) grid.
+        bmin = jnp.min(b_nodes, axis=-1)  # (C,)
+        bmax = jnp.max(b_nodes, axis=-1)
+        e1, e2 = x * bmin[None, :], x * bmax[None, :]  # (n, C)
+        lo = jnp.min(jnp.minimum(e1, e2), axis=-1)  # (n,)
+        hi = jnp.max(jnp.maximum(e1, e2), axis=-1)
         center = -0.5 * (lo + hi)
         halfwidth = self.T + 0.5 * (hi - lo)
 
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
         znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
-        sll, sg, sw = SelfNormQuad().terms(base, znodes, (y, o_nodes, logW))
+        sll, sg, sw = SelfNormQuad().terms(base, znodes, (y, x, b_nodes, logW))
         bll, bg, bw = base.terms(znodes + obar[:, None], y[:, None])  # plug-in at shift
         fit = lambda vals: vals @ Vinv.T  # noqa: E731
         return y, obar, center, halfwidth, fit(sll - bll), fit(sg - bg), fit(sw - bw)
