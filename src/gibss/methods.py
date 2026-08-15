@@ -242,17 +242,22 @@ def fit_glm_susie(
     # without crashing a method sweep); an EXPLICIT center=True on an unsupported
     # sparse + vi/jj combo is a clear error, not a fit.
     # compress on a DENSE design can center (the fold reads the eagerly-centered X, so it
-    # stays consistent with the kernel). On SPARSE it fundamentally cannot: zero-clumping
-    # needs X_ij = 0 to be a true point mass at 0, but centering shifts every entry
-    # (zeros included) by -cbar_j, leaving no zeros to clump. Default is uncentered
-    # (layout-consistent: dense == sparse); dense users may opt into center=True.
-    if isinstance(getattr(response, "smoother", None), Compress):
-        if center is True and is_bcoo(X):
+    # stays consistent with the kernel). On SPARSE the GAUSSIAN 'compress' fundamentally
+    # cannot: zero-clumping needs X_ij = 0 to be a true point mass at 0, but centering
+    # shifts every entry (zeros included) by -cbar_j, leaving no zeros to clump. The
+    # SELF-NORMALIZED 'compress_selfnorm' CAN: its off-support fill-in folds as a
+    # per-feature background at -c_j b (build_aux_selfnorm_sequential_sparse_centered), the
+    # same split glm_center_ser uses for the kernel -- so sparse centering is consistent
+    # end to end. Default is uncentered (layout-consistent: dense == sparse); users opt in.
+    smoother = getattr(response, "smoother", None)
+    if isinstance(smoother, Compress):
+        if center is True and is_bcoo(X) and not isinstance(smoother, CompressSelfNorm):
             raise ValueError(
                 "offset_integration='compress' cannot center a sparse (BCOO) design: the "
                 "zero-clumping fold needs X_ij = 0 to be a point mass at 0, but centering "
-                "shifts every entry (zeros included) so nothing clumps. Use center=False "
-                "(the intercept is handled by intercept='shared'/'profiled'), or densify X."
+                "shifts every entry (zeros included) so nothing clumps. Use "
+                "offset_integration='compress_selfnorm' (whose fold handles the "
+                "off-support background), center=False, or densify X."
             )
         if center is None:
             center = False

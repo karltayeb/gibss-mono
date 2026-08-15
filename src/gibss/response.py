@@ -391,6 +391,60 @@ def _fold_selfnorm_components(
     return EA0, EA1, EA2, Er0, Er1, Er2
 
 
+def _fold_selfnorm_background(
+    base, znodes, s_prev, c, b_nodes, W,
+    cr0, cr1, cr2, center_prev, hw_prev, value_only=False,
+):
+    """Off-support background fold for the sparse-CENTERED self-normalized fold.
+
+    Under a fixed per-column center `c_j` a design entry `x_ij` contributes offset node
+    `(x_ij - c_j) b_jm`; where `x_ij = 0` that is the ROW-INDEPENDENT `-c_j b_jm`. This
+    helper folds EVERY feature at that all-zero-column node (the full background, as if no
+    row had any support), which the sparse method then corrects on the nonzero entries.
+    It is the self-normalized analogue of `_fold_selfnorm_components` with the design
+    scaling replaced by the constant `-c_j`: per feature the node `-c_j b_jm` is a (Q,)
+    vector shared across all rows, so only one (n, Z, Q) grid is ever live (memory
+    O(n Z Q)) and NO (n, p) centered design is materialized. Reduces over the p features
+    with a `lax.scan`; same accumulation as the other folds (fresh cumulant `E[A(z +
+    s_prev + o)]` and folded previous residual `E[r(z + o)]`, weights row-independent)."""
+    n, Z = znodes.shape
+    xs = (c, b_nodes, W)  # (p,), (p, Q), (p, Q)
+
+    if value_only:
+        def body(carry, comp):
+            EA0, Er0 = carry
+            cc, bc, Wc = comp
+            o = (-cc) * bc  # (Q,) row-independent off-support node
+            pts = znodes[:, :, None] + o[None, None, :]  # (n, Z, Q)
+            Wc_ = Wc[None, None, :]
+            nll = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))[0]
+            t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
+            return (EA0 - jnp.sum(Wc_ * nll, -1),
+                    Er0 + jnp.sum(Wc_ * _clenshaw_batched(cr0[:, None, None, :], t), -1)), None
+        (EA0, Er0), _ = jax.lax.scan(body, (jnp.zeros((n, Z)), jnp.zeros((n, Z))), xs)
+        return EA0, Er0
+
+    def body(carry, comp):
+        EA0, EA1, EA2, Er0, Er1, Er2 = carry
+        cc, bc, Wc = comp
+        o = (-cc) * bc  # (Q,)
+        pts = znodes[:, :, None] + o[None, None, :]  # (n, Z, Q)
+        Wc_ = Wc[None, None, :]
+        nll, ng, nw = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))
+        EA0 = EA0 - jnp.sum(Wc_ * nll, -1)
+        EA1 = EA1 - jnp.sum(Wc_ * ng, -1)
+        EA2 = EA2 + jnp.sum(Wc_ * nw, -1)
+        t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
+        Er0 = Er0 + jnp.sum(Wc_ * _clenshaw_batched(cr0[:, None, None, :], t), -1)
+        Er1 = Er1 + jnp.sum(Wc_ * _clenshaw_batched(cr1[:, None, None, :], t), -1)
+        Er2 = Er2 + jnp.sum(Wc_ * _clenshaw_batched(cr2[:, None, None, :], t), -1)
+        return (EA0, EA1, EA2, Er0, Er1, Er2), None
+
+    init = tuple(jnp.zeros((n, Z)) for _ in range(6))
+    (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, init, xs)
+    return EA0, EA1, EA2, Er0, Er1, Er2
+
+
 @dataclass(frozen=True)
 class Compress(Smoother):
     """Amortized Chebyshev compression of a per-row offset correction.
@@ -735,6 +789,170 @@ class Compress(Smoother):
                 Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
                 Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
                 Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
+                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
+
+        if value_only:
+            cr1, cr2 = _diff_residual(cr0, halfwidth, self.M)
+        return y, s, center, halfwidth, -cr0, -cr1, cr2
+
+    def build_aux_selfnorm_sequential_sparse_centered(
+        self, base, y, X, effects, c, entry_chunk=1 << 16,
+        derivatives="differentiate", init=None,
+    ):
+        """Sparse self-normalized sequential fold on a CENTERED design -- the
+        raw-quadrature analogue of `glm_center_ser`'s off-support background, for the
+        offset fold. Same contract as `build_aux_selfnorm_sequential_sparse` but each
+        fitted effect rode the CENTERED single-effect model `eta = offset + (x_ij - c_j)
+        b_j` (per-column center `c` (p,), GIVEN), so its offset contribution for the
+        selected feature is `(x_ij - c_j) b` -- and a ZERO design entry is NOT a point
+        mass at o=0 but at `-c_j b_jm`, a per-feature BACKGROUND.
+
+        The fold for feature j therefore splits as in `glm_center_ser`: fold EVERY feature
+        at its all-zero-column node `-c_j b_jm` (the full background,
+        `_fold_selfnorm_background`, O(n p Q M), no (n, p) design materialized), then on
+        each NONZERO entry (i, j) SUBTRACT that `-c_j` background contribution and ADD the
+        support contribution `(x_ij - c_j) b_jm` (O(nnz Q M), segment-summed over rows,
+        chunked over entries). Net per row: `FullBG_i + sum_{j nonzero i} [support - bg]`,
+        which equals the dense fold on the materialized `X - c` exactly. The interval
+        moments use `(x_ij - c_j)` too: `obar_i = sum_j (x_ij - c_j) g_j`, `E[o_i^2] =
+        sum_j (x_ij - c_j)^2 h_j`, both O(nnz + p) via segment sums plus the row-constant
+        center terms. `init` seeds the (uncentered) shared intercept as before. Emits the
+        `build_aux_sequential` aux.
+
+        Complexity O((n p + nnz) Q M): the background is the price centering pays to fill
+        the zeros, exactly as `glm_center_ser` pays O(n p) for the same reason. The
+        CUMULANT background `sum_{j,m} W_jm A(z + s_prev - c_j b_jm)` is a row-INDEPENDENT
+        1-D function of `z + s_prev` and could be amortized by a Chebyshev-in-z surrogate
+        (the `_background` chebyshev trick) to O(n D + D p Q); the PREVIOUS-RESIDUAL
+        background is per-row (the residual interpolant differs per row) and is inherently
+        O(n p Q M). This first version folds both directly over the p features; the
+        cumulant amortization is a documented follow-up."""
+        if derivatives not in ("differentiate", "fit"):
+            raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
+        value_only = derivatives == "differentiate"
+        y = jnp.asarray(y)
+        c = jnp.asarray(c)
+        idx = X.indices
+        rows_all, cols_all = idx[:, 0], idx[:, 1]
+        vals_all = X.data
+        n = X.shape[0]
+        nnz = vals_all.shape[0]
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        fit = lambda v: v @ Vinv.T  # noqa: E731
+
+        C = min(int(entry_chunk), nnz)
+        nchunks = -(-nnz // C)
+        pad = nchunks * C - nnz
+        def _pad(a, fill):  # noqa: E731
+            return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
+                    if pad else a)
+
+        s = jnp.zeros(n)
+        if init is None:
+            V = jnp.zeros(n)
+            cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
+        else:
+            cr0, cr1, cr2, V0 = init
+            V = jnp.broadcast_to(jnp.asarray(V0), (n,))
+        center = -s
+        halfwidth = self.T + self.kappa * jnp.sqrt(V)
+
+        for b_nodes, logW in effects:
+            b_nodes = jnp.asarray(b_nodes)
+            p_, Q = b_nodes.shape
+            W_all = jax.nn.softmax(jnp.asarray(logW).reshape(-1)).reshape(p_, Q)  # global
+            g = jnp.sum(W_all * b_nodes, axis=-1)  # (p,) sum_m W_jm b_jm
+            h = jnp.sum(W_all * b_nodes**2, axis=-1)  # (p,) sum_m W_jm b_jm^2
+
+            # centered mixture moments: o_ij = (x_ij - c_j) b, so E[o] and E[o^2] pick up
+            # the -c_j fill on EVERY feature (row-constant terms) + the nonzero corrections.
+            cc_all = c[cols_all]
+            obar = (jax.ops.segment_sum(vals_all * g[cols_all], rows_all, num_segments=n)
+                    - jnp.sum(c * g))  # sum_j (x_ij - c_j) g_j
+            eo2 = (jax.ops.segment_sum(
+                       ((vals_all - cc_all) ** 2 - cc_all**2) * h[cols_all],
+                       rows_all, num_segments=n)
+                   + jnp.sum(c**2 * h))  # sum_j (x_ij - c_j)^2 h_j
+            var_eff = jnp.maximum(eo2 - obar**2, 0.0)
+
+            s_prev, center_prev, hw_prev = s, center, halfwidth
+            cr0_p, cr1_p, cr2_p = cr0, cr1, cr2
+            s = s + obar
+            V = V + var_eff
+            center = -s
+            halfwidth = self.T + self.kappa * jnp.sqrt(V)
+            znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+            rr = _pad(rows_all, 0).reshape(nchunks, C)
+            vv = _pad(vals_all, 0.0).reshape(nchunks, C)
+            cvec = _pad(cc_all, 0.0).reshape(nchunks, C)  # entry column centers
+            bb = _pad(b_nodes[cols_all], 0.0).reshape(nchunks, C, Q)  # entry feature nodes
+            ww = _pad(W_all[cols_all], 0.0).reshape(nchunks, C, Q)  # entry node weights
+
+            def _entry(ent):
+                rc, vc, ccv, bnc, wwc = ent  # (C,), (C,), (C,), (C, Q), (C, Q)
+                zc = znodes[rc]  # (C, M+1)
+                o_sp = (vc - ccv)[:, None] * bnc  # (C, Q) support node (x_ij - c_j) b_jm
+                o_bg = (-ccv)[:, None] * bnc      # (C, Q) background node -c_j b_jm
+                zc_s = zc[:, :, None] + s_prev[rc][:, None, None]
+                a_sp = zc_s + o_sp[:, None, :]
+                a_bg = zc_s + o_bg[:, None, :]
+                t_sp = jnp.clip((zc[:, :, None] + o_sp[:, None, :]
+                                 - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
+                t_bg = jnp.clip((zc[:, :, None] + o_bg[:, None, :]
+                                 - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
+                Wc = wwc[:, None, :]  # (C, 1, Q)
+                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
+                return a_sp, a_bg, t_sp, t_bg, Wc, ss
+
+            bg_args = (base, znodes, s_prev, c, b_nodes, W_all,
+                       cr0_p, cr1_p, cr2_p, center_prev, hw_prev)
+            if value_only:
+                EA0, Er0 = _fold_selfnorm_background(*bg_args, value_only=True)
+
+                def body(carry, ent):
+                    EA0, Er0 = carry
+                    a_sp, a_bg, t_sp, t_bg, Wc, ss = _entry(ent)
+                    # support MINUS background (the background is already in EA0/Er0)
+                    nll_sp = base.terms(a_sp, jnp.zeros_like(a_sp))[0]
+                    nll_bg = base.terms(a_bg, jnp.zeros_like(a_bg))[0]
+                    cr = cr0_p[ent[0]][:, None, None, :]
+                    dEr = _clenshaw_batched(cr, t_sp) - _clenshaw_batched(cr, t_bg)
+                    return (EA0 + ss(-jnp.sum(Wc * (nll_sp - nll_bg), -1)),
+                            Er0 + ss(jnp.sum(Wc * dEr, -1))), None
+
+                (EA0, Er0), _ = jax.lax.scan(body, (EA0, Er0), (rr, vv, cvec, bb, ww))
+                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                cr0 = fit((EA0 + pll) + Er0)
+            else:
+                EA0, EA1, EA2, Er0, Er1, Er2 = _fold_selfnorm_background(*bg_args)
+
+                def body(carry, ent):
+                    EA0, EA1, EA2, Er0, Er1, Er2 = carry
+                    a_sp, a_bg, t_sp, t_bg, Wc, ss = _entry(ent)
+                    nll_sp, ng_sp, nw_sp = base.terms(a_sp, jnp.zeros_like(a_sp))
+                    nll_bg, ng_bg, nw_bg = base.terms(a_bg, jnp.zeros_like(a_bg))
+                    rc = ent[0]
+                    cr0c, cr1c, cr2c = (cr0_p[rc][:, None, None, :],
+                                        cr1_p[rc][:, None, None, :],
+                                        cr2_p[rc][:, None, None, :])
+                    dr0 = _clenshaw_batched(cr0c, t_sp) - _clenshaw_batched(cr0c, t_bg)
+                    dr1 = _clenshaw_batched(cr1c, t_sp) - _clenshaw_batched(cr1c, t_bg)
+                    dr2 = _clenshaw_batched(cr2c, t_sp) - _clenshaw_batched(cr2c, t_bg)
+                    return (
+                        EA0 + ss(-jnp.sum(Wc * (nll_sp - nll_bg), -1)),
+                        EA1 + ss(-jnp.sum(Wc * (ng_sp - ng_bg), -1)),
+                        EA2 + ss(jnp.sum(Wc * (nw_sp - nw_bg), -1)),
+                        Er0 + ss(jnp.sum(Wc * dr0, -1)),
+                        Er1 + ss(jnp.sum(Wc * dr1, -1)),
+                        Er2 + ss(jnp.sum(Wc * dr2, -1)),
+                    ), None
+
+                init6 = (EA0, EA1, EA2, Er0, Er1, Er2)
+                (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(
+                    body, init6, (rr, vv, cvec, bb, ww))
                 pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
                 cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 

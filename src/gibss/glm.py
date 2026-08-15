@@ -41,7 +41,7 @@ from .response import Bernoulli, Compress, CompressSelfNorm, ResponseModel, Smoo
 from .response_ser import (
     _profile_null,
     build_ser_state,
-    glm_center_ser,
+    glm_center_ser_nodes,
     glm_jj_ser,
     glm_linear_profile_ser,
     glm_linear_ser,
@@ -223,10 +223,15 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
             # background (glm_center_ser). column_center is BCOO-only (dense is centered
             # eagerly), so exact O(n*p) defeats the sparsity -> default exact to chebyshev.
             bg = "chebyshev" if fs.background == "exact" else fs.background
-            return (*glm_center_ser(
-                op, aux, offset, center, prior_variance, fs.response,
-                order=order, background=bg,
-            ), None)
+            mu, var, log_bf, coefficient_kl, b_nodes, log_node_weight = (
+                glm_center_ser_nodes(
+                    op, aux, offset, center, prior_variance, fs.response,
+                    order=order, background=bg,
+                )
+            )
+            # Expose the centered per-feature quad nodes so the sparse-CENTERED
+            # self-normalized offset fold can fold this effect against (x_ij - c_j) b.
+            return mu, var, log_bf, coefficient_kl, (b_nodes, log_node_weight)
         if fs.kernel == "linear":
             # quadratic response: w is constant, so centering is EXACT and row-wise --
             # a CenteredOperator's rank-1 rmatvec/moment(2) corrections carry it (O(nnz)
@@ -542,10 +547,20 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
         effects = [(e.b_nodes.T, e.log_node_weight.T) for e in others]
         init = None
         if have_icpt:
+            # the shared intercept is the (uncentered) all-ones effect, so its seed is
+            # built the same way whether or not the X-design is centered.
             init = comp.build_selfnorm_init(
                 base, y, jnp.ones((n, 1)), bc[None, :], lw0[None, :], iv
             )
-        aux = comp.build_aux_selfnorm_sequential_sparse(base, y, data.X, effects, init=init)
+        center = getattr(data, "column_center", None)
+        if center is not None:  # sparse implicit pre-centering: fold (x_ij - c_j) b
+            aux = comp.build_aux_selfnorm_sequential_sparse_centered(
+                base, y, data.X, effects, jnp.asarray(center), init=init
+            )
+        else:
+            aux = comp.build_aux_selfnorm_sequential_sparse(
+                base, y, data.X, effects, init=init
+            )
     else:
         Xd = jnp.asarray(data.X)
         effects = []

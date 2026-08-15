@@ -27,6 +27,7 @@ __all__ = [
     "glm_ser",
     "glm_ser_nodes",
     "glm_center_ser",
+    "glm_center_ser_nodes",
     "build_ser_state",
     "glm_profile_map",
     "glm_profile_ser",
@@ -854,11 +855,7 @@ def glm_ser_nodes(
     return _glm_ser_impl(op, aux, offset, prior_variance, response, order, n_iter, tol)
 
 
-@partial(
-    jax.jit,
-    static_argnames=("response", "order", "n_iter", "background", "degree"),
-)
-def glm_center_ser(
+def _glm_center_ser_impl(
     op: DesignOperator,
     aux,
     offset,
@@ -871,24 +868,12 @@ def glm_center_ser(
     background: str = "chebyshev",
     degree: int = 40,
 ):
-    """Per-column SER with the EXACT per-feature Laplace of `glm_ser`, but on a design
-    centered by a FIXED offset `center` (c_j): the single-effect model is
-    eta_i = offset_i + (x_ij - c_j) b_j with c_j GIVEN (unweighted mean, null-weighted,
-    or the leave-one-out null-weighted center when updating effect l -- computed by the
-    caller, NOT profiled here). Distinct from `glm_profile_ser`, which SOLVES a
-    per-feature intercept; here c_j is a fixed reparameterization.
-
-    On a sparse `op` centering fills the zeros (every off-support x_ij = 0 becomes
-    -c_j, whose weight depends on b_j), so a naive fit is dense O(n*p). Instead each
-    all-rows reduction splits into a support term (O(nnz), the real entries) plus the
-    off-support fill-in, whose sum over rows is the 1-D background B(s_j) = sum_i
-    f(offset_i + s_j) at the per-feature scalar shift s_j = -c_j b_j -- the SAME
-    `_background` primitive the profiled kernel uses, amortized by the Chebyshev
-    surrogate (O(n*D + D*p)). On a dense (full-grid) op the off-support set is empty
-    and the correction cancels, so this reduces to `glm_ser` on the centered design.
-
-    Returns (mu, var, feature_log_bf, coefficient_kl), the log-BF relative to the b=0
-    fit at `offset` (a feature-independent baseline that cancels in alpha)."""
+    """Shared body of `glm_center_ser` / `glm_center_ser_nodes`. Returns the 6-tuple
+    `(mu, var, feature_log_bf, coefficient_kl, b_nodes, log_node_weight)` -- the
+    centered per-feature Laplace summaries plus the adaptive-GH nodes over b and their
+    log-unnormalized weights (each (order, p)). The b-posterior the nodes represent is
+    the centered single-effect one (`eta = offset + (x_ij - c_j) b`); the sparse-centered
+    self-normalized offset fold consumes it. See `glm_center_ser` for the method."""
     aux = _tmap(jnp.asarray, aux)
     offset = jnp.asarray(offset)
     c = jnp.asarray(center)
@@ -963,4 +948,77 @@ def glm_center_ser(
         return logint, dll
 
     logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, BGll)
-    return _posterior_moments(logint, b_nodes, dll_nodes)
+    mu, var, log_bf, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
+    return mu, var, log_bf, coefficient_kl, b_nodes, logint
+
+
+@partial(
+    jax.jit,
+    static_argnames=("response", "order", "n_iter", "background", "degree"),
+)
+def glm_center_ser(
+    op: DesignOperator,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """Per-column SER with the EXACT per-feature Laplace of `glm_ser`, but on a design
+    centered by a FIXED offset `center` (c_j): the single-effect model is
+    eta_i = offset_i + (x_ij - c_j) b_j with c_j GIVEN (unweighted mean, null-weighted,
+    or the leave-one-out null-weighted center when updating effect l -- computed by the
+    caller, NOT profiled here). Distinct from `glm_profile_ser`, which SOLVES a
+    per-feature intercept; here c_j is a fixed reparameterization.
+
+    On a sparse `op` centering fills the zeros (every off-support x_ij = 0 becomes
+    -c_j, whose weight depends on b_j), so a naive fit is dense O(n*p). Instead each
+    all-rows reduction splits into a support term (O(nnz), the real entries) plus the
+    off-support fill-in, whose sum over rows is the 1-D background B(s_j) = sum_i
+    f(offset_i + s_j) at the per-feature scalar shift s_j = -c_j b_j -- the SAME
+    `_background` primitive the profiled kernel uses, amortized by the Chebyshev
+    surrogate (O(n*D + D*p)). On a dense (full-grid) op the off-support set is empty
+    and the correction cancels, so this reduces to `glm_ser` on the centered design.
+
+    Returns (mu, var, feature_log_bf, coefficient_kl), the log-BF relative to the b=0
+    fit at `offset` (a feature-independent baseline that cancels in alpha). See
+    `glm_center_ser_nodes` for the raw quadrature nodes the self-normalized offset
+    fold consumes."""
+    return _glm_center_ser_impl(
+        op, aux, offset, center, prior_variance, response, order, n_iter, tol,
+        background, degree,
+    )[:4]
+
+
+@partial(
+    jax.jit,
+    static_argnames=("response", "order", "n_iter", "background", "degree"),
+)
+def glm_center_ser_nodes(
+    op: DesignOperator,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """`glm_center_ser` plus the raw quadrature representation of the centered
+    per-feature posterior: `(mu, var, feature_log_bf, coefficient_kl, b_nodes,
+    log_node_weight)`, the last two each (order, p). `softmax(log_node_weight)` over all
+    (node, feature) is the SER's joint posterior over (node, feature) -- the `(b_nodes,
+    logW)` contract the sparse-CENTERED self-normalized offset fold
+    (`Compress.build_aux_selfnorm_sequential_sparse_centered`) consumes."""
+    return _glm_center_ser_impl(
+        op, aux, offset, center, prior_variance, response, order, n_iter, tol,
+        background, degree,
+    )
