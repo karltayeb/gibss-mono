@@ -45,7 +45,7 @@ from .response_ser import (
     glm_linear_profile_ser,
     glm_linear_ser,
     glm_profile_ser,
-    glm_ser,
+    glm_ser_nodes,
     glm_vi_profile_ser,
     glm_vi_ser,
 )
@@ -198,8 +198,11 @@ def _aux(data, state, include_intercept_var=True):
 
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     """(kernel, intercept) dispatch, returning the raw per-feature (mu, var, log_bf,
-    coefficient_kl) so wrappers (e.g. cox_poisson's partial-likelihood read-out)
-    can adjust before assembling the SER state."""
+    coefficient_kl, nodes) so wrappers (e.g. cox_poisson's partial-likelihood read-out)
+    can adjust before assembling the SER state. `nodes` is `(b_nodes, log_node_weight)`
+    -- the adaptive-GH quadrature representation of the per-feature posterior, each
+    (order, p) -- for the plain `quad`/shared kernel (which the self-normalized offset
+    fold consumes), else `None`."""
     offset = jnp.asarray(offset)
     op = as_operator(data.X)
     profiled = fs.intercept == "profiled"
@@ -212,10 +215,10 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
             # background (glm_center_ser). column_center is BCOO-only (dense is centered
             # eagerly), so exact O(n*p) defeats the sparsity -> default exact to chebyshev.
             bg = "chebyshev" if fs.background == "exact" else fs.background
-            return glm_center_ser(
+            return (*glm_center_ser(
                 op, aux, offset, center, prior_variance, fs.response,
                 order=order, background=bg,
-            )
+            ), None)
         if fs.kernel == "linear":
             # quadratic response: w is constant, so centering is EXACT and row-wise --
             # a CenteredOperator's rank-1 rmatvec/moment(2) corrections carry it (O(nnz)
@@ -230,15 +233,17 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
                 "(its per-entry variance/tilt adds a second per-feature parameter). Pass "
                 "center=False, or use intercept='profiled' (invariant to column shifts)."
             )
+    nodes = None  # (b_nodes, log_node_weight) for the plain quad/shared kernel, else None
     if fs.kernel == "quad" and profiled:
         mu, var, log_bf, coefficient_kl, _, _ = glm_profile_ser(
             op, aux, offset, prior_variance, fs.response, order=order,
             background=fs.background, node_intercept=fs.node_intercept,
         )
     elif fs.kernel == "quad":
-        mu, var, log_bf, coefficient_kl = glm_ser(
+        mu, var, log_bf, coefficient_kl, b_nodes, log_node_weight = glm_ser_nodes(
             op, aux, offset, prior_variance, fs.response, order=order,
         )
+        nodes = (b_nodes, log_node_weight)
     elif fs.kernel == "linear":
         fn = glm_linear_profile_ser if profiled else glm_linear_ser
         out = fn(op, aux, offset, prior_variance, fs.response)
@@ -256,7 +261,7 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
         mu, var, log_bf, coefficient_kl = glm_jj_ser(
             op, aux, offset, prior_variance, fs.response,
         )
-    return mu, var, log_bf, coefficient_kl
+    return mu, var, log_bf, coefficient_kl, nodes
 
 
 def _null_log_marginal(fs, aux, offset):
@@ -285,12 +290,14 @@ def _fit_effect(data, fs, aux, offset, prior_variance, order):
     # The kernel returns feature_log_bf relative to the b=0 null at `offset`; pair it
     # with that null's marginal so the state stores the absolute per-feature marginal
     # (comparable across kernels). alpha only needs the relative BF (shift-invariant).
-    mu, var, log_bf, coefficient_kl = _fit_effect_raw(
+    mu, var, log_bf, coefficient_kl, nodes = _fit_effect_raw(
         data, fs, aux, offset, prior_variance, order
     )
     null = _null_log_marginal(fs, aux, offset)
+    b_nodes, log_node_weight = nodes if nodes is not None else (None, None)
     return build_ser_state(
-        mu, var, log_bf, coefficient_kl, prior_variance, null_log_marginal=null
+        mu, var, log_bf, coefficient_kl, prior_variance, null_log_marginal=null,
+        b_nodes=b_nodes, log_node_weight=log_node_weight,
     )
 
 

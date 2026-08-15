@@ -73,10 +73,12 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class LocalTaylorEffect(BaseSERState):
-    coefficient_kl: np.ndarray
-    mode: np.ndarray
-    hessian: np.ndarray  # Schur profile curvature (profile=True) or 1/var (profile=False)
-    b0: np.ndarray  # per-feature profiled intercept (profile=True); zeros otherwise
+    # defaults so these follow BaseSERState's defaulted b_nodes/log_node_weight (dataclass
+    # ordering); always constructed by keyword, so None defaults are inert.
+    coefficient_kl: np.ndarray = None
+    mode: np.ndarray = None
+    hessian: np.ndarray = None  # Schur profile curvature (profile=True) or 1/var (profile=False)
+    b0: np.ndarray = None  # per-feature profiled intercept (profile=True); zeros otherwise
 
     # message: inherit BaseSERState.message -> Message(mean, var). The per-row var
     # feeds the offset-integrated path; a MeanMessage total disables it.

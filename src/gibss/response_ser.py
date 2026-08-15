@@ -25,6 +25,7 @@ from ._numerics import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
 __all__ = [
     "glm_ser",
+    "glm_ser_nodes",
     "glm_center_ser",
     "build_ser_state",
     "glm_profile_map",
@@ -297,6 +298,8 @@ def build_ser_state(
     coefficient_kl,
     prior_variance,
     null_log_marginal=0.0,
+    b_nodes=None,
+    log_node_weight=None,
 ):
     """Assemble a `BaseSERState` from a kernel's per-feature outputs.
 
@@ -329,6 +332,8 @@ def build_ser_state(
         marginal_log_likelihood=float(log_norm - jnp.log(float(p)) + null_log_marginal),
         null_log_marginal=null_log_marginal,
         kl=kl,
+        b_nodes=b_nodes,
+        log_node_weight=log_node_weight,
     )
 
 
@@ -675,8 +680,7 @@ def glm_vi_profile_ser(
     return m, v, ll_alt - ll_null - kl, kl, b0, prec
 
 
-@partial(jax.jit, static_argnames=("order", "n_iter", "response"))
-def glm_ser(
+def _glm_ser_impl(
     op: DesignOperator,
     aux,
     offset,
@@ -686,14 +690,11 @@ def glm_ser(
     n_iter: int = 50,
     tol: float = 1e-8,
 ):
-    """Per-column SER for an arbitrary response. `aux` is per-observation auxiliary
-    data (y for Bernoulli/Poisson, llr for the two-group marginal, `(y, offset_var)`
-    for a `Smoothed` family); any pytree of per-row arrays works.
-
-    Returns per-feature (mu, var, feature_log_bf, coefficient_kl), the log-BF
-    relative to the b=0 fit at `offset` (what alpha uses). For a `quadratic`
-    response prefer `glm_linear_ser` (closed-form weighted linear regression; the engine enforces this).
-    """
+    """Shared body of `glm_ser` / `glm_ser_nodes`. Returns the 6-tuple `(mu, var,
+    feature_log_bf, coefficient_kl, b_nodes, log_node_weight)` -- the per-feature Laplace
+    summaries plus the adaptive-GH nodes and their log-unnormalized weights (each
+    (order, p)). `aux` is per-observation auxiliary data (y for Bernoulli/Poisson, llr for
+    the two-group marginal, `(y, offset_var)` for a `Smoothed` family)."""
     aux = _tmap(jnp.asarray, aux)
     offset = jnp.asarray(offset)
     aux_e = _tmap(op.broadcast_rows, aux)
@@ -749,7 +750,46 @@ def glm_ser(
         return logint, bb, dll
 
     logint, b_nodes, dll_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p) x3
-    return _posterior_moments(logint, b_nodes, dll_nodes)
+    mu, var, log_bf, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
+    return mu, var, log_bf, coefficient_kl, b_nodes, logint
+
+
+@partial(jax.jit, static_argnames=("order", "n_iter", "response"))
+def glm_ser(
+    op: DesignOperator,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+):
+    """Per-column SER for an arbitrary response: `(mu, var, feature_log_bf,
+    coefficient_kl)`, the log-BF relative to the b=0 fit at `offset` (what alpha uses).
+    `aux` is per-observation auxiliary data (y for Bernoulli/Poisson, llr for the
+    two-group marginal, `(y, offset_var)` for a `Smoothed` family). For a `quadratic`
+    response prefer `glm_linear_ser`. See `glm_ser_nodes` for the raw quadrature nodes."""
+    return _glm_ser_impl(op, aux, offset, prior_variance, response, order, n_iter, tol)[:4]
+
+
+@partial(jax.jit, static_argnames=("order", "n_iter", "response"))
+def glm_ser_nodes(
+    op: DesignOperator,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+):
+    """`glm_ser` plus the raw quadrature representation of the per-feature posterior:
+    `(mu, var, feature_log_bf, coefficient_kl, b_nodes, log_node_weight)`, the last two
+    each (order, p). `softmax(log_node_weight)` over all (node, feature) is the SER's
+    joint posterior over (node, feature) -- the `(b_nodes, logW)` contract the
+    self-normalized offset fold (`Compress.build_aux_selfnorm_sequential`) consumes."""
+    return _glm_ser_impl(op, aux, offset, prior_variance, response, order, n_iter, tol)
 
 
 @partial(

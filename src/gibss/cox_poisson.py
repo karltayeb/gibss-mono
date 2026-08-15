@@ -285,7 +285,7 @@ def update_effect_index_step(data, l, state):
             "intercept='shared' here."
         )
     offset = glm._effect_offset(fs, state)
-    mu, _, _, _ = glm._fit_effect_raw(
+    mu, _, _, _, _ = glm._fit_effect_raw(
         data, fs, glm._aux(data, state), offset, effect.prior_variance,
         fs.quadrature_order,
     )
