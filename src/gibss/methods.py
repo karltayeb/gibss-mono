@@ -24,6 +24,7 @@ from .response import (
     GH,
     Bernoulli,
     Compress,
+    CompressSelfNorm,
     Gaussian,
     JJEnvelope,
     JJFixed,
@@ -51,6 +52,9 @@ _SMOOTHERS = {
         inner=MixtureGH(order=cfg["offset_quadrature_points"]),
         M=cfg["compress_degree"],
     ),
+    # self-normalized offset: fold each other effect (and the intercept) against its TRUE
+    # non-Gaussian quadrature posterior -> the IBSS fixed point is the exact CAVI posterior.
+    "compress_selfnorm": lambda cfg: CompressSelfNorm(M=cfg["compress_degree"]),
     "taylor2": lambda cfg: Taylor(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),

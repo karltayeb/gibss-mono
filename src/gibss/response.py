@@ -50,6 +50,7 @@ __all__ = [
     "MixtureGH",
     "SelfNormQuad",
     "Compress",
+    "CompressSelfNorm",
     "Taylor",
     "TaylorFixed",
     "JJEnvelope",
@@ -519,6 +520,29 @@ class Compress(Smoother):
         fit = lambda vals: vals @ Vinv.T  # noqa: E731
         return y, obar, center, halfwidth, fit(sll - bll), fit(sg - bg), fit(sw - bw)
 
+    def build_selfnorm_init(self, base, y, x, b_nodes, logW, V0):
+        """Fold one ZERO-MEAN effect (its mean already kept in `eta`) as the starting
+        cumulant residual for `build_aux_selfnorm_sequential_sparse`, on that fold's OWN
+        init interval `[center=0, halfwidth = T + kappa sqrt(V0)]` so the Chebyshev
+        parameterization matches when the X-effects fold on top. Returns the `init` tuple
+        `(cr0, cr1, cr2, V0)`. Used to fold the shared intercept's non-Gaussian posterior
+        before the sparse X-effects (the self-normalized analogue of the Gaussian `N(0, iv)`
+        seed). `x` (n, C), `b_nodes`/`logW` (C, Q); the caller passes CENTERED nodes."""
+        y = jnp.asarray(y)
+        x = jnp.asarray(x)
+        b_nodes = jnp.asarray(b_nodes)
+        n = y.shape[0]
+        hw = jnp.broadcast_to(self.T + self.kappa * jnp.sqrt(jnp.asarray(V0)), (n,))
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        znodes = hw[:, None] * xnodes[None, :]  # center 0 (n, M+1)
+        sll, sg, sw = SelfNormQuad().terms(base, znodes, (y, x, b_nodes, logW))
+        bll, bg, bw = base.terms(znodes, y[:, None])  # plug-in at obar=0 (mean in eta)
+        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+        # cumulant residuals cr = A^(1) - A(z); aux stores (-cr0, -cr1, cr2), so
+        # cr0 = -fit(sll - bll) matches the Gaussian init convention (init = (cr0,cr1,cr2,V0)).
+        return (-fit(sll - bll), -fit(sg - bg), fit(sw - bw), V0)
+
     def build_aux_selfnorm_sequential(self, base, y, effects, derivatives="differentiate"):
         """Self-normalized analogue of `build_aux_sequential` for a SUM of independent
         effects (the offset when fitting one block: `o = sum_{l' != l} X_l' b_l'`). Each
@@ -588,7 +612,8 @@ class Compress(Smoother):
         return y, s, center, halfwidth, -cr0, -cr1, cr2
 
     def build_aux_selfnorm_sequential_sparse(self, base, y, X, effects,
-                                             entry_chunk=1 << 16, derivatives="differentiate"):
+                                             entry_chunk=1 << 16, derivatives="differentiate",
+                                             init=None):
         """Sparse self-normalized sequential fold -- the raw-quadrature analogue of
         `build_aux_sequential_sparse`, exploiting the design zeros for free. `X` is a
         sparse (BCOO, n x p) design shared by the effects; each effect is `(b_nodes, logW)`
@@ -620,11 +645,19 @@ class Compress(Smoother):
             return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
                     if pad else a)
 
+        # optional starting cumulant: a zero-mean effect already folded (the shared
+        # intercept's own non-Gaussian posterior). Convolution commutes, so folding it
+        # FIRST as the initial residual is exact; the X-effects fold on top unchanged.
+        # init = (cr0, cr1, cr2, V0) with V0 the intercept posterior variance.
         s = jnp.zeros(n)
-        V = jnp.zeros(n)
+        if init is None:
+            V = jnp.zeros(n)
+            cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
+        else:
+            cr0, cr1, cr2, V0 = init
+            V = jnp.broadcast_to(jnp.asarray(V0), (n,))
         center = -s
         halfwidth = self.T + self.kappa * jnp.sqrt(V)
-        cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
 
         for b_nodes, logW in effects:
             b_nodes = jnp.asarray(b_nodes)
@@ -951,6 +984,17 @@ class Compress(Smoother):
         g = bg + _clenshaw_batched(coef_g, t)
         w = jnp.maximum(bw + _clenshaw_batched(coef_w, t), 0.0)
         return ll, g, w
+
+
+@dataclass(frozen=True)
+class CompressSelfNorm(Compress):
+    """Marker subclass of `Compress` selecting the SELF-NORMALIZED offset fold: the engine
+    folds each other effect (and the intercept) against its TRUE, non-Gaussian posterior
+    via raw quadrature `(b_nodes, logW)` (`build_aux_selfnorm_sequential[_sparse]`) instead
+    of the Gaussian-moment mixture. The in-loop `Compress.terms` is identical (plug-in +
+    Chebyshev residual); only the amortized aux BUILDER differs, dispatched on this type in
+    `glm._compress_fold_aux`. With the quadrature-exact kernel this makes the IBSS sweep's
+    fixed point the exact mean-field (CAVI) posterior."""
 
 
 @dataclass(frozen=True)

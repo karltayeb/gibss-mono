@@ -35,8 +35,8 @@ from .linear import (  # noqa: F401 (re-export)
     prep_data,
     update_prior_variance_index_step,
 )
-from .operators import CenteredOperator, as_operator
-from .response import Bernoulli, Compress, ResponseModel, Smoothed
+from .operators import CenteredOperator, DenseOperator, as_operator
+from .response import Bernoulli, Compress, CompressSelfNorm, ResponseModel, Smoothed
 from .response_ser import (
     _profile_null,
     build_ser_state,
@@ -123,6 +123,13 @@ class GLMFamilyState:
     row_param: object = None
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
+    # shared intercept's raw quadrature posterior, populated only under the
+    # self-normalized offset fold (CompressSelfNorm): b0_nodes (order,) and their
+    # log-unnormalized weights logW0 (order,). `intercept_value` is then the quadrature
+    # posterior MEAN, so the fold folds the zero-mean residual (nodes - mean) as one
+    # additive non-Gaussian effect -- the exact analogue of the Gaussian N(0, iv) seed.
+    intercept_b_nodes: object = None
+    intercept_log_node_weight: object = None
 
     def __post_init__(self):
         legacy = {"profile": "quad", "vi_profile": "vi", "linear_profile": "linear"}
@@ -397,11 +404,37 @@ def estimate_intercept(data, state):
     return float(b0), float(v0)
 
 
+def estimate_intercept_quad(data, state, order=15, prior_variance=1e6):
+    """Fit the shared intercept's 1-D posterior by adaptive quadrature -- a one-feature SER
+    on the all-ones column (flat prior ~ large prior_variance) at the effects' mean offset.
+    Returns (m0, v0, b0_nodes, logW0): the posterior MEAN and variance, and the raw GH
+    nodes + their log-unnormalized weights (each (order,)). Unlike `estimate_intercept`
+    (Newton mode + Laplace var) this keeps the FULL non-Gaussian posterior, so the
+    self-normalized offset fold can fold the intercept as one additive effect."""
+    fs = state.family_state
+    base = fs.response.base if isinstance(fs.response, Smoothed) else fs.response
+    n = data.X.shape[0]
+    offset = jnp.asarray(state.total_message.mean) + fs.glm_offset  # effects only
+    ones = DenseOperator(jnp.ones((n, 1)))
+    mu, var, _, _, b0_nodes, logW0 = glm_ser_nodes(
+        ones, jnp.asarray(data.y), offset, prior_variance, base, order=order,
+    )
+    return float(mu[0]), float(var[0]), b0_nodes[:, 0], logW0[:, 0]
+
+
 def estimate_intercept_step(data, state):
     fs = state.family_state
     # profiled: b0 is per-feature inside the kernel; null: frozen since init
     if fs.intercept != "shared" or not fs.estimate_intercept:
         return state
+    if isinstance(getattr(fs.response, "smoother", None), CompressSelfNorm):
+        # self-normalized fold: keep the intercept's full (non-Gaussian) posterior; the
+        # value in eta is the posterior MEAN, the nodes ride for the zero-mean fold.
+        m0, v0, b0n, lw0 = estimate_intercept_quad(data, state, order=fs.quadrature_order)
+        return replace(state, family_state=replace(
+            fs, intercept_value=m0, intercept_var=v0,
+            intercept_b_nodes=b0n, intercept_log_node_weight=lw0,
+        ))
     b0, v0 = estimate_intercept(data, state)
     return replace(state, family_state=replace(fs, intercept_value=b0, intercept_var=v0))
 
@@ -435,6 +468,47 @@ def _effect_offset(fs, state):
     return base + state.total_message.mean
 
 
+def _selfnorm_fold_aux(data, state, comp, base, y, n, others):
+    """Self-normalized (`CompressSelfNorm`) offset aux: fold the OTHER effects -- and the
+    shared intercept -- against their TRUE, non-Gaussian posteriors via raw quadrature
+    `(b_nodes, logW)`, not Gaussian moments. Effects carry their quad nodes as (order, p)
+    (transposed to the fold's (p, Q)); unfit/empty effects (no nodes) contribute 0 and are
+    skipped. The intercept is one more ADDITIVE effect (all-ones column) whose zero-mean
+    residual (nodes - posterior mean, the mean kept in eta) seeds the fold. Re-centers to
+    obar=0 like the Gaussian path (the offset mean lives in eta)."""
+    fs = state.family_state
+    others = [e for e in others if e.b_nodes is not None]  # skip unfit effects
+    # intercept as an additive non-Gaussian effect (zero-mean; mean is intercept_value).
+    have_icpt = (
+        not isinstance(state.total_message, MeanMessage)
+        and fs.intercept_b_nodes is not None
+        and float(fs.intercept_var) > 0.0
+    )
+    if have_icpt:
+        bc = jnp.asarray(fs.intercept_b_nodes) - float(fs.intercept_value)  # centered (order,)
+        lw0 = jnp.asarray(fs.intercept_log_node_weight)
+        iv = float(fs.intercept_var)
+
+    if is_bcoo(data.X):
+        effects = [(e.b_nodes.T, e.log_node_weight.T) for e in others]
+        init = None
+        if have_icpt:
+            init = comp.build_selfnorm_init(
+                base, y, jnp.ones((n, 1)), bc[None, :], lw0[None, :], iv
+            )
+        aux = comp.build_aux_selfnorm_sequential_sparse(base, y, data.X, effects, init=init)
+    else:
+        Xd = jnp.asarray(data.X)
+        effects = []
+        if have_icpt:  # zero-mean intercept effect first (all-ones column)
+            effects.append((jnp.ones((n, 1)), bc[None, :], lw0[None, :]))
+        effects += [(Xd, e.b_nodes.T, e.log_node_weight.T) for e in others]
+        aux = comp.build_aux_selfnorm_sequential(base, y, effects)
+    y_, _obar, _center, hw, cll, cg, cw = aux
+    z = jnp.zeros_like(hw)  # re-center: obar -> 0, center -> 0 (coeffs unchanged)
+    return (y_, z, z, hw, cll, cg, cw)
+
+
 def _compress_fold_aux(data, state, l):
     """M2: the per-target offset aux for Compress. The EXACT offset of target l is the
     SUM of the other effects, so we fold their per-row mixtures one at a time (sparse
@@ -452,6 +526,8 @@ def _compress_fold_aux(data, state, l):
     y = jnp.asarray(data.y)
     n = y.shape[0]
     others = [e for i, e in enumerate(state.single_effects) if i != l]
+    if isinstance(comp, CompressSelfNorm):
+        return _selfnorm_fold_aux(data, state, comp, base, y, n, others)
     # the shared intercept's posterior uncertainty is part of the offset too (as it is
     # in the GH path's ov); fold it as one extra N(0, intercept_var) Gaussian. Zero
     # under profiled (intercept_var stays 0) and under MeanMessage (mean-only mode).
