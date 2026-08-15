@@ -406,19 +406,39 @@ def estimate_intercept(data, state):
 
 def estimate_intercept_quad(data, state, order=15, prior_variance=1e6):
     """Fit the shared intercept's 1-D posterior by adaptive quadrature -- a one-feature SER
-    on the all-ones column (flat prior ~ large prior_variance) at the effects' mean offset.
+    on the all-ones column (flat prior ~ large prior_variance). EXACT CAVI: the intercept
+    likelihood is integrated over ALL effects' current posteriors, symmetric to how each
+    effect update integrates the OTHER effects. Concretely we fit against the
+    self-normalized fold of every fitted effect (no leave-one-out, intercept omitted from
+    the offset) on the SMOOTHED response, so the cumulant seen at b0 is E_effects[A(b0 +
+    Sum_l X b_l)] -- not the plug-in mean the old code used.
+
     Returns (m0, v0, b0_nodes, logW0): the posterior MEAN and variance, and the raw GH
     nodes + their log-unnormalized weights (each (order,)). Unlike `estimate_intercept`
     (Newton mode + Laplace var) this keeps the FULL non-Gaussian posterior, so the
-    self-normalized offset fold can fold the intercept as one additive effect."""
+    self-normalized offset fold can fold the intercept as one additive effect. Only called
+    for the `CompressSelfNorm` path; with zero fitted effects the fold reduces to the base
+    cumulant, matching the old plug-in fit exactly."""
     fs = state.family_state
     base = fs.response.base if isinstance(fs.response, Smoothed) else fs.response
     n = data.X.shape[0]
+    # effects' MEAN rides in eta (the fold is re-centered to obar=0), matching
+    # `_selfnorm_fold_aux`; b0 is integrated against the effects-integrated cumulant.
     offset = jnp.asarray(state.total_message.mean) + fs.glm_offset  # effects only
     ones = DenseOperator(jnp.ones((n, 1)))
-    mu, var, _, _, b0_nodes, logW0 = glm_ser_nodes(
-        ones, jnp.asarray(data.y), offset, prior_variance, base, order=order,
-    )
+    comp = fs.response.smoother if isinstance(fs.response, Smoothed) else None
+    if isinstance(comp, CompressSelfNorm):
+        fold_aux = _selfnorm_fold_aux(
+            data, state, comp, base, jnp.asarray(data.y), n,
+            state.single_effects, include_intercept=False,
+        )
+        mu, var, _, _, b0_nodes, logW0 = glm_ser_nodes(
+            ones, fold_aux, offset, prior_variance, fs.response, order=order,
+        )
+    else:  # non-self-normalized fallback: plug-in fit at the effects' mean
+        mu, var, _, _, b0_nodes, logW0 = glm_ser_nodes(
+            ones, jnp.asarray(data.y), offset, prior_variance, base, order=order,
+        )
     return float(mu[0]), float(var[0]), b0_nodes[:, 0], logW0[:, 0]
 
 
@@ -468,19 +488,26 @@ def _effect_offset(fs, state):
     return base + state.total_message.mean
 
 
-def _selfnorm_fold_aux(data, state, comp, base, y, n, others):
-    """Self-normalized (`CompressSelfNorm`) offset aux: fold the OTHER effects -- and the
-    shared intercept -- against their TRUE, non-Gaussian posteriors via raw quadrature
-    `(b_nodes, logW)`, not Gaussian moments. Effects carry their quad nodes as (order, p)
-    (transposed to the fold's (p, Q)); unfit/empty effects (no nodes) contribute 0 and are
-    skipped. The intercept is one more ADDITIVE effect (all-ones column) whose zero-mean
-    residual (nodes - posterior mean, the mean kept in eta) seeds the fold. Re-centers to
-    obar=0 like the Gaussian path (the offset mean lives in eta)."""
+def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=True):
+    """Self-normalized (`CompressSelfNorm`) offset aux: fold a list of effects -- and,
+    when `include_intercept`, the shared intercept -- against their TRUE, non-Gaussian
+    posteriors via raw quadrature `(b_nodes, logW)`, not Gaussian moments. Effects carry
+    their quad nodes as (order, p) (transposed to the fold's (p, Q)); unfit/empty effects
+    (no nodes) contribute 0 and are skipped. The intercept is one more ADDITIVE effect
+    (all-ones column) whose zero-mean residual (nodes - posterior mean, the mean kept in
+    eta) seeds the fold. Re-centers to obar=0 like the Gaussian path (the offset mean lives
+    in eta).
+
+    Used two ways: for an EFFECT update `others` is the leave-one-out list and the
+    intercept is folded in (`include_intercept=True`); for the INTERCEPT update `others`
+    is ALL fitted effects and the intercept is omitted (`include_intercept=False`), so the
+    fold is the effects-integrated cumulant the intercept's exact-CAVI factor integrates."""
     fs = state.family_state
     others = [e for e in others if e.b_nodes is not None]  # skip unfit effects
     # intercept as an additive non-Gaussian effect (zero-mean; mean is intercept_value).
     have_icpt = (
-        not isinstance(state.total_message, MeanMessage)
+        include_intercept
+        and not isinstance(state.total_message, MeanMessage)
         and fs.intercept_b_nodes is not None
         and float(fs.intercept_var) > 0.0
     )
