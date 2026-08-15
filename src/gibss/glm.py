@@ -13,6 +13,7 @@ so it is estimated the usual way, before the effects.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 
 import jax
@@ -44,7 +45,7 @@ from .response_ser import (
     glm_jj_ser,
     glm_linear_profile_ser,
     glm_linear_ser,
-    glm_profile_ser,
+    glm_profile_ser_nodes,
     glm_ser_nodes,
     glm_vi_profile_ser,
     glm_vi_ser,
@@ -242,10 +243,17 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
             )
     nodes = None  # (b_nodes, log_node_weight) for the plain quad/shared kernel, else None
     if fs.kernel == "quad" and profiled:
-        mu, var, log_bf, coefficient_kl, _, _ = glm_profile_ser(
-            op, aux, offset, prior_variance, fs.response, order=order,
-            background=fs.background, node_intercept=fs.node_intercept,
+        mu, var, log_bf, coefficient_kl, _, _, b_nodes, log_node_weight = (
+            glm_profile_ser_nodes(
+                op, aux, offset, prior_variance, fs.response, order=order,
+                background=fs.background, node_intercept=fs.node_intercept,
+            )
         )
+        # The profile-marginalized b-posterior nodes: the CompressSelfNorm offset fold
+        # folds these against o = X*b (the profiled per-feature intercept is excluded
+        # from the message, and there is no shared intercept to fold), so exposing them
+        # is all that is needed to make compress_selfnorm work under intercept='profiled'.
+        nodes = (b_nodes, log_node_weight)
     elif fs.kernel == "quad":
         mu, var, log_bf, coefficient_kl, b_nodes, log_node_weight = glm_ser_nodes(
             op, aux, offset, prior_variance, fs.response, order=order,
@@ -503,6 +511,20 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
     is ALL fitted effects and the intercept is omitted (`include_intercept=False`), so the
     fold is the effects-integrated cumulant the intercept's exact-CAVI factor integrates."""
     fs = state.family_state
+    # Guard: a FITTED effect must carry quad nodes for the self-normalized fold. An
+    # unfit/empty effect legitimately has b_nodes=None (it contributes 0 and is
+    # dropped), and is identified by kl=inf (the `_empty_effect` sentinel; a fitted
+    # effect has finite kl). A fitted effect with no nodes would be SILENTLY dropped
+    # here, folding a zero offset and producing a wrong fit -- e.g. before profiled
+    # kernels exposed their nodes. Fail loudly instead.
+    for e in others:
+        if e.b_nodes is None and math.isfinite(float(e.kl)):
+            raise ValueError(
+                "CompressSelfNorm offset fold requires per-feature quad nodes on every "
+                "fitted effect, but a fitted effect (finite kl) has b_nodes=None. This "
+                "kernel/intercept combination does not expose quadrature nodes; the fold "
+                "would silently use a zero offset. Use kernel='quad'."
+            )
     others = [e for e in others if e.b_nodes is not None]  # skip unfit effects
     # intercept as an additive non-Gaussian effect (zero-mean; mean is intercept_value).
     have_icpt = (

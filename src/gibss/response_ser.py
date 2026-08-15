@@ -30,6 +30,7 @@ __all__ = [
     "build_ser_state",
     "glm_profile_map",
     "glm_profile_ser",
+    "glm_profile_ser_nodes",
     "glm_jj_ser",
     "glm_vi_ser",
     "glm_vi_profile_ser",
@@ -185,18 +186,7 @@ def glm_profile_map(
     return b, b0, var, log_bf
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "response",
-        "order",
-        "n_iter",
-        "background",
-        "node_intercept",
-        "node_newton",
-    ),
-)
-def glm_profile_ser(
+def _glm_profile_ser_impl(
     op,
     aux,
     offset,
@@ -208,14 +198,18 @@ def glm_profile_ser(
     node_intercept: str = "linear",
     node_newton: int = 4,
 ):
-    """Per-column profiled-intercept SER: glm_profile_map mode + a GH tail over b with
-    per-node intercept. Response-generic form of `ser_ops.profile_ser`.
+    """Shared body of `glm_profile_ser` / `glm_profile_ser_nodes`. Per-column
+    profiled-intercept SER: glm_profile_map mode + a GH tail over b with per-node
+    intercept. Response-generic form of `ser_ops.profile_ser`.
 
     node_intercept: 'linear' (Cox-Reid one step) or 'newton' (re-profile b0 at each
     node via the row-background -- more accurate in the tails, cheap under chebyshev).
-    Returns (mu, var, feature_log_bf, coefficient_kl, b0_hat, precision). For a
-    `quadratic` response prefer `glm_linear_profile_ser` (closed form; the
-    engine enforces this)."""
+    Returns the 8-tuple (mu, var, feature_log_bf, coefficient_kl, b0_hat, precision,
+    b_nodes, log_node_weight): the profiled per-feature Laplace summaries plus the
+    adaptive-GH nodes over b and their log-unnormalized weights (each (order, p)). The
+    b-posterior the nodes represent is the profile-marginalized one -- the object the
+    profiled model's self-normalized offset fold consumes. For a `quadratic` response
+    prefer `glm_linear_profile_ser` (closed form; the engine enforces this)."""
     aux = _tmap(jnp.asarray, aux)
     offset = jnp.asarray(offset)
     aux_e = _tmap(op.broadcast_rows, aux)
@@ -288,7 +282,75 @@ def glm_profile_ser(
 
     logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, b0_nodes, BGll)
     mu, var, log_norm, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
-    return mu, var, log_norm, coefficient_kl, b0_hat, 1.0 / var_lap
+    return mu, var, log_norm, coefficient_kl, b0_hat, 1.0 / var_lap, b_nodes, logint
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "response",
+        "order",
+        "n_iter",
+        "background",
+        "node_intercept",
+        "node_newton",
+    ),
+)
+def glm_profile_ser(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 30,
+    background: str = "exact",
+    node_intercept: str = "linear",
+    node_newton: int = 4,
+):
+    """Per-column profiled-intercept SER: `(mu, var, feature_log_bf, coefficient_kl,
+    b0_hat, precision)`. See `_glm_profile_ser_impl` for the method and
+    `glm_profile_ser_nodes` for the raw quadrature nodes the self-normalized offset
+    fold consumes."""
+    return _glm_profile_ser_impl(
+        op, aux, offset, prior_variance, response, order, n_iter,
+        background, node_intercept, node_newton,
+    )[:6]
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "response",
+        "order",
+        "n_iter",
+        "background",
+        "node_intercept",
+        "node_newton",
+    ),
+)
+def glm_profile_ser_nodes(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 30,
+    background: str = "exact",
+    node_intercept: str = "linear",
+    node_newton: int = 4,
+):
+    """`glm_profile_ser` plus the raw quadrature representation of the (profiled)
+    per-feature posterior: `(mu, var, feature_log_bf, coefficient_kl, b0_hat,
+    precision, b_nodes, log_node_weight)`, the last two each (order, p).
+    `softmax(log_node_weight)` over all (node, feature) is the SER's joint posterior
+    over (node, feature) -- the `(b_nodes, logW)` contract the self-normalized offset
+    fold consumes under `intercept='profiled'`."""
+    return _glm_profile_ser_impl(
+        op, aux, offset, prior_variance, response, order, n_iter,
+        background, node_intercept, node_newton,
+    )
 
 
 def build_ser_state(
