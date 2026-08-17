@@ -179,6 +179,36 @@ def test_terms_presentation_reconstructs_atilde():
         assert np.allclose(np.asarray(w), np.asarray(At2[:, k]), atol=1e-6)
 
 
+@pytest.mark.parametrize("L", [2, 4])
+def test_sparse_build_matches_dense(L):
+    """The zero-clumping BCOO CF build equals the dense build to machine precision."""
+    from jax.experimental import sparse
+
+    from gibss.cf_offset import smoothed_nodes_sparse
+
+    rng = np.random.default_rng(200 + L)
+    n, C = 30, 8
+    Xd = (rng.random((n, C)) < 0.35) * rng.standard_normal((n, C))
+    Xd = jnp.asarray(Xd)
+    Xs = sparse.BCOO.fromdense(Xd)
+    dense_eff, sparse_eff = [], []
+    for _ in range(L):
+        a = np.exp(rng.standard_normal(C))
+        a /= a.sum()
+        mu = rng.standard_normal(C)
+        var = 0.3 * np.exp(rng.standard_normal(C) * 0.3)
+        dense_eff.append((Xd, jnp.asarray(a), jnp.asarray(mu), jnp.asarray(var)))
+        sparse_eff.append((jnp.asarray(a), jnp.asarray(mu), jnp.asarray(var)))
+    zd, d0, d1, d2, hwd, sd, Vd = smoothed_nodes(dense_eff, M=48)
+    zs, s0, s1, s2, hws, ss, Vs = smoothed_nodes_sparse(Xs, sparse_eff, M=48)
+    assert np.allclose(np.asarray(hwd), np.asarray(hws))
+    assert np.allclose(np.asarray(sd), np.asarray(ss))
+    assert np.allclose(np.asarray(Vd), np.asarray(Vs))
+    assert np.max(np.abs(np.asarray(d0) - np.asarray(s0))) < 1e-10
+    assert np.max(np.abs(np.asarray(d1) - np.asarray(s1))) < 1e-10
+    assert np.max(np.abs(np.asarray(d2) - np.asarray(s2))) < 1e-10
+
+
 def test_empty_offset_is_base_cumulant():
     """No other effects -> Atilde = A exactly (the offset is a point mass at 0)."""
     n = 5

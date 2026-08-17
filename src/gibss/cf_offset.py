@@ -87,7 +87,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jax.ops import segment_max, segment_min, segment_sum
+
 from ._numerics import _cheb_fit_matrix, _clenshaw_batched
+from .operators import BCOOOperator
 from .response import Bernoulli, ResponseModel, Smoother
 
 __all__ = [
@@ -95,6 +98,9 @@ __all__ = [
     "offset_cf",
     "smoothed_nodes",
     "build_aux",
+    "offset_cf_sparse",
+    "smoothed_nodes_sparse",
+    "build_aux_sparse",
     "CharFnOffset",
 ]
 
@@ -282,27 +288,33 @@ def smoothed_nodes(
     Tmax, ntau, hw = _grid_size(
         V0, sp0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau
     )
+    tau, wq, psi = _frequency_grid(Tmax, ntau)
+    phi, s, V, _ = offset_cf(effects, tau, n=n)  # zero-mean product of per-effect CFs
+    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
 
-    # --- frequency grid + logistic kernel psi(t) = pi t / sinh(pi t), psi(0) = 1 ---
+
+def _frequency_grid(Tmax, ntau):
+    """Half-line CF grid `[0, Tmax]` with trapezoid weights and the logistic Fourier
+    kernel `psi(t) = pi t / sinh(pi t)` (psi(0) = 1)."""
     tau = jnp.linspace(0.0, Tmax, ntau)
     dtau = Tmax / (ntau - 1)
-    wq = jnp.full((ntau,), dtau).at[0].set(0.5 * dtau).at[-1].set(0.5 * dtau)  # trapz
+    wq = jnp.full((ntau,), dtau).at[0].set(0.5 * dtau).at[-1].set(0.5 * dtau)
     pt = jnp.pi * tau
     psi = jnp.where(tau > 0, pt / jnp.sinh(jnp.where(tau > 0, pt, 1.0)), 1.0)
+    return tau, wq, psi
 
-    # --- zero-mean offset CF (product of per-effect Gaussian-mixture factors) ---
-    phi, s, V, _ = offset_cf(effects, tau, n=n)
+
+def _atilde_from_cf(phi, V, tau, wq, psi, hw, M):
+    """Offset-integrated cumulant `(znodes, At0, At1, At2)` at the per-row CGL nodes from
+    a ZERO-MEAN offset CF `phi` (n, ntau) via the psi-tamed residual quadrature. Shared
+    by the dense and sparse builders -- only how `phi` is formed differs."""
     R = phi - 1.0  # ~ -t^2 V/2 near 0 -> residual transforms are localized
-
-    # per-t coefficients (t=0 excluded from the /t, /t^2 sums; added analytically)
     tau_safe = jnp.where(tau > 0, tau, 1.0)
     c_val = jnp.where(tau > 0, wq * psi / tau_safe**2, 0.0)  # value residual, /t^2
     c_grd = jnp.where(tau > 0, wq * psi / tau_safe, 0.0)  # grad residual, /t
     c_wt = wq * psi  # weight residual (no 1/t)
     inv_pi = 1.0 / jnp.pi
-
-    xnodes_np, _ = _cheb_fit_matrix(M)
-    xnodes = jnp.asarray(xnodes_np)  # (M+1,) CGL nodes on [-1, 1]
+    xnodes = jnp.asarray(_cheb_fit_matrix(M)[0])  # (M+1,) CGL nodes on [-1, 1]
 
     def node(_, xk):
         z = hw * xk  # (n,)
@@ -316,12 +328,7 @@ def smoothed_nodes(
     _, (D_ll, D_g, D_w) = jax.lax.scan(node, 0.0, xnodes)  # each (M+1, n)
     znodes = hw[:, None] * xnodes[None, :]  # (n, M+1)
     sig = jax.nn.sigmoid(znodes)
-    A0 = jax.nn.softplus(znodes)
-    A2 = sig * (1.0 - sig)
-    At0 = A0 - D_ll.T
-    At1 = sig - D_g.T
-    At2 = A2 + D_w.T
-    return znodes, At0, At1, At2, hw, s, V
+    return znodes, jax.nn.softplus(znodes) - D_ll.T, sig - D_g.T, sig * (1.0 - sig) + D_w.T
 
 
 def build_aux(base, y, effects, M=48, **kwargs):
@@ -341,6 +348,130 @@ def build_aux(base, y, effects, M=48, **kwargs):
     A0 = jax.nn.softplus(znodes)
     A2 = sig * (1.0 - sig)
     z = jnp.zeros_like(hw)  # obar/center = 0
+    return y, z, z, hw, fit(A0 - At0), fit(sig - At1), fit(At2 - A2)
+
+
+# --------------------------------------------------------------------------------------
+# Sparse (BCOO) path. The design X is shared across effects, so an effect is just its
+# effect-space law `(alpha, mu, var)` (each (p,)); the offset CF exploits the zeros.
+# --------------------------------------------------------------------------------------
+
+
+def _sparse_effect_moments(op, rows, cols, vals, alpha, mu, var, n):
+    """Per-row mean, variance, and between-component mean-spread of one effect on a
+    sparse design (all O(nnz), no dense fill). `op` is the BCOOOperator."""
+    mean = op.matvec(alpha * mu)  # sum_c x_ic alpha_c mu_c
+    second = op.matvec_sq(alpha * (mu**2 + var))
+    v = jnp.maximum(second - mean**2, 0.0)
+    # mean atoms per row are {x_ic mu_c : c in supp(i)} plus 0 (the off-support mass);
+    # the spread includes 0 so a one-sided support is measured from the origin.
+    xm = vals * mu[cols]
+    hi = jnp.maximum(segment_max(xm, rows, num_segments=n), 0.0)
+    lo = jnp.minimum(segment_min(xm, rows, num_segments=n), 0.0)
+    return mean, v, hi - lo
+
+
+def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15):
+    """Zero-mean offset CF on a sparse (BCOO) design via the zero-clumping identity
+
+        phi_l,i(t) = 1 + sum_{c in supp(i)} alpha_lc (exp(i t x_ic mu_lc
+                        - 1/2 t^2 x_ic^2 var_lc) - 1),
+
+    which is EXACT (uses sum_c alpha_lc = 1): a gene not in set c contributes the constant
+    alpha_lc, so only the nnz support entries carry t-dependence. The support sum is a
+    per-row `segment_sum` over the BCOO entries, chunked (`entry_chunk`) to bound peak
+    memory at `O(entry_chunk * ntau)`. `effects` is a list of `(alpha, mu, var)` (each
+    (p,)); X is shared. Returns `(phi, s, V, spread)` -- `phi` (n, ntau) centered."""
+    tau = jnp.asarray(tau)
+    ntau = tau.shape[0]
+    op = BCOOOperator(X)
+    idx = X.indices
+    rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
+    n = X.shape[0] if n is None else n
+    nnz = vals.shape[0]
+
+    s = jnp.zeros(n)
+    V = jnp.zeros(n)
+    spread = jnp.zeros(n)
+    phi = jnp.ones((n, ntau), dtype=jnp.complex128)
+    for alpha, mu, var in effects:
+        alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
+        mean, v, sp = _sparse_effect_moments(op, rows, cols, vals, alpha, mu, var, n)
+        s = s + mean
+        V = V + v
+        spread = spread + sp
+        acc = jnp.zeros((n, ntau), dtype=jnp.complex128)
+        for k0 in range(0, nnz, entry_chunk):
+            k1 = min(k0 + entry_chunk, nnz)
+            r, c, x = rows[k0:k1], cols[k0:k1], vals[k0:k1]
+            u = x[:, None] * tau[None, :]  # (chunk, ntau)
+            g = alpha[c][:, None] * (
+                jnp.exp(1j * u * mu[c][:, None] - 0.5 * u**2 * var[c][:, None]) - 1.0
+            )
+            acc = acc + segment_sum(g, r, num_segments=n)
+        phi = phi * (1.0 + acc)
+    phi = phi * jnp.exp(-1j * (tau[None, :] * s[:, None]))  # center to zero mean
+    return phi, s, V, spread
+
+
+def smoothed_nodes_sparse(
+    X,
+    effects,
+    M=48,
+    *,
+    base=Bernoulli(),
+    tol=1e-10,
+    Tmax=None,
+    ntau=None,
+    kappa=4.0,
+    T=10.0,
+    safety=1.3,
+    min_ntau=32,
+    max_ntau=1 << 15,
+    entry_chunk=1 << 15,
+):
+    """Sparse (BCOO) analogue of `smoothed_nodes`: `effects` is a list of `(alpha, mu,
+    var)` over the shared design `X`. Returns `(znodes, At0, At1, At2, hw, s, V)`."""
+    if not isinstance(base, Bernoulli):
+        raise TypeError(
+            "cf_offset sparse path supports only the Bernoulli (logistic) base; "
+            f"got {type(base).__name__}."
+        )
+    n = X.shape[0]
+    op = BCOOOperator(X)
+    idx = X.indices
+    rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
+    s0 = jnp.zeros(n)
+    V0 = jnp.zeros(n)
+    sp0 = jnp.zeros(n)
+    for alpha, mu, var in effects:  # moments only, to size the grid
+        mean, v, sp = _sparse_effect_moments(
+            op, rows, cols, vals, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var), n
+        )
+        s0 = s0 + mean
+        V0 = V0 + v
+        sp0 = sp0 + sp
+    Tmax, ntau, hw = _grid_size(
+        V0, sp0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau
+    )
+    tau, wq, psi = _frequency_grid(Tmax, ntau)
+    phi, s, V, _ = offset_cf_sparse(X, effects, tau, n=n, entry_chunk=entry_chunk)
+    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
+
+
+def build_aux_sparse(base, y, X, effects, M=48, entry_chunk=1 << 15, **kwargs):
+    """Compress-style aux for the sparse path -- same contract as `build_aux`, with the
+    offset CF folded over the shared BCOO design `X` and `effects = [(alpha, mu, var)]`."""
+    y = jnp.asarray(y)
+    znodes, At0, At1, At2, hw, s, V = smoothed_nodes_sparse(
+        X, effects, M, base=base, entry_chunk=entry_chunk, **kwargs
+    )
+    Vinv = jnp.asarray(_cheb_fit_matrix(M)[1])
+    fit = lambda vals: vals @ Vinv.T  # noqa: E731
+    sig = jax.nn.sigmoid(znodes)
+    A0 = jax.nn.softplus(znodes)
+    A2 = sig * (1.0 - sig)
+    z = jnp.zeros_like(hw)
     return y, z, z, hw, fit(A0 - At0), fit(sig - At1), fit(At2 - A2)
 
 
@@ -374,6 +505,14 @@ class CharFnOffset(Smoother):
         return build_aux(
             base, y, effects, self.M, tol=self.tol, kappa=self.kappa, T=self.T,
             safety=self.safety, ntau=ntau, Tmax=Tmax,
+        )
+
+    def build_aux_sparse(self, base, y, X, effects, ntau=None, Tmax=None,
+                         entry_chunk=1 << 15):
+        """Sparse (BCOO) build: `X` shared, `effects = [(alpha, mu, var)]`. Same aux."""
+        return build_aux_sparse(
+            base, y, X, effects, self.M, entry_chunk=entry_chunk, tol=self.tol,
+            kappa=self.kappa, T=self.T, safety=self.safety, ntau=ntau, Tmax=Tmax,
         )
 
     def terms(self, base: ResponseModel, eta, aux):

@@ -235,16 +235,10 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
-    # CAVI in Q2 (cf) is dense + uncentered in this MVP: CharFnOffset.build_aux folds
-    # the raw design, and pre-centering (a column-shift reparameterization) has not been
-    # validated with the CF fold. Reject sparse/centered here rather than fit the wrong
-    # model.
+    # CAVI in Q2 (cf) works on dense AND sparse (BCOO) designs -- the CF fold has a
+    # zero-clumping sparse path -- but always UNCENTERED: pre-centering (a column-shift
+    # reparameterization) fills the zeros and has not been validated with the CF fold.
     if kernel == "vi_gh":
-        if is_bcoo(X):
-            raise ValueError(
-                "offset_integration='cf' (CAVI in Q2) is dense-only in this MVP; "
-                "densify X."
-            )
         if center:
             raise ValueError(
                 "offset_integration='cf' does not support pre-centering yet; "

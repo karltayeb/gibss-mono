@@ -31,7 +31,11 @@ from .engine import (
     to_numpy_state_step,
 )
 from .cf_offset import CharFnOffset
-from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
+from .linear import (  # noqa: F401 (prep_data re-export)
+    is_bcoo,
+    prep_data,
+    update_prior_variance_index_step,
+)
 from .operators import CenteredOperator, as_operator
 from .response import Bernoulli, ResponseModel, Smoothed
 from .response_ser import (
@@ -217,14 +221,22 @@ def _cf_aux(data, state, l):
     construction (both are sum_{l'!=l} X (alpha mu))."""
     fs = state.family_state
     X = data.X
+    y = jnp.asarray(data.y)
+    if is_bcoo(X):
+        # sparse: the design is shared, so an effect is just its (alpha, mu, var) law;
+        # the CF build exploits the zeros (zero-clumping).
+        effects = [
+            (e.alpha, e.mu, e.var)
+            for j, e in enumerate(state.single_effects)
+            if j != l
+        ]
+        return fs.response.smoother.build_aux_sparse(fs.response.base, y, X, effects)
     effects = [
         (X, e.alpha, e.mu, e.var)
         for j, e in enumerate(state.single_effects)
         if j != l
     ]
-    return fs.response.smoother.build_aux(
-        fs.response.base, jnp.asarray(data.y), effects
-    )
+    return fs.response.smoother.build_aux(fs.response.base, y, effects)
 
 
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
