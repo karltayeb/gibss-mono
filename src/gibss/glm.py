@@ -30,6 +30,7 @@ from .engine import (
     subtract_message_index_step,
     to_numpy_state_step,
 )
+from .cf_offset import CharFnOffset
 from .linear import prep_data, update_prior_variance_index_step  # noqa: F401 (re-export)
 from .operators import CenteredOperator, as_operator
 from .response import Bernoulli, ResponseModel, Smoothed
@@ -42,6 +43,7 @@ from .response_ser import (
     glm_linear_ser,
     glm_profile_ser,
     glm_ser,
+    glm_vi_gh_ser,
     glm_vi_profile_ser,
     glm_vi_ser,
 )
@@ -102,6 +104,12 @@ class GLMFamilyState:
     #             JJEnvelope: classic localjj (shared) / centered localjj (profiled).
     #   "jj"      glm_jj_ser -- conjugate quadratic-bound SER (classic localjj);
     #             the kernel tunes the per-entry tilt itself. Shared intercept only.
+    #   "vi_gh"   glm_vi_gh_ser -- Gaussian q(b|gamma) integrated by GH over b against
+    #             an EXACT offset-integrated cumulant (response = Smoothed(base,
+    #             CharFnOffset())): CAVI in Q2. The offset table is built per update
+    #             from the OTHER effects' Gaussian-mixture laws (not the message), so
+    #             the offset is the true mixture, not a single Gaussian. Shared
+    #             intercept, dense, logistic (MVP).
     # `background` ("exact" O(n*p) / "chebyshev" O(n*D + D*p)) and `node_intercept`
     # ("linear"|"newton", quad only) apply to the profiled-intercept variants.
     kernel: str = "quad"
@@ -127,10 +135,26 @@ class GLMFamilyState:
                 f"kernel={self.kernel!r} was split into orthogonal axes: use "
                 f"kernel={legacy[self.kernel]!r}, intercept='profiled'."
             )
-        if self.kernel not in ("quad", "linear", "vi", "jj"):
+        if self.kernel not in ("quad", "linear", "vi", "jj", "vi_gh"):
             raise ValueError(
-                f"unknown kernel {self.kernel!r}; use 'quad', 'linear', 'vi' or 'jj'"
+                f"unknown kernel {self.kernel!r}; use 'quad', 'linear', 'vi', 'jj' "
+                f"or 'vi_gh'"
             )
+        if self.kernel == "vi_gh":
+            ok = isinstance(self.response, Smoothed) and isinstance(
+                self.response.smoother, CharFnOffset
+            )
+            if not ok:
+                raise ValueError(
+                    "kernel='vi_gh' (CAVI in Q2) needs response = Smoothed(base, "
+                    f"CharFnOffset()); got {self.response!r}."
+                )
+            if self.intercept == "profiled":
+                raise ValueError(
+                    "kernel='vi_gh' has no profiled-intercept variant yet (the "
+                    "intercept would need integrating over the effect mixture too); "
+                    "use intercept='shared' or 'null'."
+                )
         if self.intercept not in ("shared", "profiled", "null"):
             raise ValueError(
                 f"unknown intercept {self.intercept!r}; use 'shared', 'profiled' "
@@ -181,6 +205,26 @@ def _aux(data, state, include_intercept_var=True):
     if fs.response.smoother.takes_row_param and fs.kernel != "jj":
         return y, ov, jnp.asarray(fs.row_param)
     return y, ov
+
+
+def _cf_aux(data, state, l):
+    """Kernel aux for CAVI in Q2 (kernel='vi_gh'): the CharFnOffset table built from
+    every OTHER effect's Gaussian-mixture posterior in EFFECT space (x, alpha, mu, var).
+    Unlike `_aux` (which only sees the aggregate message), this reads the individual
+    effect laws -- the offset is their exact mixture, not a moment-matched Gaussian. The
+    offset MEAN lives in eta (the table is centered at 0); the caller's `offset` (LOO
+    message mean + intercept) carries it, and equals the table's internal s by
+    construction (both are sum_{l'!=l} X (alpha mu))."""
+    fs = state.family_state
+    X = data.X
+    effects = [
+        (X, e.alpha, e.mu, e.var)
+        for j, e in enumerate(state.single_effects)
+        if j != l
+    ]
+    return fs.response.smoother.build_aux(
+        fs.response.base, jnp.asarray(data.y), effects
+    )
 
 
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
@@ -238,6 +282,12 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     elif fs.kernel == "vi":
         mu, var, log_bf, coefficient_kl = glm_vi_ser(
             op, aux, offset, prior_variance, fs.response,
+        )
+    elif fs.kernel == "vi_gh":
+        # CAVI in Q2: `aux` is the CharFnOffset table built from the OTHER effects'
+        # Gaussian-mixture laws (by _cf_aux, in the effect step); GH integrates b.
+        mu, var, log_bf, coefficient_kl = glm_vi_gh_ser(
+            op, aux, offset, prior_variance, fs.response, order=order,
         )
     else:  # jj (shared only, validated at construction)
         mu, var, log_bf, coefficient_kl = glm_jj_ser(
@@ -355,7 +405,17 @@ def estimate_intercept(data, state):
     alternation for a point estimate -- no b to integrate here).
     Returns (b0, v0)."""
     fs = state.family_state
-    aux = _aux(data, state, include_intercept_var=False)
+    if fs.kernel == "vi_gh":
+        # CAVI-in-Q2 MVP: a point intercept on the BASE cumulant at the full mean
+        # predictor. Offset integration applies to the EFFECTS (where Q2 CAVI matters);
+        # integrating the intercept over the effect mixture is a follow-up. Using the
+        # CharFnOffset-wrapped response here would be wrong anyway -- its aux is the
+        # per-effect table, not (y, ov).
+        response = fs.response.base
+        aux = jnp.asarray(data.y)
+    else:
+        response = fs.response
+        aux = _aux(data, state, include_intercept_var=False)
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset
 
     def terms_at(b0):
@@ -363,8 +423,8 @@ def estimate_intercept(data, state):
         if fs.kernel == "jj":
             y, ov = aux
             xi = jnp.sqrt(eta**2 + ov)
-            return fs.response.terms(eta, (y, ov, xi))
-        return fs.response.terms(eta, aux)
+            return response.terms(eta, (y, ov, xi))
+        return response.terms(eta, aux)
 
     def body(s):
         b0, it = s
@@ -421,8 +481,13 @@ def update_effect_index_step(data, l, state):
     # profiled: offset is the leave-one-out message (+ base glm_offset; b0 profiled
     # per feature); shared-intercept (quad/jj): also add the estimated intercept. A
     # Smoothed response additionally receives the LOO message variance through aux.
+    # For CAVI in Q2 (vi_gh) the aux is instead the exact offset table built from the
+    # OTHER effects' laws (the LOO message MEAN still carries the offset mean in eta).
     offset = _effect_offset(fs, state)
-    new_effect = _fit_effect(data, fs, _aux(data, state), offset, effect.prior_variance, fs.quadrature_order)
+    aux = _cf_aux(data, state, l) if fs.kernel == "vi_gh" else _aux(data, state)
+    new_effect = _fit_effect(
+        data, fs, aux, offset, effect.prior_variance, fs.quadrature_order
+    )
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 

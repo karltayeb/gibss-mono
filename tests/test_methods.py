@@ -139,7 +139,9 @@ def test_prior_variance_threads_through():
     assert all(e.prior_variance == 0.5 for e in st.single_effects)
 
 
-@pytest.mark.parametrize("method", sorted(PRESETS))
+# cf_cavi (CAVI in Q2) is dense-only in this MVP -- it raises on BCOO rather than
+# falling back (see test_cf_cavi_engine.test_cf_cavi_guards for the sparse rejection).
+@pytest.mark.parametrize("method", [m for m in sorted(PRESETS) if m != "cf_cavi"])
 def test_every_preset_runs_on_sparse(method):
     # the center=None default must be layout- AND kernel-aware: on a BCOO design only
     # the quad kernel consumes centering, so every OTHER preset must fall back to

@@ -18,6 +18,7 @@ family, Gaussian q without a smoothing scheme).
 from __future__ import annotations
 
 from . import glm
+from .cf_offset import CharFnOffset
 from .engine import fit_ibss, fit_ibss_greedy
 from .linear import is_bcoo
 from .response import (
@@ -49,6 +50,10 @@ _SMOOTHERS = {
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
+    # cf: exact mixture-offset via the characteristic function (CAVI in Q2). Handled
+    # specially in _resolve (it forces the vi_gh kernel), but listed here so the
+    # offset_integration name validates.
+    "cf": lambda cfg: CharFnOffset(M=cfg["compress_degree"]),
 }
 
 _DEFAULTS = {
@@ -58,6 +63,7 @@ _DEFAULTS = {
     "offset_integration": "none",  # "none" | key of _SMOOTHERS
     "offset_quadrature_points": 15,
     "effect_quadrature_points": 15,
+    "compress_degree": 48,  # Chebyshev degree M for the cf offset table
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
@@ -72,6 +78,7 @@ PRESETS = {
     "linear": {"family": "gaussian"},
     "smoothed": {"offset_integration": "gh"},
     "localjj": {"variational_family": "gaussian", "offset_integration": "jj"},
+    "cf_cavi": {"variational_family": "gaussian", "offset_integration": "cf"},
     "globaljj": {"offset_integration": "jj_fixed"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
@@ -126,6 +133,18 @@ def _resolve(cfg):
         elif integ == "jj" and vfam == "gaussian" and cfg["intercept"] == "shared":
             # conjugate classic localjj; Smoother.validate rejects non-Bernoulli
             return Smoothed(base, JJFixed()), "jj"
+        elif integ == "cf":
+            # exact mixture-offset CAVI in Q2: the offset is integrated over the other
+            # effects' Gaussian MIXTURE (via the characteristic function), and the
+            # effect b by GH -> the vi_gh kernel. Gaussian q only; Bernoulli only
+            # (CharFnOffset.validate). Built per-update from the effect laws, so the
+            # engine dispatches on the vi_gh kernel (not the generic vi seam).
+            if vfam != "gaussian":
+                raise ValueError(
+                    "offset_integration='cf' (CAVI in Q2) needs "
+                    "variational_family='gaussian'; the effect q must be Gaussian."
+                )
+            return Smoothed(base, CharFnOffset(M=cfg["compress_degree"])), "vi_gh"
         else:
             response = Smoothed(base, _SMOOTHERS[integ](cfg))
 
@@ -215,6 +234,23 @@ def fit_glm_susie(
     }
 
     response, kernel = _resolve(cfg)
+
+    # CAVI in Q2 (cf) is dense + uncentered in this MVP: CharFnOffset.build_aux folds
+    # the raw design, and pre-centering (a column-shift reparameterization) has not been
+    # validated with the CF fold. Reject sparse/centered here rather than fit the wrong
+    # model.
+    if kernel == "vi_gh":
+        if is_bcoo(X):
+            raise ValueError(
+                "offset_integration='cf' (CAVI in Q2) is dense-only in this MVP; "
+                "densify X."
+            )
+        if center:
+            raise ValueError(
+                "offset_integration='cf' does not support pre-centering yet; "
+                "pass center=False."
+            )
+        center = False
 
     # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
     # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row
