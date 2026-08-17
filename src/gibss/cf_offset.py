@@ -87,7 +87,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax.ops import segment_max, segment_min, segment_sum
+from jax.ops import segment_sum
 
 from ._numerics import _cheb_fit_matrix, _clenshaw_batched
 from .operators import BCOOOperator
@@ -139,23 +139,21 @@ def _concrete_or_none(x):
 
 
 def effect_moments(effect: Effect):
-    """Per-row mean, variance, and between-component mean-spread of one effect's row
-    contribution `o_li = x_ic b`, all `(n,)` and formed WITHOUT an `(n, C, .)` tensor.
+    """Per-row mean and variance of one effect's row contribution `o_li = x_ic b`, both
+    `(n,)` and formed WITHOUT an `(n, C)` intermediate beyond the design itself.
 
-    mean   E[o_li] = sum_c alpha_c x_ic mu_c
-    var    Var[o_li] = sum_c alpha_c x_ic^2 (mu_c^2 + var_c) - mean^2  (mixture variance:
-           within-component + between-component, so it already captures multimodality)
-    spread max_c x_ic mu_c - min_c x_ic mu_c  (a conservative extra alias driver)
+    mean  E[o_li]   = sum_c alpha_c x_ic mu_c
+    var   Var[o_li] = sum_c alpha_c x_ic^2 (mu_c^2 + var_c) - mean^2   -- the MIXTURE
+          variance (within + between component), so it already captures the offset's
+          spread including multimodality, and is ALPHA-WEIGHTED (a near-zero-alpha
+          component with a huge mean contributes ~nothing, unlike a raw mean range).
     """
     x, alpha, mu, var = effect
     x = jnp.asarray(x)
     alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
     mean = x @ (alpha * mu)
     second = (x**2) @ (alpha * (mu**2 + var))
-    v = jnp.maximum(second - mean**2, 0.0)
-    xm = x * mu[None, :]  # (n, C) -- same order as the design, no ntau axis
-    spread = jnp.max(xm, axis=-1) - jnp.min(xm, axis=-1)
-    return mean, v, spread
+    return mean, jnp.maximum(second - mean**2, 0.0)
 
 
 def _effect_cf(effect: Effect, tau):
@@ -188,7 +186,7 @@ def offset_cf(effects, tau, n=None):
 
     Effects are combined by multiplying their factors -- no sequential peel, no rebuild.
     Only the changed effect's factor need be recomputed by the caller across updates.
-    Peak memory `O(n, ntau)` (one running product)."""
+    Peak memory `O(n, ntau)` (one running product). Returns `(phi, s, V)`."""
     tau = jnp.asarray(tau)
     if n is None:
         if not effects:
@@ -197,26 +195,28 @@ def offset_cf(effects, tau, n=None):
     phi = jnp.ones((n, tau.shape[0]), dtype=jnp.complex128)
     s = jnp.zeros(n)
     V = jnp.zeros(n)
-    spread = jnp.zeros(n)
     for effect in effects:
-        mean, v, sp = effect_moments(effect)
+        mean, v = effect_moments(effect)
         s = s + mean
         V = V + v
-        spread = spread + sp
         phi = phi * _effect_cf(effect, tau)
     phi = phi * jnp.exp(-1j * (tau[None, :] * s[:, None]))  # center to zero mean
-    return phi, s, V, spread
+    return phi, s, V
 
 
-def _grid_size(V, spread, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau):
-    """Adaptive `(Tmax, ntau, hw)` for the CF quadrature. `hw = T + kappa sqrt(V)` is
-    the per-row fit half-width (it already covers multimodality since `V` is the mixture
-    variance). `Tmax` is the logistic kernel tail. `ntau` satisfies the Nyquist bound
-    `ntau >= Tmax * driver / pi`, `driver = max_i(hw_i + spread_i)`; when `ntau` is
-    given it is only guarded (raise on aliasing), never shrunk."""
-    hw = T + kappa * jnp.sqrt(jnp.maximum(V, 0.0))
+def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau):
+    """Adaptive `(Tmax, ntau, hw)` for the CF quadrature. `hw = T + kappa sqrt(V)` is the
+    per-row fit half-width. `Tmax` is the logistic kernel tail. `ntau` meets the Nyquist
+    bound `ntau >= Tmax * driver / pi`, with `driver = max_i(hw_i + kappa sqrt(V_i))` --
+    the position content of `Atilde(z) = (A * q_o)(z)` is the sample range `hw` convolved
+    with the offset support `~kappa sqrt(V)`. Crucially the driver is ALPHA-WEIGHTED (via
+    the mixture variance V), so thousands of near-zero-alpha features with large means do
+    NOT inflate the grid -- their CF amplitude is below tolerance. When `ntau` is passed
+    it is only guarded (raise on aliasing), never shrunk."""
+    sd = kappa * jnp.sqrt(jnp.maximum(V, 0.0))
+    hw = T + sd
     Tmax = _psi_tail_Tmax(tol) if Tmax is None else float(Tmax)
-    driver = _concrete_or_none(jnp.max(hw + spread))
+    driver = _concrete_or_none(jnp.max(hw + sd))
     if ntau is None:
         if driver is None:
             raise ValueError(
@@ -227,7 +227,7 @@ def _grid_size(V, spread, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
         if req > max_ntau:
             raise ValueError(
                 f"cf_offset: required ntau={req} exceeds max_ntau={max_ntau} (driver "
-                f"hw+spread={driver:.1f}, Tmax={Tmax:.1f}); offset variance too large."
+                f"hw+sd={driver:.1f}, Tmax={Tmax:.1f}); offset variance too large."
             )
         ntau = min(max(req, min_ntau), max_ntau)
     else:
@@ -237,7 +237,7 @@ def _grid_size(V, spread, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
             if ntau < req:
                 raise ValueError(
                     f"cf_offset: ntau={ntau} violates the Nyquist bound (need >= {req} "
-                    f"for driver hw+spread={driver:.1f}, Tmax={Tmax:.1f}); the CF product "
+                    f"for driver hw+sd={driver:.1f}, Tmax={Tmax:.1f}); the CF product "
                     "would alias. Raise ntau, or leave ntau=None to auto-size."
                 )
     return Tmax, ntau, hw
@@ -277,19 +277,12 @@ def smoothed_nodes(
 
     # --- offset moments + adaptive alias-safe grid (concrete/eager) ---
     # a light first pass for the moments only (no ntau), to size the grid
-    s0 = jnp.zeros(n)
     V0 = jnp.zeros(n)
-    sp0 = jnp.zeros(n)
     for effect in effects:
-        mean, v, sp = effect_moments(effect)
-        s0 = s0 + mean
-        V0 = V0 + v
-        sp0 = sp0 + sp
-    Tmax, ntau, hw = _grid_size(
-        V0, sp0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau
-    )
+        V0 = V0 + effect_moments(effect)[1]
+    Tmax, ntau, hw = _grid_size(V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
     tau, wq, psi = _frequency_grid(Tmax, ntau)
-    phi, s, V, _ = offset_cf(effects, tau, n=n)  # zero-mean product of per-effect CFs
+    phi, s, V = offset_cf(effects, tau, n=n)  # zero-mean product of per-effect CFs
     return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
 
 
@@ -357,18 +350,12 @@ def build_aux(base, y, effects, M=48, **kwargs):
 # --------------------------------------------------------------------------------------
 
 
-def _sparse_effect_moments(op, rows, cols, vals, alpha, mu, var, n):
-    """Per-row mean, variance, and between-component mean-spread of one effect on a
-    sparse design (all O(nnz), no dense fill). `op` is the BCOOOperator."""
+def _sparse_effect_moments(op, alpha, mu, var):
+    """Per-row mean and (alpha-weighted mixture) variance of one effect on a sparse
+    design (O(nnz), no dense fill). `op` is the BCOOOperator."""
     mean = op.matvec(alpha * mu)  # sum_c x_ic alpha_c mu_c
     second = op.matvec_sq(alpha * (mu**2 + var))
-    v = jnp.maximum(second - mean**2, 0.0)
-    # mean atoms per row are {x_ic mu_c : c in supp(i)} plus 0 (the off-support mass);
-    # the spread includes 0 so a one-sided support is measured from the origin.
-    xm = vals * mu[cols]
-    hi = jnp.maximum(segment_max(xm, rows, num_segments=n), 0.0)
-    lo = jnp.minimum(segment_min(xm, rows, num_segments=n), 0.0)
-    return mean, v, hi - lo
+    return mean, jnp.maximum(second - mean**2, 0.0)
 
 
 def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15):
@@ -381,7 +368,7 @@ def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15):
     alpha_lc, so only the nnz support entries carry t-dependence. The support sum is a
     per-row `segment_sum` over the BCOO entries, chunked (`entry_chunk`) to bound peak
     memory at `O(entry_chunk * ntau)`. `effects` is a list of `(alpha, mu, var)` (each
-    (p,)); X is shared. Returns `(phi, s, V, spread)` -- `phi` (n, ntau) centered."""
+    (p,)); X is shared. Returns `(phi, s, V)` -- `phi` (n, ntau) centered."""
     tau = jnp.asarray(tau)
     ntau = tau.shape[0]
     op = BCOOOperator(X)
@@ -392,14 +379,12 @@ def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15):
 
     s = jnp.zeros(n)
     V = jnp.zeros(n)
-    spread = jnp.zeros(n)
     phi = jnp.ones((n, ntau), dtype=jnp.complex128)
     for alpha, mu, var in effects:
         alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
-        mean, v, sp = _sparse_effect_moments(op, rows, cols, vals, alpha, mu, var, n)
+        mean, v = _sparse_effect_moments(op, alpha, mu, var)
         s = s + mean
         V = V + v
-        spread = spread + sp
         acc = jnp.zeros((n, ntau), dtype=jnp.complex128)
         for k0 in range(0, nnz, entry_chunk):
             k1 = min(k0 + entry_chunk, nnz)
@@ -411,7 +396,7 @@ def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15):
             acc = acc + segment_sum(g, r, num_segments=n)
         phi = phi * (1.0 + acc)
     phi = phi * jnp.exp(-1j * (tau[None, :] * s[:, None]))  # center to zero mean
-    return phi, s, V, spread
+    return phi, s, V
 
 
 def smoothed_nodes_sparse(
@@ -439,23 +424,14 @@ def smoothed_nodes_sparse(
         )
     n = X.shape[0]
     op = BCOOOperator(X)
-    idx = X.indices
-    rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
-    s0 = jnp.zeros(n)
     V0 = jnp.zeros(n)
-    sp0 = jnp.zeros(n)
-    for alpha, mu, var in effects:  # moments only, to size the grid
-        mean, v, sp = _sparse_effect_moments(
-            op, rows, cols, vals, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var), n
-        )
-        s0 = s0 + mean
-        V0 = V0 + v
-        sp0 = sp0 + sp
-    Tmax, ntau, hw = _grid_size(
-        V0, sp0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau
-    )
+    for alpha, mu, var in effects:  # variance only, to size the grid
+        V0 = V0 + _sparse_effect_moments(
+            op, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
+        )[1]
+    Tmax, ntau, hw = _grid_size(V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
     tau, wq, psi = _frequency_grid(Tmax, ntau)
-    phi, s, V, _ = offset_cf_sparse(X, effects, tau, n=n, entry_chunk=entry_chunk)
+    phi, s, V = offset_cf_sparse(X, effects, tau, n=n, entry_chunk=entry_chunk)
     return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
 
 

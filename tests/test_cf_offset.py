@@ -135,7 +135,7 @@ def test_moments_match_message_convention():
     n, C = 20, 4
     effects = _rand_effects(rng, n, L=3, C=C)
     tau = jnp.linspace(0.0, 5.0, 64)
-    _, s, V, _ = offset_cf(effects, tau)
+    _, s, V = offset_cf(effects, tau)
     s_ref = np.zeros(n)
     V_ref = np.zeros(n)
     for x, a, mu, var in effects:
@@ -153,7 +153,7 @@ def test_cf_at_zero_is_one():
     rng = np.random.default_rng(5)
     effects = _rand_effects(rng, n=6, L=2, C=3)
     tau = jnp.linspace(0.0, 4.0, 33)
-    phi, s, V, _ = offset_cf(effects, tau)
+    phi, s, V = offset_cf(effects, tau)
     assert np.allclose(np.asarray(phi[:, 0]), 1.0 + 0.0j, atol=1e-12)
 
 
