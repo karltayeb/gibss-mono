@@ -77,10 +77,12 @@ def test_cf_cavi_fixed_point_self_consistent():
         )
 
 
-def _brute_atilde1_deriv(x1, alpha1, mu1, var1, eta, which, gh_order=200):
+def _brute_atilde1_deriv(x1, alpha1, mu1, var1, eta, which, gh_order=200, extra_var=0.0):
     """Exact derivative (0:A, 1:A', 2:A'') of the ZERO-MEAN offset from a SINGLE effect
     with law (alpha1, mu1, var1) over its features and design columns x1 (n, C), at
-    points `eta` (leading axis n). GH over each Gaussian component."""
+    points `eta` (leading axis n). GH over each Gaussian component. `extra_var` folds one
+    extra homogeneous zero-mean Gaussian (the shared intercept's N(0, v0)) into the
+    offset -- a convolution, so it just ADDS to every component's variance."""
     n, C = x1.shape
     s1 = x1 @ (alpha1 * mu1)  # effect mean (removed for the zero-mean law)
     nodes, wts = np.polynomial.hermite.hermgauss(gh_order)
@@ -95,7 +97,7 @@ def _brute_atilde1_deriv(x1, alpha1, mu1, var1, eta, which, gh_order=200):
     for c in range(C):
         w = alpha1[c]
         mean = (x1[:, c] * mu1[c] - s1).reshape((n,) + extra)
-        sd = np.sqrt(x1[:, c] ** 2 * var1[c]).reshape((n,) + extra)
+        sd = np.sqrt(x1[:, c] ** 2 * var1[c] + extra_var).reshape((n,) + extra)
         for gk, wk in zip(nodes, wts):
             out = out + w * wk * f(eta + mean + np.sqrt(2.0) * sd * gk)
     return out
@@ -126,6 +128,9 @@ def test_cf_cavi_matches_exact_cavi_stationarity():
     v0 = np.asarray(e0.var)
     pv0 = float(e0.prior_variance)
     offset0 = b0_int + Xn @ (a1 * mu1)  # intercept + effect-1 mean (the offset mean)
+    # CAVI in Q2 folds the intercept's Gaussian factor N(0, v0_int) into the effect
+    # offset too (b0 is a unit-column effect), so the reference must convolve with it.
+    v_int = float(st.family_state.intercept_var)
 
     order = 40
     gnodes, gwts = np.polynomial.hermite.hermgauss(order)
@@ -133,14 +138,49 @@ def test_cf_cavi_matches_exact_cavi_stationarity():
     b_pts = m0[None, :] + np.sqrt(2.0 * v0)[None, :] * gnodes[:, None]  # (order, p)
     eta = offset0[:, None, None] + Xn[:, :, None] * b_pts.T[None, :, :]  # (n, p, order)
 
-    A1 = _brute_atilde1_deriv(Xn, a1, mu1, var1, eta, which=1)
-    A2 = _brute_atilde1_deriv(Xn, a1, mu1, var1, eta, which=2)
+    A1 = _brute_atilde1_deriv(Xn, a1, mu1, var1, eta, which=1, extra_var=v_int)
+    A2 = _brute_atilde1_deriv(Xn, a1, mu1, var1, eta, which=2, extra_var=v_int)
     Eb_g = np.einsum("k,npk->np", gwts, np.asarray(y)[:, None, None] - A1)
     Eb_w = np.einsum("k,npk->np", gwts, A2)
     grad_m = np.sum(Xn * Eb_g, axis=0) - m0 / pv0
     prec = 1.0 / pv0 + np.sum(Xn**2 * Eb_w, axis=0)
     assert np.max(np.abs(grad_m)) < 1e-3, f"grad_m={grad_m}"
     assert np.allclose(1.0 / v0, prec, rtol=1e-2, atol=1e-3)
+
+
+def test_cf_cavi_intercept_stationarity():
+    """At convergence the shared intercept q(b0)=N(m0,v0) satisfies its OWN flat-prior
+    CAVI stationarity as a unit-ones-column effect: b0 solves the GH-averaged score
+    against the (single) effect's offset-integrated cumulant, and 1/v0 = sum_i E_b0[A''].
+    Validates `_intercept_vi_gh` independently of the engine (L=1 so the b0 offset is one
+    effect, reusable via `_brute_atilde1_deriv`)."""
+    rng = np.random.default_rng(7)
+    X, y = _logit_data(rng, n=250, p=5, signal_idx=[2], signal_val=[1.8])
+    st = fit_glm_susie(
+        X, y, L=1, method="cf_cavi", max_iter=300, tol=1e-10,
+        estimate_prior_variance=False, prior_variance=1.0,
+    )
+    e0 = st.single_effects[0]
+    Xn = np.asarray(X)
+    a0, mu0, var0 = np.asarray(e0.alpha), np.asarray(e0.mu), np.asarray(e0.var)
+    m0 = float(st.family_state.intercept_value)
+    v0 = float(st.family_state.intercept_var)
+    offmean = Xn @ (a0 * mu0)  # effect-0 mean = the offset mean for b0 (unit column)
+
+    order = 40
+    gn, gw = np.polynomial.hermite.hermgauss(order)
+    gw = gw / np.sqrt(np.pi)
+    b_pts = m0 + np.sqrt(2.0 * v0) * gn  # (order,)  b0 ~ N(m0, v0)
+    eta = offmean[:, None] + b_pts[None, :]  # (n, order); x0 = 1
+    A1 = _brute_atilde1_deriv(Xn, a0, mu0, var0, eta, which=1)
+    A2 = _brute_atilde1_deriv(Xn, a0, mu0, var0, eta, which=2)
+    Eb_g = np.einsum("k,nk->n", gw, np.asarray(y)[:, None] - A1)
+    Eb_w = np.einsum("k,nk->n", gw, A2)
+    # flat prior: the score sums to 0 at stationarity. The unit column does not cancel
+    # (unlike the +-1 design columns), so the per-row M=48 Chebyshev table error (~6e-5)
+    # accumulates coherently -- assert the n-INDEPENDENT per-observation residual.
+    assert abs(np.sum(Eb_g)) / len(y) < 2e-4
+    assert np.isclose(1.0 / v0, np.sum(Eb_w), rtol=2e-2, atol=1e-2)
 
 
 def test_cf_cavi_guards():

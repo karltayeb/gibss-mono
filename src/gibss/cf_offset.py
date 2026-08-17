@@ -179,14 +179,19 @@ def _effect_cf(effect: Effect, tau):
     return phi_l
 
 
-def offset_cf(effects, tau, n=None):
+def offset_cf(effects, tau, n=None, offset_var=0.0):
     """Zero-mean offset characteristic function, eq. (2): the PRODUCT of the per-effect
     factors, centered by the total offset mean `s`. Returns `(phi, s, V, spread)` with
     `phi` `(n, ntau)` complex (centered), and `s, V, spread` `(n,)`.
 
     Effects are combined by multiplying their factors -- no sequential peel, no rebuild.
     Only the changed effect's factor need be recomputed by the caller across updates.
-    Peak memory `O(n, ntau)` (one running product). Returns `(phi, s, V)`."""
+    Peak memory `O(n, ntau)` (one running product). Returns `(phi, s, V)`.
+
+    `offset_var` (scalar or `(n,)`) adds one extra HOMOGENEOUS zero-mean Gaussian
+    `N(0, offset_var)` to the offset -- e.g. the shared intercept's posterior variance
+    `q(b0) = N(m0, v0)` on the all-ones column (its mean m0 lives in eta). A zero-mean
+    Gaussian has CF `exp(-1/2 t^2 offset_var)`, so it just scales `phi` and adds to `V`."""
     tau = jnp.asarray(tau)
     if n is None:
         if not effects:
@@ -200,6 +205,9 @@ def offset_cf(effects, tau, n=None):
         s = s + mean
         V = V + v
         phi = phi * _effect_cf(effect, tau)
+    ov = jnp.asarray(offset_var)
+    V = V + ov  # extra zero-mean Gaussian offset component (e.g. intercept variance)
+    phi = phi * jnp.exp(-0.5 * (ov[..., None] if ov.ndim else ov) * tau[None, :] ** 2)
     phi = phi * jnp.exp(-1j * (tau[None, :] * s[:, None]))  # center to zero mean
     return phi, s, V
 
@@ -257,6 +265,7 @@ def smoothed_nodes(
     safety=1.3,
     min_ntau=32,
     max_ntau=1 << 15,
+    offset_var=0.0,
 ):
     """Offset-integrated cumulant `Atilde` and its first two z-derivatives at per-row
     CGL nodes, via the psi-tamed residual CF quadrature (logistic base only).
@@ -264,7 +273,10 @@ def smoothed_nodes(
     `effects` is the leave-one-out set (all effects EXCEPT the one being updated), each
     `(x, alpha, mu, var)` in effect space. Returns `(znodes, At0, At1, At2, hw, s, V)`:
     `znodes, At0..At2` are `(n, M+1)`; `hw, s, V` are `(n,)`. `znodes` are centered at 0
-    (the offset mean `s` is returned separately for the caller to carry in eta)."""
+    (the offset mean `s` is returned separately for the caller to carry in eta).
+
+    `offset_var` folds one extra homogeneous zero-mean Gaussian into the offset (e.g. the
+    shared intercept's posterior variance), sized into the grid and the CF alike."""
     if not isinstance(base, Bernoulli):
         raise TypeError(
             "cf_offset.smoothed_nodes supports only the Bernoulli (logistic) base; "
@@ -277,12 +289,12 @@ def smoothed_nodes(
 
     # --- offset moments + adaptive alias-safe grid (concrete/eager) ---
     # a light first pass for the moments only (no ntau), to size the grid
-    V0 = jnp.zeros(n)
+    V0 = jnp.zeros(n) + jnp.asarray(offset_var)
     for effect in effects:
         V0 = V0 + effect_moments(effect)[1]
     Tmax, ntau, hw = _grid_size(V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
     tau, wq, psi = _frequency_grid(Tmax, ntau)
-    phi, s, V = offset_cf(effects, tau, n=n)  # zero-mean product of per-effect CFs
+    phi, s, V = offset_cf(effects, tau, n=n, offset_var=offset_var)  # + intercept var
     return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
 
 
@@ -358,7 +370,7 @@ def _sparse_effect_moments(op, alpha, mu, var):
     return mean, jnp.maximum(second - mean**2, 0.0)
 
 
-def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15):
+def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15, offset_var=0.0):
     """Zero-mean offset CF on a sparse (BCOO) design via the zero-clumping identity
 
         phi_l,i(t) = 1 + sum_{c in supp(i)} alpha_lc (exp(i t x_ic mu_lc
@@ -395,6 +407,9 @@ def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15):
             )
             acc = acc + segment_sum(g, r, num_segments=n)
         phi = phi * (1.0 + acc)
+    ov = jnp.asarray(offset_var)
+    V = V + ov  # extra zero-mean Gaussian offset component (e.g. intercept variance)
+    phi = phi * jnp.exp(-0.5 * (ov[..., None] if ov.ndim else ov) * tau[None, :] ** 2)
     phi = phi * jnp.exp(-1j * (tau[None, :] * s[:, None]))  # center to zero mean
     return phi, s, V
 
@@ -414,9 +429,11 @@ def smoothed_nodes_sparse(
     min_ntau=32,
     max_ntau=1 << 15,
     entry_chunk=1 << 15,
+    offset_var=0.0,
 ):
     """Sparse (BCOO) analogue of `smoothed_nodes`: `effects` is a list of `(alpha, mu,
-    var)` over the shared design `X`. Returns `(znodes, At0, At1, At2, hw, s, V)`."""
+    var)` over the shared design `X`. Returns `(znodes, At0, At1, At2, hw, s, V)`.
+    `offset_var` folds one extra homogeneous zero-mean Gaussian (e.g. intercept var)."""
     if not isinstance(base, Bernoulli):
         raise TypeError(
             "cf_offset sparse path supports only the Bernoulli (logistic) base; "
@@ -424,14 +441,16 @@ def smoothed_nodes_sparse(
         )
     n = X.shape[0]
     op = BCOOOperator(X)
-    V0 = jnp.zeros(n)
+    V0 = jnp.zeros(n) + jnp.asarray(offset_var)
     for alpha, mu, var in effects:  # variance only, to size the grid
         V0 = V0 + _sparse_effect_moments(
             op, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
         )[1]
     Tmax, ntau, hw = _grid_size(V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
     tau, wq, psi = _frequency_grid(Tmax, ntau)
-    phi, s, V = offset_cf_sparse(X, effects, tau, n=n, entry_chunk=entry_chunk)
+    phi, s, V = offset_cf_sparse(
+        X, effects, tau, n=n, entry_chunk=entry_chunk, offset_var=offset_var
+    )
     return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
 
 
@@ -477,18 +496,20 @@ class CharFnOffset(Smoother):
                 f"got {type(base).__name__}."
             )
 
-    def build_aux(self, base, y, effects, ntau=None, Tmax=None):
+    def build_aux(self, base, y, effects, ntau=None, Tmax=None, offset_var=0.0):
         return build_aux(
             base, y, effects, self.M, tol=self.tol, kappa=self.kappa, T=self.T,
-            safety=self.safety, ntau=ntau, Tmax=Tmax,
+            safety=self.safety, ntau=ntau, Tmax=Tmax, offset_var=offset_var,
         )
 
     def build_aux_sparse(self, base, y, X, effects, ntau=None, Tmax=None,
-                         entry_chunk=1 << 15):
-        """Sparse (BCOO) build: `X` shared, `effects = [(alpha, mu, var)]`. Same aux."""
+                         entry_chunk=1 << 15, offset_var=0.0):
+        """Sparse (BCOO) build: `X` shared, `effects = [(alpha, mu, var)]`. Same aux.
+        `offset_var` folds an extra homogeneous zero-mean Gaussian (intercept var)."""
         return build_aux_sparse(
             base, y, X, effects, self.M, entry_chunk=entry_chunk, tol=self.tol,
             kappa=self.kappa, T=self.T, safety=self.safety, ntau=ntau, Tmax=Tmax,
+            offset_var=offset_var,
         )
 
     def terms(self, base: ResponseModel, eta, aux):
