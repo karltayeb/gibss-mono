@@ -271,10 +271,14 @@ def smoothed_nodes(
 
     # --- offset moments + adaptive alias-safe grid (concrete/eager) ---
     # a light first pass for the moments only (no ntau), to size the grid
-    s0 = jnp.zeros(n); V0 = jnp.zeros(n); sp0 = jnp.zeros(n)
+    s0 = jnp.zeros(n)
+    V0 = jnp.zeros(n)
+    sp0 = jnp.zeros(n)
     for effect in effects:
         mean, v, sp = effect_moments(effect)
-        s0 = s0 + mean; V0 = V0 + v; sp0 = sp0 + sp
+        s0 = s0 + mean
+        V0 = V0 + v
+        sp0 = sp0 + sp
     Tmax, ntau, hw = _grid_size(
         V0, sp0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau
     )
