@@ -34,6 +34,7 @@ __all__ = [
     "glm_profile_ser_nodes",
     "glm_jj_ser",
     "glm_vi_ser",
+    "glm_vi_gh_ser",
     "glm_vi_profile_ser",
     "glm_linear_ser",
     "glm_linear_profile_ser",
@@ -640,6 +641,97 @@ def glm_vi_ser(
     # Off-support entries have ve = ov and eta = offset, so ll - ll0 = 0: O(nnz).
     ll = smoothed(m, v)[0]
     ll0 = response.terms(off_e, (y_e, ov_e))[0]
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    return m, v, op.local_moment(0, ll - ll0) - kl, kl
+
+
+@partial(jax.jit, static_argnames=("response", "order", "n_iter"))
+def glm_vi_gh_ser(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 100,
+    tol: float = 1e-8,
+):
+    """Gaussian-restricted variational SER whose effect `b` is integrated by explicit
+    Gauss-Hermite quadrature over a response that ALREADY carries the offset.
+
+    Same q(b | gamma=j) = N(m_j, v_j) coordinate ascent as `glm_vi_ser`, but the two
+    kernels take the Gaussian expectation `E_{b ~ N(m,v)}` differently:
+
+      glm_vi_ser  : the offset AND the effect are folded through ONE Gaussian
+                    convolution seam (`ve = x^2 v + ov`) -- requires a `Smoothed(base,
+                    pointwise scheme)` and can only represent a SINGLE-Gaussian offset.
+      glm_vi_gh_ser: the offset is pre-integrated INSIDE `response` (any
+                    offset-integrated cumulant, e.g. a Chebyshev-table smoother --
+                    `Smoothed(base, CharFnOffset()/Compress()/...)`), and only the
+                    effect `b` is integrated here, by `order`-node GH over the fixed
+                    per-row cumulant `E_b[response.terms(offset + x b, aux)]`.
+
+    This is what CAVI in Q2 for a GLM needs: the offset under q_{-j} in Q2 is a Gaussian
+    MIXTURE (a convolution of L-1 p-component mixtures), which the single-Gaussian
+    convolution of `glm_vi_ser` cannot represent but a CF/table smoother can. Being GH
+    over `b`, it works with ANY `response` providing a smooth cumulant `terms(eta, aux)
+    -> (y*eta - Atilde, y - Atilde', Atilde'')`; a plain base (empty offset) reduces it
+    to a Gaussian-VI SER with no offset integration (== glm_vi_ser with ov=0).
+
+    `aux` is the per-row data `response.terms` consumes (the table `(y, obar, center,
+    halfwidth, coef_ll, coef_g, coef_w)` for a compress/CF smoother, or plain `y` for a
+    base); it is treated as an opaque pytree and broadcast leaf-wise. `offset` is the
+    deterministic predictor added outside the table, and must be CONSISTENT with the
+    smoother's mean convention (CharFnOffset: intercept + s; Compress: intercept only) --
+    the kernel only evaluates `terms(offset + x b, aux)` and cannot detect a mismatch.
+    Stationarity: m solves the GH-averaged score, 1/v = 1/pv + sum_i x^2 E_b[weight]
+    (Price's theorem). Returns (m, v, elbo_rel, coefficient_kl = KL(q_j || prior)), the
+    `build_ser_state` contract; `elbo_rel` is the per-feature ELBO minus the b=0 null.
+    Shared intercept only (no profiled variant here)."""
+    offset = jnp.asarray(offset)
+    aux_e = _tmap(op.broadcast_rows, aux)
+    off_e = op.broadcast_rows(offset)
+    x = op.entry_x
+    inv_pv = 1.0 / prior_variance
+
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+
+    def smoothed(m, v):
+        # E_{b ~ N(m, v)} of the offset-integrated cumulant terms, by GH over b. The
+        # variance folded here is the EFFECT's alone (x^2 v); the offset is already
+        # integrated inside `response`/`aux`, so -- unlike glm_vi_ser -- there is no ov.
+        ve = x**2 * op.broadcast_cols(v)
+        eta = off_e + x * op.broadcast_cols(m)
+        sd = jnp.sqrt(2.0 * jnp.maximum(ve, 0.0))
+        lead = (-1,) + (1,) * jnp.ndim(eta)
+        shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)  # (order, *eta)
+        aux_o = _tmap(lambda a: a[None, ...], aux_e)  # open the GH-node axis on aux
+        ll, g, w = response.terms(shft, aux_o)
+        W = wts.reshape(lead)
+        return jnp.sum(W * ll, 0), jnp.sum(W * g, 0), jnp.sum(W * w, 0)
+
+    def body(state):
+        m, v, _, it = state
+        _, g, w = smoothed(m, v)
+        prec = inv_pv + op.local_moment(2, w)
+        step = (op.local_moment(1, g) - inv_pv * m) / prec
+        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    )
+    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+
+    # ELBO - baseline: E_q[ll] is the GH-averaged ll at (m, v); baseline is b = 0, where
+    # ve = 0 so no GH is needed (the offset is already in the table -> terms at offset).
+    ll = smoothed(m, v)[0]
+    ll0 = response.terms(off_e, aux_e)[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
     return m, v, op.local_moment(0, ll - ll0) - kl, kl
 

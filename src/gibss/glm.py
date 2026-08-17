@@ -31,7 +31,9 @@ from .engine import (
     subtract_message_index_step,
     to_numpy_state_step,
 )
-from .linear import (  # noqa: F401 (re-export)
+from ._numerics import _gh_rule
+from .cf_offset import CharFnOffset
+from .linear import (  # noqa: F401 (prep_data re-export)
     is_bcoo,
     prep_data,
     update_prior_variance_index_step,
@@ -45,8 +47,11 @@ from .response_ser import (
     glm_jj_ser,
     glm_linear_profile_ser,
     glm_linear_ser,
+    glm_profile_ser,
     glm_profile_ser_nodes,
+    glm_ser,
     glm_ser_nodes,
+    glm_vi_gh_ser,
     glm_vi_profile_ser,
     glm_vi_ser,
 )
@@ -107,6 +112,13 @@ class GLMFamilyState:
     #             JJEnvelope: classic localjj (shared) / centered localjj (profiled).
     #   "jj"      glm_jj_ser -- conjugate quadratic-bound SER (classic localjj);
     #             the kernel tunes the per-entry tilt itself. Shared intercept only.
+    #   "vi_gh"   glm_vi_gh_ser -- Gaussian q(b|gamma) integrated by GH over b against
+    #             an offset-integrated cumulant (response = Smoothed(base,
+    #             CharFnOffset() | Compress())): CAVI in Q2. The offset table is built
+    #             per update from the OTHER effects' Gaussian-mixture laws (not the
+    #             message), so the offset is the true mixture, not a single Gaussian --
+    #             by the exact CF product (CharFnOffset) or the quadrature peel
+    #             (Compress). Shared intercept, dense or sparse, logistic (MVP).
     # `background` ("exact" O(n*p) / "chebyshev" O(n*D + D*p)) and `node_intercept`
     # ("linear"|"newton", quad only) apply to the profiled-intercept variants.
     kernel: str = "quad"
@@ -139,10 +151,29 @@ class GLMFamilyState:
                 f"kernel={self.kernel!r} was split into orthogonal axes: use "
                 f"kernel={legacy[self.kernel]!r}, intercept='profiled'."
             )
-        if self.kernel not in ("quad", "linear", "vi", "jj"):
+        if self.kernel not in ("quad", "linear", "vi", "jj", "vi_gh"):
             raise ValueError(
-                f"unknown kernel {self.kernel!r}; use 'quad', 'linear', 'vi' or 'jj'"
+                f"unknown kernel {self.kernel!r}; use 'quad', 'linear', 'vi', 'jj' "
+                f"or 'vi_gh'"
             )
+        if self.kernel == "vi_gh":
+            # any offset-integrated-cumulant smoother works: CharFnOffset (exact CF
+            # product) or Compress (quadrature peel). Both hand vi_gh the same table
+            # contract (y, obar=0, center=0, hw, coef_ll, coef_g, coef_w).
+            ok = isinstance(self.response, Smoothed) and isinstance(
+                self.response.smoother, (CharFnOffset, Compress)
+            )
+            if not ok:
+                raise ValueError(
+                    "kernel='vi_gh' (CAVI in Q2) needs response = Smoothed(base, "
+                    f"CharFnOffset()|Compress()); got {self.response!r}."
+                )
+            if self.intercept == "profiled":
+                raise ValueError(
+                    "kernel='vi_gh' has no profiled-intercept variant yet (the "
+                    "intercept would need integrating over the effect mixture too); "
+                    "use intercept='shared' or 'null'."
+                )
         if self.intercept not in ("shared", "profiled", "null"):
             raise ValueError(
                 f"unknown intercept {self.intercept!r}; use 'shared', 'profiled' "
@@ -202,6 +233,84 @@ def _aux(data, state, include_intercept_var=True):
     if smoother.takes_row_param and fs.kernel != "jj":
         return y, ov, jnp.asarray(fs.row_param)
     return y, ov
+
+
+def _intercept_ov(state):
+    """Posterior variance v0 of the shared intercept's Gaussian factor q(b0)=N(m0,v0), to
+    be folded into the effect offsets (CAVI in Q2 treats b0 as a unit-column effect). 0 if
+    there is no shared intercept, or in mean-only (MeanMessage) mode."""
+    fs = state.family_state
+    if fs.intercept != "shared" or isinstance(state.total_message, MeanMessage):
+        return 0.0
+    return float(fs.intercept_var)
+
+
+def _build_offset_table(data, state, effects, offset_var):
+    """The vi_gh aux: an offset-integrated cumulant table from an explicit list of
+    single-effects (each read in EFFECT space -- x, alpha, mu, var) PLUS one homogeneous
+    zero-mean Gaussian `N(0, offset_var)` (the shared intercept's factor). The offset MEAN
+    lives in eta (the table is centered at 0); the caller's `offset` carries it.
+
+    Two builders share this seam and the same table contract:
+      CharFnOffset : exact CF product; the effects' mixtures and `offset_var` both fold
+                     into the closed-form CF (obar=0 already).
+      Compress     : quadrature peel; the intercept N(0, offset_var) is seeded first
+                     (sparse `init=`) or appended as a zero-mean effect (dense), and the
+                     result is RE-CENTERED to obar=0 (coeffs unchanged, interval was at
+                     -s) so the mean is not double-counted against eta."""
+    fs = state.family_state
+    smoother, base = fs.response.smoother, fs.response.base
+    X = data.X
+    y = jnp.asarray(data.y)
+    n = y.shape[0]
+
+    if isinstance(smoother, Compress):
+        if is_bcoo(X):
+            eff = [(e.alpha, e.mu, e.var) for e in effects]
+            init = None
+            if offset_var > 0.0:  # seed the fold with the intercept's N(0, v0)
+                z1 = jnp.zeros((n, 1))
+                _, _, _, _, cll0, cg0, cw0 = smoother.build_aux(
+                    base, y, z1, jnp.full((n, 1), offset_var), z1
+                )
+                init = (-cll0, -cg0, cw0, offset_var)
+            aux = smoother.build_aux_sequential_sparse(base, y, X, eff, init=init)
+        else:
+            Xd = jnp.asarray(X)
+            eff = [
+                (Xd * jnp.asarray(e.mu)[None, :],
+                 Xd**2 * jnp.asarray(e.var)[None, :],
+                 jnp.broadcast_to(jnp.log(jnp.asarray(e.alpha))[None, :], Xd.shape))
+                for e in effects
+            ]
+            if offset_var > 0.0:  # intercept as a zero-mean single-Gaussian effect
+                zc = jnp.zeros((n, 1))
+                eff.append((zc, jnp.full((n, 1), offset_var), zc))
+            aux = smoother.build_aux_sequential(base, y, eff)
+        y_, _obar, _center, hw, cll, cg, cw = aux
+        z = jnp.zeros_like(hw)  # re-center obar/center -> 0 (mean lives in eta)
+        return (y_, z, z, hw, cll, cg, cw)
+
+    # CharFnOffset: obar=0 already; the intercept variance folds via offset_var.
+    if is_bcoo(X):
+        eff = [(e.alpha, e.mu, e.var) for e in effects]
+        return smoother.build_aux_sparse(base, y, X, eff, offset_var=offset_var)
+    eff = [(X, e.alpha, e.mu, e.var) for e in effects]
+    return smoother.build_aux(base, y, eff, offset_var=offset_var)
+
+
+def _offset_table_aux(data, state, l):
+    """Effect-j vi_gh aux: fold the OTHER effects' Gaussian mixtures PLUS the shared
+    intercept's Gaussian factor N(0, v0). The offset MEAN lives in eta (the caller's
+    `offset` = LOO message mean + intercept m0)."""
+    others = [e for j, e in enumerate(state.single_effects) if j != l]
+    return _build_offset_table(data, state, others, _intercept_ov(state))
+
+
+def _intercept_offset_aux(data, state):
+    """Intercept vi_gh aux: fold ALL L effects (the intercept is a unit-ones-column
+    effect, so its offset is every b_l; it excludes ITSELF -> offset_var=0)."""
+    return _build_offset_table(data, state, list(state.single_effects), 0.0)
 
 
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
@@ -276,6 +385,12 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     elif fs.kernel == "vi":
         mu, var, log_bf, coefficient_kl = glm_vi_ser(
             op, aux, offset, prior_variance, fs.response,
+        )
+    elif fs.kernel == "vi_gh":
+        # CAVI in Q2: `aux` is the CharFnOffset table built from the OTHER effects'
+        # Gaussian-mixture laws (by _offset_table_aux, in the effect step); GH integrates b.
+        mu, var, log_bf, coefficient_kl = glm_vi_gh_ser(
+            op, aux, offset, prior_variance, fs.response, order=order,
         )
     else:  # jj (shared only, validated at construction)
         mu, var, log_bf, coefficient_kl = glm_jj_ser(
@@ -384,6 +499,43 @@ def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli
     return _freeze_null_intercept(data, state)
 
 
+def _intercept_vi_gh(data, state, order=15, n_iter=50, tol=1e-8):
+    """CAVI-in-Q2 coordinate update of the intercept as a unit-ones-column Gaussian
+    effect q(b0) = N(m0, v0), with a flat prior. Symmetric with the effect updates: the
+    offset is ALL L effects' Gaussian mixture, integrated into the cumulant table
+    (`_intercept_offset_aux`), and b0 is integrated by GH over N(m0, v0). Returns (m0, v0)
+    with m0 solving the GH-averaged score and 1/v0 = sum_i E_{b0}[weight] (flat prior)."""
+    fs = state.family_state
+    response = fs.response
+    aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset  # offset mean s
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+    aux_o = jax.tree_util.tree_map(lambda a: a[None, ...], aux)  # open GH-node axis
+
+    def smoothed(m0, v0):
+        sd = jnp.sqrt(2.0 * jnp.maximum(v0, 0.0))
+        shft = (total_mean + m0)[None, :] + sd * nodes[:, None]  # (order, n)
+        _, g, w = response.terms(shft, aux_o)
+        W = wts[:, None]
+        return jnp.sum(W * g, 0), jnp.sum(W * w, 0)  # (n,)
+
+    def body(s):
+        m0, v0, _, it = s
+        g, w = smoothed(m0, v0)
+        prec = jnp.maximum(jnp.sum(w), 1e-8)
+        step = jnp.clip(jnp.sum(g) / prec, -4.0, 4.0)
+        return m0 + step, 1.0 / prec, jnp.abs(step), it + 1
+
+    m0, v0, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.asarray(fs.intercept_value), jnp.asarray(1.0), jnp.inf, 0),
+    )
+    return float(m0), float(v0)
+
+
 def estimate_intercept(data, state):
     """Concave Newton for a scalar intercept: max_{b0} sum_i loglik_i(mean + b0).
 
@@ -395,6 +547,11 @@ def estimate_intercept(data, state):
     alternation for a point estimate -- no b to integrate here).
     Returns (b0, v0)."""
     fs = state.family_state
+    if fs.kernel == "vi_gh":
+        # CAVI in Q2: b0 is a unit-ones-column Gaussian effect, updated symmetrically
+        # with the effects -- offset = ALL effects integrated, b0 integrated by GH.
+        return _intercept_vi_gh(data, state, order=fs.quadrature_order)
+    response = fs.response
     aux = _aux(data, state, include_intercept_var=False)
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset
 
@@ -403,8 +560,8 @@ def estimate_intercept(data, state):
         if fs.kernel == "jj":
             y, ov = aux
             xi = jnp.sqrt(eta**2 + ov)
-            return fs.response.terms(eta, (y, ov, xi))
-        return fs.response.terms(eta, aux)
+            return response.terms(eta, (y, ov, xi))
+        return response.terms(eta, aux)
 
     def body(s):
         b0, it = s
@@ -630,14 +787,24 @@ def update_effect_index_step(data, l, state):
     fs = state.family_state
     # profiled: offset is the leave-one-out message (+ base glm_offset; b0 profiled
     # per feature); shared-intercept (quad/jj): also add the estimated intercept. A
-    # Smoothed response additionally receives the LOO message variance through aux --
-    # or, for Compress, the EXACT per-target offset folded from the other effects.
+    # Smoothed response additionally receives the LOO message offset through aux:
+    #   vi_gh (Q2 CAVI): the OTHER effects' Gaussian mixtures folded exactly, via the
+    #     CF product or the Compress peel (`_offset_table_aux`).
+    #   quad + Compress/CompressSelfNorm (Q1 CAVI): the OTHER effects folded by the
+    #     sequential peel -- Gaussian-moment (Compress) or exact free-form self-normalized
+    #     (CompressSelfNorm) -- via `_compress_fold_aux`.
+    # The LOO message MEAN carries the offset mean in eta in every case.
     offset = _effect_offset(fs, state)
-    if isinstance(fs.response, Smoothed) and isinstance(fs.response.smoother, Compress):
+    smoother = fs.response.smoother if isinstance(fs.response, Smoothed) else None
+    if fs.kernel == "vi_gh":
+        aux = _offset_table_aux(data, state, l)
+    elif isinstance(smoother, Compress):
         aux = _compress_fold_aux(data, state, l)
     else:
         aux = _aux(data, state)
-    new_effect = _fit_effect(data, fs, aux, offset, effect.prior_variance, fs.quadrature_order)
+    new_effect = _fit_effect(
+        data, fs, aux, offset, effect.prior_variance, fs.quadrature_order
+    )
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 

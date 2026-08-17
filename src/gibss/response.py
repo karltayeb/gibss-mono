@@ -208,6 +208,404 @@ class MixtureGH(Smoother):
         return red(ll), red(g), red(w)
 
 
+def _diff_residual(cr0, halfwidth, M):
+    """First and second z-derivative coefficient tables of a value residual `cr0`
+    (n, M+1), by the Chebyshev differentiation matrix and the interval chain rule
+    (the fit lives on [center +- halfwidth], so d/dz = (D coeffs) / halfwidth)."""
+    D = jnp.asarray(_cheb_diff_matrix(M)).T  # (M+1, M+1); apply as cr @ D
+    cr1 = (cr0 @ D) / halfwidth[:, None]
+    cr2 = (cr1 @ D) / halfwidth[:, None]
+    return cr1, cr2
+
+
+def _fold_over_components(
+    base, znodes, s_prev, means, vars_, pi, xgh, wgh,
+    cr0, cr1, cr2, center_prev, hw_prev, value_only=False,
+):
+    """One sequential-fold step, reduced component by component to bound memory.
+
+    Accumulates, over the K mixture components of one effect, the fresh cumulant fold
+    `E_o[A(z + s_prev + o)]` and the previous-residual fold `E_o[r(z + o)]` at the
+    Chebyshev nodes `znodes` (n, Z). The reduction is a `lax.scan` over components: only
+    ONE component's (n, Z, Q) grid is live at a time, so peak memory is O(n Z Q),
+    independent of K. `base.terms(., 0)` isolates the y-free cumulant `-A` (and, in full
+    mode, `-A', A''`). With `value_only` the fold carries just the value (EA0, Er0) --
+    the derivatives are recovered by differentiating the final interpolant, cheaper and
+    at least as accurate; otherwise it also folds `(A', A'')` and `(r', r'')`, returning
+    six sums."""
+    n, Z = znodes.shape
+    xs = (jnp.moveaxis(means, 1, 0), jnp.moveaxis(vars_, 1, 0), jnp.moveaxis(pi, 1, 0))
+
+    if value_only:
+        def body(carry, comp):
+            EA0, Er0 = carry
+            mk, vk, pk = comp
+            sd = jnp.sqrt(2.0 * jnp.maximum(vk, 0.0))
+            o = mk[:, None] + sd[:, None] * xgh[None, :]
+            pts = znodes[:, :, None] + o[:, None, :]
+            Wk = pk[:, None, None] * wgh[None, None, :]
+            nll = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))[0]
+            t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
+            return (EA0 - jnp.sum(Wk * nll, -1),
+                    Er0 + jnp.sum(Wk * _clenshaw_batched(cr0[:, None, None, :], t), -1)), None
+        (EA0, Er0), _ = jax.lax.scan(body, (jnp.zeros((n, Z)), jnp.zeros((n, Z))), xs)
+        return EA0, Er0
+
+    def body(carry, comp):
+        EA0, EA1, EA2, Er0, Er1, Er2 = carry
+        mk, vk, pk = comp  # each (n,)
+        sd = jnp.sqrt(2.0 * jnp.maximum(vk, 0.0))
+        o = mk[:, None] + sd[:, None] * xgh[None, :]  # (n, Q)
+        pts = znodes[:, :, None] + o[:, None, :]  # (n, Z, Q)
+        Wk = pk[:, None, None] * wgh[None, None, :]  # (n, 1, Q)
+        nll, ng, nw = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))
+        EA0 = EA0 - jnp.sum(Wk * nll, -1)  # E_o[A]  (reduce Q)
+        EA1 = EA1 - jnp.sum(Wk * ng, -1)  # E_o[A']
+        EA2 = EA2 + jnp.sum(Wk * nw, -1)  # E_o[A'']
+        t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1.0, 1.0)
+        Er0 = Er0 + jnp.sum(Wk * _clenshaw_batched(cr0[:, None, None, :], t), -1)
+        Er1 = Er1 + jnp.sum(Wk * _clenshaw_batched(cr1[:, None, None, :], t), -1)
+        Er2 = Er2 + jnp.sum(Wk * _clenshaw_batched(cr2[:, None, None, :], t), -1)
+        return (EA0, EA1, EA2, Er0, Er1, Er2), None
+
+    init = tuple(jnp.zeros((n, Z)) for _ in range(6))
+    (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, init, xs)
+    return EA0, EA1, EA2, Er0, Er1, Er2
+
+
+@dataclass(frozen=True)
+class Compress(Smoother):
+    """Amortized Chebyshev compression of a per-row offset correction.
+
+    A wrapper scheme: `inner` (a MixtureGH-style smoother) supplies the EXACT smoothed
+    terms `inner.terms(eta) = (y*eta - Atilde, y - Atilde', Atilde'')` for the per-row
+    offset law, but paying `inner`'s `K * order` likelihood passes on EVERY in-loop
+    evaluation is wasteful: `Atilde_i` is a fixed univariate function of `eta` for the
+    whole SER fit, hit O(p * newton * gh-nodes) times. So we split off the plug-in mean
+    shift and compress only the residual once, out of the loop.
+
+    Write `obar_i = E[o_i]` (the mixture mean). The plug-in `base.terms(eta + obar_i)`
+    carries the dominant shape and convexity; the residual
+
+        R_i(eta) = inner.terms(eta) - base.terms(eta + obar_i)   (per term: ll, g, w)
+
+    is a small, smooth, exponentially-localized bump (its g/w components vanish at both
+    ends; the ll component tends to the constant -y*obar). We interpolate each of the
+    three residuals by a degree-`M` Chebyshev series on a per-row interval that just
+    covers where the offset mass overlaps the logistic transition, precomputed by
+    `build_aux`. In the loop `terms` is then one exact `base.terms` plus three Clenshaw
+    passes -- O(M) fused mul-adds, independent of `K` and `inner.order`, so the offset
+    law can be made as rich as the model wants without touching in-loop cost.
+
+    aux = (y, obar, center, halfwidth, coef_ll, coef_g, coef_w), all per-row, built by
+    `build_aux` from the SAME `(y, means, vars, log_pi)` mixture `MixtureGH` consumes.
+    `coef_*` are (n, M+1); the rest are (n,). The clamp `t = clip((eta - center)/
+    halfwidth, -1, 1)` makes evaluation outside the fit interval return the endpoint
+    (~0 correction), which is asymptotically exact because R vanishes there. NOT
+    certified; convex (the assembled weight is floored at 0, and Atilde'' >= 0 anyway).
+    All-zero `coef_*` recovers the naive plug-in-offset fit exactly.
+
+    Like `MixtureGH`, this is a fixed-per-row-offset scheme: use it with the
+    quadrature/Laplace kernels (glm_ser / glm_profile_ser), where the offset law does
+    not depend on the feature being fit, NOT the vi/linear kernels (which fold the
+    effect's own variance into the per-entry offset).
+    """
+
+    # inner supplies the per-fold GH quadrature (its `order` is the number of GH nodes
+    # per Gaussian component). order=5 already reaches the Chebyshev interpolation floor
+    # -- the fold integrand (softplus + a small, effectively low-order residual against a
+    # Gaussian) is smooth, so accuracy is set by M, not the quadrature; raise `order`
+    # only for the exact-reference path.
+    inner: Smoother = field(default_factory=lambda: MixtureGH(order=5))
+    M: int = 48
+    T: float = 10.0
+    kappa: float = 4.0
+
+    def validate(self, base):
+        self.inner.validate(base)
+
+    def build_aux(self, base, y, means, vars_, log_pi):
+        """Precompute the compressed aux from a per-row Gaussian-mixture offset law
+        `o_i ~ sum_k pi_ik N(means_ik, vars_ik)` (shapes (n, K), same as `MixtureGH`).
+        Runs once per SER fit, out of the hot loop, so `inner.order` can be large."""
+        y = jnp.asarray(y)
+        means, vars_ = jnp.asarray(means), jnp.asarray(vars_)
+        log_pi = jnp.asarray(log_pi)
+        pi = jax.nn.softmax(log_pi, axis=-1)  # (n, K)
+        obar = jnp.sum(pi * means, axis=-1)  # (n,) plug-in mean shift
+        sd = jnp.sqrt(jnp.maximum(vars_, 0.0))
+        lo = jnp.min(means - self.kappa * sd, axis=-1)  # leftmost offset edge (n,)
+        hi = jnp.max(means + self.kappa * sd, axis=-1)  # rightmost offset edge
+        # R_i is nonzero only where eta + m_ik hits the transition (0); in eta that is
+        # the negated, padded offset window [-hi - T, -lo + T].
+        center = -0.5 * (lo + hi)
+        halfwidth = self.T + 0.5 * (hi - lo)
+
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)  # CGL nodes, samples->coeffs
+        xnodes = jnp.asarray(xnodes_np)  # (M+1,) on [-1, 1]
+        Vinv = jnp.asarray(Vinv_np)  # (M+1, M+1)
+        znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+        # exact smoothed terms at the nodes; reshape mixture leaves to (n, 1, K) so the
+        # (M+1) node axis is the "columns" slot inner.terms broadcasts over.
+        inner_aux = (
+            y[:, None],
+            means[:, None, :],
+            vars_[:, None, :],
+            log_pi[:, None, :],
+        )
+        sll, sg, sw = self.inner.terms(base, znodes, inner_aux)  # each (n, M+1)
+        bll, bg, bw = base.terms(znodes + obar[:, None], y[:, None])  # plug-in at shift
+        fit = lambda vals: vals @ Vinv.T  # (n, M+1) samples -> (n, M+1) coeffs  # noqa: E731
+        coef_ll = fit(sll - bll)
+        coef_g = fit(sg - bg)
+        coef_w = fit(sw - bw)
+        return y, obar, center, halfwidth, coef_ll, coef_g, coef_w
+
+    def build_aux_sequential(self, base, y, effects, derivatives="differentiate"):
+        """Build the compressed aux for a SUM of independent per-row offsets by folding
+        one effect at a time -- the exact way to handle the product mixture without
+        materializing its `prod_l K_l` components.
+
+        `effects` is an iterable of `(means, vars, log_pi)` mixtures (each (n, K), the
+        `MixtureGH` contract, K free per effect). Under mean-field independence the
+        offset cumulant is an iterated expectation `Atilde = E_o1 ... E_oL[A(z + sum o)]`,
+        so we peel the effects: `A^(m)(z) = E_{o^(m)}[A^(m-1)(z + o^(m))]`, starting from
+        `A^(0) = A`. Each fold costs O(K * order) per node, not O(prod K), and is exact
+        up to the fold quadrature (`inner.order`) and the per-stage Chebyshev refit.
+
+        We keep the plug-in/residual split of `build_aux` at every stage: carry the
+        analytic plug-in `A(z + s_m)` (s_m = cumulative mean, valid everywhere) plus a
+        compressed residual `r^(m) = A^(m) - A(z + s_m)` and its first two derivatives
+        (all y-free, bounded, and decaying at both ends -- the Jensen gap accumulated so
+        far). The residual recurrence per stage is the fresh single-effect residual of A
+        over `o^(m)` plus the folded previous residual `E_{o^(m)}[r^(m-1)(z + o^(m))]`.
+
+        Intervals stay well behaved because variances ADD: stage m centers at `-s_m`
+        with half-width `T + kappa sqrt(V_m)`, V_m the cumulative offset variance. That
+        grows monotonically and tracks the true (CLT) spread of the aggregate offset --
+        including between-component dispersion, so multimodal offsets are covered too --
+        and the residual clamp keeps a fold that reaches slightly past a previous stage's
+        interval safe (it reads ~0 there, which is correct). Because the fold is a
+        sup-norm contraction, per-stage refit errors accumulate additively, not
+        multiplicatively; and each fold smooths, so later stages only get easier.
+
+        `derivatives`: how the returned g/w tables are formed. "differentiate" (default)
+        carries ONLY the value residual through the fold (one integrand, ~3x cheaper) and
+        gets r', r'' by differentiating the final interpolant -- at least as accurate as
+        fitting them, since the fold value is well-resolved. "fit" folds (A', A'') and
+        (r', r'') too and fits all three tables (the independent-derivative reference).
+
+        Returns the same aux as `build_aux`; with a single effect it matches it (up to
+        the interval convention). Reduces to `A` when `effects` is empty."""
+        if derivatives not in ("differentiate", "fit"):
+            raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
+        value_only = derivatives == "differentiate"
+        y = jnp.asarray(y)
+        n = y.shape[0]
+        xgh_np, logw_np = _gh_rule(self.inner.order)
+        xgh = jnp.asarray(xgh_np)
+        wgh = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))  # sum to 1
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+
+        s = jnp.zeros(n)  # cumulative mean shift s_m
+        V = jnp.zeros(n)  # cumulative variance V_m
+        center = -s  # current residual interval
+        halfwidth = self.T + self.kappa * jnp.sqrt(V)
+        # cumulant residual r^(m) and its first two derivatives, as Chebyshev coeffs;
+        # r^(0) = 0 (A^(0) = A exactly).
+        cr0 = jnp.zeros((n, self.M + 1))
+        cr1 = jnp.zeros((n, self.M + 1))
+        cr2 = jnp.zeros((n, self.M + 1))
+
+        for means, vars_, log_pi in effects:
+            means, vars_ = jnp.asarray(means), jnp.asarray(vars_)
+            log_pi = jnp.asarray(log_pi)
+            pi = jax.nn.softmax(log_pi, axis=-1)
+            obar = jnp.sum(pi * means, axis=-1)  # (n,) effect mean
+            var_eff = jnp.sum(pi * (vars_ + means**2), axis=-1) - obar**2  # effect var
+            s_prev, center_prev, hw_prev = s, center, halfwidth
+            s = s + obar
+            V = V + var_eff
+            center = -s
+            halfwidth = self.T + self.kappa * jnp.sqrt(V)
+            znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+            # fold this effect, reducing over its K components one at a time (memory
+            # is O(n M Q), not O(n M K Q)). value_only carries just the value residual.
+            if value_only:
+                EA0, Er0 = _fold_over_components(
+                    base, znodes, s_prev, means, vars_, pi, xgh, wgh,
+                    cr0, cr1, cr2, center_prev, hw_prev, value_only=True,
+                )
+                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                cr0 = fit((EA0 + pll) + Er0)  # F0 = E_o[A] - A(z+s), A(z+s) = -pll
+            else:
+                EA0, EA1, EA2, Er0, Er1, Er2 = _fold_over_components(
+                    base, znodes, s_prev, means, vars_, pi, xgh, wgh,
+                    cr0, cr1, cr2, center_prev, hw_prev,
+                )
+                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
+
+        if value_only:  # derivatives of the value interpolant, on the final interval
+            cr1, cr2 = _diff_residual(cr0, halfwidth, self.M)
+        # aux residuals are the term residuals: ll,g pick up a minus sign, w a plus
+        # (coef_ll = fit(-r), etc.; fit is linear so negate the coeffs).
+        return y, s, center, halfwidth, -cr0, -cr1, cr2
+
+    def build_aux_sequential_sparse(self, base, y, X, effects, entry_chunk=1 << 16,
+                                    derivatives="differentiate", init=None):
+        """Sparse sequential fold that exploits zeros for free.
+
+        Same result as `build_aux_sequential`, but the per-effect offset law comes from
+        a sparse design `X` (BCOO, n x p) plus per-effect SER posteriors `(alpha, mu,
+        var)` (each length p): component j of row i is `N(X_ij mu_j, X_ij^2 var_j)` with
+        weight `alpha_j`. Where `X_ij = 0` the component is a point mass at 0, so ALL
+        zero columns of a row collapse into ONE identity component with weight
+        `pi_0i = 1 - sum_{j: X_ij != 0} alpha_j` that folds as `pi_0i * g(z)` -- no
+        quadrature. Real GH work therefore touches only the `nnz` nonzero entries,
+        segment-summed over rows, so a fold is O(nnz Q M) not O(n p Q M); on a design
+        with `r` nonzeros per row that is a `p/r` speedup (e.g. GO:BP: ~7500/19). The
+        zero-clumping is EXACT (a zero column truly cannot shift the predictor), and the
+        nonzero grid is chunked over entries (`entry_chunk`) to bound memory. Emits the
+        same aux as `build_aux_sequential`.
+
+        `effects` is a list of `(alpha, mu, var)` for the OTHER effects; `alpha` sums to
+        1 over all p features (the SER `alpha`), so `pi_0i` is the PIP mass on the sets
+        NOT containing row i. The interval moments (`s`, `V`) are the exact mixture mean
+        and variance, unchanged by the lumping."""
+        if derivatives not in ("differentiate", "fit"):
+            raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
+        value_only = derivatives == "differentiate"
+        y = jnp.asarray(y)
+        idx = X.indices
+        rows_all, cols_all = idx[:, 0], idx[:, 1]
+        vals_all = X.data
+        n = X.shape[0]
+        nnz = vals_all.shape[0]
+        xgh_np, logw_np = _gh_rule(self.inner.order)
+        xgh = jnp.asarray(xgh_np)
+        wgh = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))
+        xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
+        xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
+        fit = lambda v: v @ Vinv.T  # noqa: E731
+
+        # entries padded to a whole number of chunks; padding carries weight 0.
+        C = min(int(entry_chunk), nnz)
+        nchunks = -(-nnz // C)
+        pad = nchunks * C - nnz
+        def _pad(a, fill):  # noqa: E731
+            return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
+                    if pad else a)
+
+        # Optional initial state: a zero-mean Gaussian already folded (e.g. the shared
+        # intercept's N(0, intercept_var)). Convolution commutes, so folding it FIRST as
+        # the starting cumulant is exact -- the X-effects then fold on top with no change
+        # to the entry loop. init = (cr0, cr1, cr2, V0) with V0 scalar/(n,).
+        s = jnp.zeros(n)
+        if init is None:
+            V = jnp.zeros(n)
+            cr0 = cr1 = cr2 = jnp.zeros((n, self.M + 1))
+        else:
+            cr0, cr1, cr2, V0 = init
+            V = jnp.broadcast_to(jnp.asarray(V0), (n,))
+        center = -s
+        halfwidth = self.T + self.kappa * jnp.sqrt(V)
+
+        for alpha, mu, var in effects:
+            alpha, mu, var = map(jnp.asarray, (alpha, mu, var))
+            muC, varC, wA = mu[cols_all], var[cols_all], alpha[cols_all]
+            m_e = vals_all * muC  # component mean X_ij mu_j
+            sd_e = jnp.sqrt(2.0 * jnp.maximum(vals_all**2 * varC, 0.0))  # GH sd
+            # exact mixture moments (== the engine's message): zeros drop out of both
+            obar = jax.ops.segment_sum(wA * m_e, rows_all, num_segments=n)
+            eo2 = jax.ops.segment_sum(wA * vals_all**2 * (varC + muC**2), rows_all, num_segments=n)
+            var_eff = jnp.maximum(eo2 - obar**2, 0.0)
+            pi0 = jnp.maximum(1.0 - jax.ops.segment_sum(wA, rows_all, num_segments=n), 0.0)
+
+            s_prev, center_prev, hw_prev = s, center, halfwidth
+            cr0_p, cr1_p, cr2_p = cr0, cr1, cr2
+            s = s + obar
+            V = V + var_eff
+            center = -s
+            halfwidth = self.T + self.kappa * jnp.sqrt(V)
+            znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
+
+            # fold the nonzero components, chunked over entries (peak O(C M Q))
+            rr = _pad(rows_all, 0).reshape(nchunks, C)
+            me = _pad(m_e, 0.0).reshape(nchunks, C)
+            sde = _pad(sd_e, 0.0).reshape(nchunks, C)
+            we = _pad(wA, 0.0).reshape(nchunks, C)
+
+            def _pts_and_t(ent):  # shared per-entry geometry
+                rc, mc, sc, wc = ent
+                zc = znodes[rc]  # (C, M+1)
+                o = mc[:, None] + sc[:, None] * xgh[None, :]  # (C, Q)
+                a_arg = zc[:, :, None] + s_prev[rc][:, None, None] + o[:, None, :]
+                r_arg = zc[:, :, None] + o[:, None, :]
+                tt = jnp.clip((r_arg - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
+                Wc = wc[:, None, None] * wgh[None, None, :]
+                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
+                return a_arg, tt, Wc, ss
+
+            tz = jnp.clip((znodes - center_prev[:, None]) / hw_prev[:, None], -1., 1.)
+            if value_only:
+                def body(carry, ent):
+                    EA0, Er0 = carry
+                    a_arg, tt, Wc, ss = _pts_and_t(ent)
+                    nll = base.terms(a_arg, jnp.zeros_like(a_arg))[0]
+                    return (EA0 + ss(-jnp.sum(Wc * nll, -1)),
+                            Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[ent[0]][:, None, None, :], tt), -1))), None
+                z2 = (jnp.zeros((n, self.M + 1)), jnp.zeros((n, self.M + 1)))
+                (EA0, Er0), _ = jax.lax.scan(body, z2, (rr, me, sde, we))
+                znll = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))[0]
+                EA0 = EA0 + pi0[:, None] * (-znll)
+                Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
+                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                cr0 = fit((EA0 + pll) + Er0)
+            else:
+                def body(carry, ent):
+                    EA0, EA1, EA2, Er0, Er1, Er2 = carry
+                    a_arg, tt, Wc, ss = _pts_and_t(ent)
+                    nll, ng, nw = base.terms(a_arg, jnp.zeros_like(a_arg))
+                    rc = ent[0]
+                    return (
+                        EA0 + ss(-jnp.sum(Wc * nll, -1)),
+                        EA1 + ss(-jnp.sum(Wc * ng, -1)),
+                        EA2 + ss(jnp.sum(Wc * nw, -1)),
+                        Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[rc][:, None, None, :], tt), -1)),
+                        Er1 + ss(jnp.sum(Wc * _clenshaw_batched(cr1_p[rc][:, None, None, :], tt), -1)),
+                        Er2 + ss(jnp.sum(Wc * _clenshaw_batched(cr2_p[rc][:, None, None, :], tt), -1)),
+                    ), None
+                zero6 = tuple(jnp.zeros((n, self.M + 1)) for _ in range(6))
+                (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, zero6, (rr, me, sde, we))
+                znll, zng, znw = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))
+                EA0 = EA0 + pi0[:, None] * (-znll)
+                EA1 = EA1 + pi0[:, None] * (-zng)
+                EA2 = EA2 + pi0[:, None] * znw
+                Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
+                Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
+                Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
+                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
+
+        if value_only:
+            cr1, cr2 = _diff_residual(cr0, halfwidth, self.M)
+        return y, s, center, halfwidth, -cr0, -cr1, cr2
+
+    def terms(self, base, eta, aux):
+        y, obar, center, halfwidth, coef_ll, coef_g, coef_w = aux
+        bll, bg, bw = base.terms(eta + obar, y)  # exact plug-in at the mean shift
+        t = jnp.clip((eta - center) / halfwidth, -1.0, 1.0)
+        ll = bll + _clenshaw_batched(coef_ll, t)
+        g = bg + _clenshaw_batched(coef_g, t)
+        w = jnp.maximum(bw + _clenshaw_batched(coef_w, t), 0.0)
+        return ll, g, w
+
+
 @dataclass(frozen=True)
 class SelfNormQuad(Smoother):
     """Self-normalized quadrature fold against an offset law given by RAW quadrature.

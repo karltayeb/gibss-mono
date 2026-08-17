@@ -18,6 +18,7 @@ family, Gaussian q without a smoothing scheme).
 from __future__ import annotations
 
 from . import glm
+from .cf_offset import CharFnOffset
 from .engine import fit_ibss, fit_ibss_greedy
 from .linear import is_bcoo
 from .response import (
@@ -59,6 +60,10 @@ _SMOOTHERS = {
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
+    # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).
+    # "compress" (above) doubles as the Q2 peel builder (gaussian) and the Q1 fold
+    # (unconstrained); _resolve routes on variational_family.
+    "cf": lambda cfg: CharFnOffset(M=cfg["compress_degree"]),
 }
 
 _DEFAULTS = {
@@ -69,6 +74,7 @@ _DEFAULTS = {
     "offset_quadrature_points": 15,
     "compress_degree": 48,  # Chebyshev degree M for offset_integration="compress"
     "effect_quadrature_points": 15,
+    "compress_degree": 48,  # Chebyshev degree M for the cf offset table
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
@@ -83,6 +89,8 @@ PRESETS = {
     "linear": {"family": "gaussian"},
     "smoothed": {"offset_integration": "gh"},
     "localjj": {"variational_family": "gaussian", "offset_integration": "jj"},
+    "cf_cavi": {"variational_family": "gaussian", "offset_integration": "cf"},
+    "compress_cavi": {"variational_family": "gaussian", "offset_integration": "compress"},
     "globaljj": {"offset_integration": "jj_fixed"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
@@ -137,17 +145,35 @@ def _resolve(cfg):
         elif integ == "jj" and vfam == "gaussian" and cfg["intercept"] == "shared":
             # conjugate classic localjj; Smoother.validate rejects non-Bernoulli
             return Smoothed(base, JJFixed()), "jj"
+        elif integ == "cf":
+            # CAVI in Q2 ONLY: the characteristic-function offset needs Gaussian effect
+            # posteriors (free-form Q1 has no closed-form CF). The offset is integrated
+            # over the OTHER effects' Gaussian mixture and b by GH -> the vi_gh kernel.
+            if vfam != "gaussian":
+                raise ValueError(
+                    "offset_integration='cf' (CAVI in Q2) needs variational_family="
+                    "'gaussian'; free-form Q1 posteriors have no closed-form "
+                    "characteristic function -- use 'compress' or 'compress_selfnorm'."
+                )
+            return Smoothed(base, CharFnOffset(M=cfg["compress_degree"])), "vi_gh"
+        elif integ == "compress" and vfam == "gaussian":
+            # CAVI in Q2: the Compress peel as the offset-integrated-cumulant builder,
+            # interchangeable with "cf" behind the same table seam; GH over b (vi_gh).
+            # (compress + unconstrained falls through to the Q1 quad kernel below.)
+            return Smoothed(base, _SMOOTHERS["compress"](cfg)), "vi_gh"
         else:
             response = Smoothed(base, _SMOOTHERS[integ](cfg))
 
     if getattr(response, "quadratic", False):
         return response, "linear"
     if isinstance(getattr(response, "smoother", None), Compress) and vfam != "unconstrained":
+        # reachable only for compress_selfnorm + gaussian (compress + gaussian returned
+        # vi_gh above). The self-normalized fold IS the free-form Q1 offset; there is no
+        # Gaussian-q meaning for it.
         raise ValueError(
-            "offset_integration='compress' needs variational_family='unconstrained' "
-            "(the 'quad' kernel): Compress precomputes fixed-per-row offset tables, but "
-            "the 'vi' kernel folds the effect's OWN variance into the per-entry offset, "
-            "which those tables can't express. Use variational_family='unconstrained'."
+            "offset_integration='compress_selfnorm' (exact free-form CAVI in Q1) needs "
+            "variational_family='unconstrained' (the 'quad' kernel). For a Gaussian q "
+            "(CAVI in Q2) use offset_integration='compress' or 'cf'."
         )
     if vfam == "unconstrained":
         return response, "quad"
@@ -233,6 +259,17 @@ def fit_glm_susie(
     }
 
     response, kernel = _resolve(cfg)
+
+    # CAVI in Q2 (cf) works on dense AND sparse (BCOO) designs -- the CF fold has a
+    # zero-clumping sparse path -- but always UNCENTERED: pre-centering (a column-shift
+    # reparameterization) fills the zeros and has not been validated with the CF fold.
+    if kernel == "vi_gh":
+        if center:
+            raise ValueError(
+                "offset_integration='cf' does not support pre-centering yet; "
+                "pass center=False."
+            )
+        center = False
 
     # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
     # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row

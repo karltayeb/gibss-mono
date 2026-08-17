@@ -198,12 +198,16 @@ def test_compress_offset_sparse_rejects_center_true():
         fit_glm_susie(X, y, L=2, offset_integration="compress", center=True, max_iter=5)
 
 
-def test_compress_offset_rejects_vi_kernel():
-    # Compress is a fixed-per-row-offset scheme (quad kernel only); the vi kernel folds
-    # the effect's own variance into the offset, which its tables can't express.
+def test_compress_gaussian_resolves_to_vi_gh():
+    # Consolidated: compress + gaussian is a valid Q2 CAVI path (the vi_gh kernel
+    # integrates b by GH against the offset-integrated cumulant table). The exact
+    # free-form compress_selfnorm, by contrast, has no Gaussian-q meaning and rejects it.
     X, y = _data("logistic")
+    st = fit_glm_susie(X, y, L=2, offset_integration="compress",
+                       variational_family="gaussian", max_iter=5)
+    assert st.family_state.kernel == "vi_gh"
     with pytest.raises(ValueError, match="unconstrained"):
-        fit_glm_susie(X, y, L=2, offset_integration="compress",
+        fit_glm_susie(X, y, L=2, offset_integration="compress_selfnorm",
                       variational_family="gaussian", max_iter=5)
 
 
