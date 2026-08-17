@@ -37,7 +37,7 @@ from .linear import (  # noqa: F401 (prep_data re-export)
     update_prior_variance_index_step,
 )
 from .operators import CenteredOperator, as_operator
-from .response import Bernoulli, ResponseModel, Smoothed
+from .response import Bernoulli, Compress, ResponseModel, Smoothed
 from .response_ser import (
     _profile_null,
     build_ser_state,
@@ -109,11 +109,12 @@ class GLMFamilyState:
     #   "jj"      glm_jj_ser -- conjugate quadratic-bound SER (classic localjj);
     #             the kernel tunes the per-entry tilt itself. Shared intercept only.
     #   "vi_gh"   glm_vi_gh_ser -- Gaussian q(b|gamma) integrated by GH over b against
-    #             an EXACT offset-integrated cumulant (response = Smoothed(base,
-    #             CharFnOffset())): CAVI in Q2. The offset table is built per update
-    #             from the OTHER effects' Gaussian-mixture laws (not the message), so
-    #             the offset is the true mixture, not a single Gaussian. Shared
-    #             intercept, dense, logistic (MVP).
+    #             an offset-integrated cumulant (response = Smoothed(base,
+    #             CharFnOffset() | Compress())): CAVI in Q2. The offset table is built
+    #             per update from the OTHER effects' Gaussian-mixture laws (not the
+    #             message), so the offset is the true mixture, not a single Gaussian --
+    #             by the exact CF product (CharFnOffset) or the quadrature peel
+    #             (Compress). Shared intercept, dense or sparse, logistic (MVP).
     # `background` ("exact" O(n*p) / "chebyshev" O(n*D + D*p)) and `node_intercept`
     # ("linear"|"newton", quad only) apply to the profiled-intercept variants.
     kernel: str = "quad"
@@ -145,13 +146,16 @@ class GLMFamilyState:
                 f"or 'vi_gh'"
             )
         if self.kernel == "vi_gh":
+            # any offset-integrated-cumulant smoother works: CharFnOffset (exact CF
+            # product) or Compress (quadrature peel). Both hand vi_gh the same table
+            # contract (y, obar=0, center=0, hw, coef_ll, coef_g, coef_w).
             ok = isinstance(self.response, Smoothed) and isinstance(
-                self.response.smoother, CharFnOffset
+                self.response.smoother, (CharFnOffset, Compress)
             )
             if not ok:
                 raise ValueError(
                     "kernel='vi_gh' (CAVI in Q2) needs response = Smoothed(base, "
-                    f"CharFnOffset()); got {self.response!r}."
+                    f"CharFnOffset()|Compress()); got {self.response!r}."
                 )
             if self.intercept == "profiled":
                 raise ValueError(
@@ -211,32 +215,52 @@ def _aux(data, state, include_intercept_var=True):
     return y, ov
 
 
-def _cf_aux(data, state, l):
-    """Kernel aux for CAVI in Q2 (kernel='vi_gh'): the CharFnOffset table built from
-    every OTHER effect's Gaussian-mixture posterior in EFFECT space (x, alpha, mu, var).
-    Unlike `_aux` (which only sees the aggregate message), this reads the individual
-    effect laws -- the offset is their exact mixture, not a moment-matched Gaussian. The
-    offset MEAN lives in eta (the table is centered at 0); the caller's `offset` (LOO
-    message mean + intercept) carries it, and equals the table's internal s by
-    construction (both are sum_{l'!=l} X (alpha mu))."""
+def _offset_table_aux(data, state, l):
+    """Kernel aux for CAVI in Q2 (kernel='vi_gh'): the offset-integrated cumulant table
+    built from every OTHER effect's Gaussian-mixture posterior in EFFECT space
+    (x, alpha, mu, var). Unlike `_aux` (which only sees the aggregate message), this reads
+    the individual effect laws -- the offset is their exact mixture, not a moment-matched
+    Gaussian. The offset MEAN lives in eta (the table is centered at 0); the caller's
+    `offset` (LOO message mean + intercept) carries it, and equals the table's internal s
+    by construction (both are sum_{l'!=l} X (alpha mu)).
+
+    Two builders share this seam and the same table contract:
+      CharFnOffset : exact CF product (`build_aux`/`build_aux_sparse`), obar=0 already.
+      Compress     : quadrature peel (`build_aux_sequential`/`_sparse`), which returns
+                     obar=s -- we RE-CENTER it to obar=0 here (coefficients unchanged,
+                     the fit interval was centered at -s) so the mean is not double
+                     counted against the offset that eta already carries."""
     fs = state.family_state
+    smoother, base = fs.response.smoother, fs.response.base
     X = data.X
     y = jnp.asarray(data.y)
+    others = [e for j, e in enumerate(state.single_effects) if j != l]
+
+    if isinstance(smoother, Compress):
+        # quadrature peel: sequential fold over the other effects (point intercept, so
+        # no intercept-variance fold -- parity with the CharFnOffset path).
+        if is_bcoo(X):
+            effects = [(e.alpha, e.mu, e.var) for e in others]
+            aux = smoother.build_aux_sequential_sparse(base, y, X, effects)
+        else:
+            Xd = jnp.asarray(X)
+            effects = [
+                (Xd * jnp.asarray(e.mu)[None, :],
+                 Xd**2 * jnp.asarray(e.var)[None, :],
+                 jnp.broadcast_to(jnp.log(jnp.asarray(e.alpha))[None, :], Xd.shape))
+                for e in others
+            ]
+            aux = smoother.build_aux_sequential(base, y, effects)
+        y_, _obar, _center, hw, cll, cg, cw = aux
+        z = jnp.zeros_like(hw)  # re-center obar/center -> 0 (mean lives in eta)
+        return (y_, z, z, hw, cll, cg, cw)
+
+    # CharFnOffset: obar=0 already, build directly in effect space.
     if is_bcoo(X):
-        # sparse: the design is shared, so an effect is just its (alpha, mu, var) law;
-        # the CF build exploits the zeros (zero-clumping).
-        effects = [
-            (e.alpha, e.mu, e.var)
-            for j, e in enumerate(state.single_effects)
-            if j != l
-        ]
-        return fs.response.smoother.build_aux_sparse(fs.response.base, y, X, effects)
-    effects = [
-        (X, e.alpha, e.mu, e.var)
-        for j, e in enumerate(state.single_effects)
-        if j != l
-    ]
-    return fs.response.smoother.build_aux(fs.response.base, y, effects)
+        effects = [(e.alpha, e.mu, e.var) for e in others]
+        return smoother.build_aux_sparse(base, y, X, effects)
+    effects = [(X, e.alpha, e.mu, e.var) for e in others]
+    return smoother.build_aux(base, y, effects)
 
 
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
@@ -297,7 +321,7 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
         )
     elif fs.kernel == "vi_gh":
         # CAVI in Q2: `aux` is the CharFnOffset table built from the OTHER effects'
-        # Gaussian-mixture laws (by _cf_aux, in the effect step); GH integrates b.
+        # Gaussian-mixture laws (by _offset_table_aux, in the effect step); GH integrates b.
         mu, var, log_bf, coefficient_kl = glm_vi_gh_ser(
             op, aux, offset, prior_variance, fs.response, order=order,
         )
@@ -496,7 +520,7 @@ def update_effect_index_step(data, l, state):
     # For CAVI in Q2 (vi_gh) the aux is instead the exact offset table built from the
     # OTHER effects' laws (the LOO message MEAN still carries the offset mean in eta).
     offset = _effect_offset(fs, state)
-    aux = _cf_aux(data, state, l) if fs.kernel == "vi_gh" else _aux(data, state)
+    aux = _offset_table_aux(data, state, l) if fs.kernel == "vi_gh" else _aux(data, state)
     new_effect = _fit_effect(
         data, fs, aux, offset, effect.prior_variance, fs.quadrature_order
     )

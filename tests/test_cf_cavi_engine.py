@@ -1,11 +1,11 @@
 """Engine wiring for CAVI in Q2 (method='cf_cavi' / offset_integration='cf').
 
 Covers: (1) an end-to-end fit converges and recovers the true effects; (2) the
-converged state is a fixed point of the REAL engine update path (glm._cf_aux +
+converged state is a fixed point of the REAL engine update path (glm._offset_table_aux +
 glm._effect_offset + glm._fit_effect) -- so the offset table and offset are wired
 consistently; (3) at convergence an effect satisfies the EXACT CAVI stationarity
 computed from a brute-force offset-integrated cumulant over the OTHER effect
-(independent of _cf_aux); and (4) the front-door guards.
+(independent of _offset_table_aux); and (4) the front-door guards.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def test_cf_cavi_fixed_point_self_consistent():
         loo = replace(
             st, total_message=st.total_message.subtract(e.message(data))
         )
-        aux = glm._cf_aux(data, loo, l)
+        aux = glm._offset_table_aux(data, loo, l)
         offset = glm._effect_offset(fs, loo)
         refit = glm._fit_effect(
             data, fs, aux, offset, e.prior_variance, fs.quadrature_order
@@ -104,7 +104,7 @@ def _brute_atilde1_deriv(x1, alpha1, mu1, var1, eta, which, gh_order=200):
 def test_cf_cavi_matches_exact_cavi_stationarity():
     """L=2: at convergence, effect 0's per-feature Gaussian posterior satisfies the
     EXACT CAVI gradient/curvature computed from a brute-force cumulant integrated over
-    effect 1 -- independent of the CF engine's own _cf_aux.
+    effect 1 -- independent of the CF engine's own _offset_table_aux.
 
     Prior variance is FIXED here: with EB prior-variance estimation the effect is fit
     against the pre-update pv and pv is refreshed after, so m is stationary w.r.t. the

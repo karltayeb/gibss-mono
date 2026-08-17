@@ -24,9 +24,11 @@ from .linear import is_bcoo
 from .response import (
     GH,
     Bernoulli,
+    Compress,
     Gaussian,
     JJEnvelope,
     JJFixed,
+    MixtureGH,
     Poisson,
     ResponseModel,
     Smoothed,
@@ -50,10 +52,14 @@ _SMOOTHERS = {
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
-    # cf: exact mixture-offset via the characteristic function (CAVI in Q2). Handled
-    # specially in _resolve (it forces the vi_gh kernel), but listed here so the
-    # offset_integration name validates.
+    # cf/compress: interchangeable offset-integrated-cumulant builders for CAVI in Q2.
+    # Both force the vi_gh kernel in _resolve; listed here so the name validates. "cf" is
+    # the exact characteristic-function product; "compress" is the quadrature peel.
     "cf": lambda cfg: CharFnOffset(M=cfg["compress_degree"]),
+    "compress": lambda cfg: Compress(
+        inner=MixtureGH(order=cfg["offset_quadrature_points"]),
+        M=cfg["compress_degree"],
+    ),
 }
 
 _DEFAULTS = {
@@ -79,6 +85,7 @@ PRESETS = {
     "smoothed": {"offset_integration": "gh"},
     "localjj": {"variational_family": "gaussian", "offset_integration": "jj"},
     "cf_cavi": {"variational_family": "gaussian", "offset_integration": "cf"},
+    "compress_cavi": {"variational_family": "gaussian", "offset_integration": "compress"},
     "globaljj": {"offset_integration": "jj_fixed"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
@@ -133,18 +140,19 @@ def _resolve(cfg):
         elif integ == "jj" and vfam == "gaussian" and cfg["intercept"] == "shared":
             # conjugate classic localjj; Smoother.validate rejects non-Bernoulli
             return Smoothed(base, JJFixed()), "jj"
-        elif integ == "cf":
-            # exact mixture-offset CAVI in Q2: the offset is integrated over the other
-            # effects' Gaussian MIXTURE (via the characteristic function), and the
-            # effect b by GH -> the vi_gh kernel. Gaussian q only; Bernoulli only
-            # (CharFnOffset.validate). Built per-update from the effect laws, so the
-            # engine dispatches on the vi_gh kernel (not the generic vi seam).
+        elif integ in ("cf", "compress"):
+            # CAVI in Q2: integrate the offset over the OTHER effects' Gaussian MIXTURE
+            # and the effect b by GH -> the vi_gh kernel. Two interchangeable builders
+            # behind the same table seam: "cf" (exact characteristic-function product)
+            # and "compress" (quadrature peel). Gaussian q only; Bernoulli only
+            # (smoother.validate). Built per-update from the effect laws, so the engine
+            # dispatches on the vi_gh kernel (not the generic vi seam).
             if vfam != "gaussian":
                 raise ValueError(
-                    "offset_integration='cf' (CAVI in Q2) needs "
+                    f"offset_integration={integ!r} (CAVI in Q2) needs "
                     "variational_family='gaussian'; the effect q must be Gaussian."
                 )
-            return Smoothed(base, CharFnOffset(M=cfg["compress_degree"])), "vi_gh"
+            return Smoothed(base, _SMOOTHERS[integ](cfg)), "vi_gh"
         else:
             response = Smoothed(base, _SMOOTHERS[integ](cfg))
 
