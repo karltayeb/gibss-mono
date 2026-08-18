@@ -112,6 +112,29 @@ def test_q2_dense_centering(integ):
     assert np.asarray(s.pip)[c] > 0.9
 
 
+def test_q2_sparse_centering_matches_dense():
+    # Sparse-centered Q2 (Compress): the centered offset fold + the centered effect kernel
+    # (glm_vi_gh_center_ser) together == the manual dense-centered fit, to machine
+    # precision. cf can't center sparse (its closed-form product densifies) -> rejected.
+    rng = np.random.default_rng(7)
+    n, p, c = 400, 20, 3
+    Xd = (rng.random((n, p)) < 0.2) * rng.normal(1.5, 0.3, (n, p))
+    beta = np.zeros(p); beta[c] = 2.5
+    y = (rng.uniform(size=n) < _sigmoid(Xd @ beta - 1.0)).astype(float)
+    Xb = sparse.BCOO.fromdense(jnp.asarray(Xd))
+    Xdc = jnp.asarray(Xd - Xd.mean(0)[None, :])
+    kw = dict(L=3, offset_integration="compress", variational_family="gaussian",
+              estimate_prior_variance=False, prior_variance=1.0, max_iter=80)
+    s_sp = fit_glm_susie(Xb, jnp.asarray(y), center=True, **kw)
+    s_de = fit_glm_susie(Xdc, jnp.asarray(y), center=False, **kw)
+    flm = lambda st: np.stack([np.asarray(e.feature_log_marginal) for e in st.single_effects])
+    assert np.max(np.abs(flm(s_sp) - flm(s_de))) < 1e-4
+    assert np.asarray(s_sp.pip)[c] > 0.9
+    with pytest.raises(ValueError, match="cf"):
+        fit_glm_susie(Xb, jnp.asarray(y), L=2, offset_integration="cf",
+                      variational_family="gaussian", center=True, max_iter=3)
+
+
 def test_cf_requires_gaussian_vfam():
     # cf is Q2-only (no closed-form CF for a free-form Q1 posterior); it must reject
     # variational_family='unconstrained'. (compress, by contrast, is valid for BOTH

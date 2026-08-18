@@ -269,50 +269,32 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
-    # CAVI in Q2 (vi_gh): DENSE pre-centering is supported and desirable -- it
-    # orthogonalizes the intercept from the effects, so the mean-field factorization
-    # q(b0) prod q(b_l) (whose whole premise is posterior independence) becomes accurate.
-    # Both builders read the eagerly-centered X. SPARSE is not yet supported here: the CF
-    # fold densifies under centering (off-support entries stop clumping), and the Compress
-    # sparse fold needs a centered variant. Default is uncentered (layout-consistent).
-    if kernel == "vi_gh":
-        if is_bcoo(X):
-            if center:
-                raise ValueError(
-                    "CAVI in Q2 (offset_integration='cf'/'compress' + "
-                    "variational_family='gaussian') does not support pre-centering on a "
-                    "sparse (BCOO) design yet; pass center=False, or densify X. Dense "
-                    "centering IS supported."
-                )
-            center = False
-        elif center is None:
-            center = False  # dense default: uncentered; center=True is honored
-
-    # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
-    # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row
-    # background) and linear (row-wise exact through a CenteredOperator) consume it; the
-    # vi/jj kernels' per-entry variance/tilt would drop the off-support fill-in.
-    # center=None -> on wherever supported (so the default centers everything it can
-    # without crashing a method sweep); an EXPLICIT center=True on an unsupported
-    # sparse + vi/jj combo is a clear error, not a fit.
-    # compress on a DENSE design can center (the fold reads the eagerly-centered X, so it
-    # stays consistent with the kernel). On SPARSE the GAUSSIAN 'compress' fundamentally
-    # cannot: zero-clumping needs X_ij = 0 to be a true point mass at 0, but centering
-    # shifts every entry (zeros included) by -cbar_j, leaving no zeros to clump. The
-    # SELF-NORMALIZED 'compress_selfnorm' CAN: its off-support fill-in folds as a
-    # per-feature background at -c_j b (build_aux_selfnorm_sequential_sparse_centered), the
-    # same split glm_center_ser uses for the kernel -- so sparse centering is consistent
-    # end to end. Default is uncentered (layout-consistent: dense == sparse); users opt in.
+    # Pre-centering support depends on kernel AND builder. Centering orthogonalizes the
+    # intercept from the effects, so the mean-field factorization q(b0) prod q(b_l) -- whose
+    # premise IS posterior independence -- becomes accurate; always desirable where the fold
+    # can consume it.
+    #   vi_gh (Q2): dense -> both builders read the eagerly-centered X. Sparse -> the
+    #     Compress peel has a centered fold (the -c_j off-support background split); the CF
+    #     fold densifies under centering (off-support entries stop clumping) -> rejected.
+    #   compress_selfnorm (Q1, quad): dense + sparse (its self-normalized centered fold).
+    #   quad / linear (classic): dense eager; sparse via glm_center_ser / CenteredOperator.
+    #   vi / jj: dense only (their per-entry variance/tilt drops the sparse off-support fill).
+    # Default (center=None) is uncentered on sparse (layout-consistent), centered where free
+    # on dense; an EXPLICIT center=True on an unsupported combo is an error, not a fallback.
     smoother = getattr(response, "smoother", None)
-    if isinstance(smoother, Compress):
-        if center is True and is_bcoo(X) and not isinstance(smoother, CompressSelfNorm):
+    if kernel == "vi_gh":
+        if center and is_bcoo(X) and isinstance(smoother, CharFnOffset):
+            # Sparse centering: the Compress peel has a centered fold (self-normalized
+            # -c_j background) + a centered effect kernel (glm_vi_gh_center_ser). The CF
+            # closed-form product densifies under centering, so cf can't participate.
             raise ValueError(
-                "offset_integration='compress' cannot center a sparse (BCOO) design: the "
-                "zero-clumping fold needs X_ij = 0 to be a point mass at 0, but centering "
-                "shifts every entry (zeros included) so nothing clumps. Use "
-                "offset_integration='compress_selfnorm' (whose fold handles the "
-                "off-support background), center=False, or densify X."
+                "offset_integration='cf' cannot pre-center a sparse (BCOO) design (the "
+                "characteristic-function fold densifies under centering); use "
+                "offset_integration='compress', center=False, or densify X."
             )
+        if center is None:
+            center = False  # default uncentered (layout-consistent); center=True honored
+    elif isinstance(smoother, Compress):  # compress_selfnorm (quad): dense + sparse center
         if center is None:
             center = False
     else:

@@ -51,6 +51,7 @@ from .response_ser import (
     glm_profile_ser_nodes,
     glm_ser,
     glm_ser_nodes,
+    glm_vi_gh_center_ser,
     glm_vi_gh_ser,
     glm_vi_profile_ser,
     glm_vi_ser,
@@ -237,6 +238,20 @@ def _intercept_ov(state):
     return float(fs.intercept_var)
 
 
+def _gh_expand(effect, order):
+    """A Gaussian-mixture effect `(alpha, mu, var)` (each (p,)) as raw quadrature
+    `(b_nodes, logW)` (each (p, order)): every feature's `N(mu_c, var_c)` becomes its
+    `order`-node Gauss-Hermite rule with selection weight `alpha_c`. A Gaussian component
+    folded by GH IS this node set, so this lets the Compress Gaussian fold reuse the
+    self-normalized (raw-node) centered sparse fold. `softmax(logW)` = `alpha_c * w_gh`."""
+    alpha, mu, var = (jnp.asarray(effect[0]), jnp.asarray(effect[1]), jnp.asarray(effect[2]))
+    xgh_np, logw_np = _gh_rule(order)
+    xgh, logwgh = jnp.asarray(xgh_np), jnp.asarray(logw_np)
+    b_nodes = mu[:, None] + jnp.sqrt(2.0 * jnp.maximum(var, 0.0))[:, None] * xgh[None, :]
+    logW = jnp.log(alpha)[:, None] + logwgh[None, :]  # softmax normalizes the GH weights
+    return b_nodes, logW
+
+
 def _build_offset_table(data, state, effects, offset_var):
     """The vi_gh aux: an offset-integrated cumulant table from an explicit list of
     single-effects (each read in EFFECT space -- x, alpha, mu, var) PLUS one homogeneous
@@ -266,7 +281,18 @@ def _build_offset_table(data, state, effects, offset_var):
                     base, y, z1, jnp.full((n, 1), offset_var), z1
                 )
                 init = (-cll0, -cg0, cw0, offset_var)
-            aux = smoother.build_aux_sequential_sparse(base, y, X, eff, init=init)
+            cbar = getattr(data, "column_center", None)
+            if cbar is not None:
+                # centered sparse design: offset is (x_ij - c_j) b, so a zero entry is a
+                # point mass at -c_j b (NOT 0) and zero-clumping breaks. A Gaussian
+                # component folded by GH IS a raw node set, so GH-expand the mixtures and
+                # reuse the self-normalized CENTERED fold (its -c_j background split).
+                gh_eff = [_gh_expand(t, smoother.inner.order) for t in eff]
+                aux = smoother.build_aux_selfnorm_sequential_sparse_centered(
+                    base, y, X, gh_eff, cbar, init=init
+                )
+            else:
+                aux = smoother.build_aux_sequential_sparse(base, y, X, eff, init=init)
         else:
             Xd = jnp.asarray(X)
             eff = [
@@ -333,6 +359,15 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
             # Expose the centered per-feature quad nodes so the sparse-CENTERED
             # self-normalized offset fold can fold this effect against (x_ij - c_j) b.
             return mu, var, log_bf, coefficient_kl, (b_nodes, log_node_weight)
+        if fs.kernel == "vi_gh":
+            # CAVI in Q2 on a centered sparse column: GH over b against the offset table,
+            # with the same support+background split as glm_center_ser for the -c_j fill.
+            bg = "chebyshev" if fs.background == "exact" else fs.background
+            mu, var, log_bf, coefficient_kl = glm_vi_gh_center_ser(
+                op, aux, offset, center, prior_variance, fs.response,
+                order=order, background=bg,
+            )
+            return mu, var, log_bf, coefficient_kl, None
         if fs.kernel == "linear":
             # quadratic response: w is constant, so centering is EXACT and row-wise --
             # a CenteredOperator's rank-1 rmatvec/moment(2) corrections carry it (O(nnz)
@@ -342,10 +377,10 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
             # per-feature parameter under centering (c_j^2 v_j), which the 1-D background
             # can't express -- a 2-D surrogate is a follow-up.
             raise NotImplementedError(
-                "sparse (BCOO) pre-centering is implemented for kernel='quad' and "
-                f"'linear'; kernel={fs.kernel!r} would silently fit the UNCENTERED model "
-                "(its per-entry variance/tilt adds a second per-feature parameter). Pass "
-                "center=False, or use intercept='profiled' (invariant to column shifts)."
+                "sparse (BCOO) pre-centering is implemented for kernel='quad', 'vi_gh' "
+                f"and 'linear'; kernel={fs.kernel!r} would silently fit the UNCENTERED "
+                "model (its per-entry variance/tilt adds a second per-feature parameter). "
+                "Pass center=False, or use intercept='profiled' (invariant to shifts)."
             )
     nodes = None  # (b_nodes, log_node_weight) for the plain quad/shared kernel, else None
     if fs.kernel == "quad" and profiled:

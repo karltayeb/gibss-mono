@@ -736,6 +736,86 @@ def glm_vi_gh_ser(
     return m, v, op.local_moment(0, ll - ll0) - kl, kl
 
 
+def glm_vi_gh_center_ser(
+    op,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 100,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """Sparse-CENTERED variant of `glm_vi_gh_ser`: the Gaussian-VI effect update on a
+    centered design, `eta = offset + (x_ij - c_j) b`, where a zero entry is NOT a point
+    mass at o=0 but at `-c_j b` (a per-feature off-support BACKGROUND). The effect `b` is
+    integrated by GH over q(b)=N(m,v) as in `glm_vi_gh_ser`; the centered score/curvature
+    at each GH-b node reuse `glm_center_ser`'s support+background split: support entries
+    carry `(x_ij - c_j)`, and the all-rows off-support fill `-c_j` is summed once via
+    `_background` (a Chebyshev-in-shift surrogate, O(n D) not O(n p)) with the support
+    rows corrected out. `center` is the per-column mean `c` (p,), GIVEN. Returns
+    (m, v, elbo_rel, coefficient_kl); shared intercept only."""
+    offset = jnp.asarray(offset)
+    c = jnp.asarray(center)
+    aux_e = _tmap(op.broadcast_rows, aux)
+    off_e = op.broadcast_rows(offset)
+    x_e = op.entry_x
+    c_e = op.broadcast_cols(c)
+    xc_e = x_e - c_e  # (x_ij - c_j) at support entries
+    inv_pv = 1.0 / prior_variance
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+
+    def sc_at(b):
+        # centered (loglik, score, curvature) per feature at a single b (p,), all-rows:
+        # support entries use (x-c); the off-support fill uses -c (the `_background` sum
+        # over ALL rows, minus the support rows already counted at the support predictor).
+        b_e = op.broadcast_cols(b)
+        eta_e = off_e + xc_e * b_e  # support predictor
+        eta_bg_e = off_e - c_e * b_e  # support rows at the background shift (correction)
+        ll_e, g_e, w_e = response.terms(eta_e, aux_e)
+        ll_b, g_b, w_b = response.terms(eta_bg_e, aux_e)
+        BGw, BGg, BGl = _background(response, offset, aux, -c * b, background, degree)
+        ll = BGl + op.local_moment(0, ll_e - ll_b)
+        score = op.local_moment(0, xc_e * g_e) - c * (BGg - op.local_moment(0, g_b))
+        curv = op.local_moment(0, xc_e**2 * w_e) + c**2 * (BGw - op.local_moment(0, w_b))
+        return ll, score, curv
+
+    def smoothed(m, v):
+        # E_{b ~ N(m, v)} of the centered (ll, score, curv), by GH over b (per feature).
+        sd = jnp.sqrt(2.0 * jnp.maximum(v, 0.0))
+        bk = m[None, :] + sd[None, :] * nodes[:, None]  # (order, p) per-feature b nodes
+        ll_k, sc_k, cv_k = jax.vmap(sc_at)(bk)  # (order, p) each
+        W = wts[:, None]
+        return jnp.sum(W * ll_k, 0), jnp.sum(W * sc_k, 0), jnp.sum(W * cv_k, 0)
+
+    def body(state):
+        m, v, _, it = state
+        _, score, curv = smoothed(m, v)
+        prec = inv_pv + curv  # 1/v = 1/pv + sum_i (x-c)^2 E_b[weight]  (Price)
+        step = jnp.clip((score - inv_pv * m) / prec, -4.0, 4.0)
+        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    )
+    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+    # ELBO - baseline: GH-averaged centered loglik at (m, v) minus the b=0 null (already
+    # per-feature summed inside `sc_at`), minus the KL.
+    ll = smoothed(m, v)[0]
+    ll0 = sc_at(jnp.zeros(op.p))[0]
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    return m, v, (ll - ll0) - kl, kl
+
+
 @partial(jax.jit, static_argnames=("response", "n_iter", "background", "degree"))
 def glm_vi_profile_ser(
     op,
