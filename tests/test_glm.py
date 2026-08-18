@@ -237,9 +237,9 @@ def test_glm_vi_kernel_recovers():
 
 
 def test_glm_intercept_variance_is_curvature():
-    # estimate_intercept returns (b0, v0) with v0 = 1/sum w = the inverse observed
-    # curvature of the loglik in b0 (exact for an unwrapped ExponentialFamily);
-    # checked against autodiff of the summed Bernoulli loglik.
+    # estimate_intercept returns (b0, v0) with v0 = 1/(sum w + 1/tau) = the inverse MAP
+    # curvature of the loglik + the diffuse N(0, tau) intercept prior (tau huge, so ~ the
+    # inverse observed curvature); checked against autodiff of the summed Bernoulli loglik.
     import jax
     import jax.numpy as jnp
     rng = np.random.default_rng(0)
@@ -266,9 +266,11 @@ def test_glm_intercept_variance_is_curvature():
         eta = jnp.asarray(off) + b
         return jnp.sum(jnp.asarray(y) * eta - jax.nn.softplus(eta))
 
-    assert abs(float(jax.grad(ll)(jnp.asarray(b0)))) < 1e-6         # at the MAP
+    tau = S.family_state.intercept_prior_variance
+    # MAP condition: ll'(b0) - b0/tau = 0 (loglik score balances the diffuse prior)
+    assert abs(float(jax.grad(ll)(jnp.asarray(b0))) - b0 / tau) < 1e-6
     curv = -float(jax.grad(jax.grad(ll))(jnp.asarray(b0)))
-    np.testing.assert_allclose(v0, 1.0 / curv, rtol=1e-8)
+    np.testing.assert_allclose(v0, 1.0 / (curv + 1.0 / tau), rtol=1e-9)
 
 
 def test_glm_intercept_variance_flows_into_offset_variance():

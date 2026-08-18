@@ -80,7 +80,7 @@ def test_intercept_quad_matches_dense_reference():
         assert s.converged
         order = s.family_state.quadrature_order
         data = prep_data(X, y)
-        m_new, v_new, _, _ = glm._intercept_freeform(data, s, order=order)
+        m_new, v_new, _, _, _ = glm._intercept_freeform(data, s, order=order)
         m_old, v_old = _old_plugin(s, X, y, order)
         grid = np.linspace(m_new - 2.0, m_new + 2.0, 2001)
         m_ref, v_ref = _dense_reference(s, X, y, grid)
@@ -102,7 +102,7 @@ def test_intercept_quad_matches_plugin_with_no_effects():
     resp = Smoothed(Bernoulli(), CompressSelfNorm(M=48))
     state = glm.initialize_state(data, L=2, response=resp)  # effects unfit (b_nodes None)
     order = state.family_state.quadrature_order
-    m_new, v_new, _, _ = glm._intercept_freeform(data, state, order=order)
+    m_new, v_new, _, _, _ = glm._intercept_freeform(data, state, order=order)
     m_old, v_old = _old_plugin(state, X, y, order)
     assert abs(m_new - m_old) < 1e-9
     assert abs(v_new - v_old) < 1e-9

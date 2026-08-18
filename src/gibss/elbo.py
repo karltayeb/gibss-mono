@@ -15,9 +15,10 @@ Why this is the whole problem
 -----------------------------
 The KL side is free: mean-field factorizes it into `sum_l KL(q_l || prior_l)`, which is
 exactly the per-effect `e.kl` already stored on every fitted effect (a Gaussian KL for Q2,
-the free-form coefficient KL for Q1 -- both on the same nats scale). The intercept is a
-flat-prior nuisance and is PLUGGED IN at its posterior mean (`fs.intercept_value`), so it
-carries no KL; see `compute_elbo` for the rationale.
+the free-form coefficient KL for Q1 -- both on the same nats scale). A SHARED intercept is a
+genuine variational factor q(b0) with a diffuse N(0, tau) prior: its spread is integrated
+(not dropped) and its KL is subtracted, exactly like an effect. A profiled/null intercept is
+a point and is plugged in at `fs.intercept_value`; see `compute_elbo` for the rationale.
 
 The only real work is the expected log-likelihood `sum_i E_q[log p(y_i | eta_i)]`, where
 `eta_i` couples ALL L effects through the nonlinear cumulant `A`. That expectation over the
@@ -62,13 +63,17 @@ from .response import (
 class ELBOBreakdown:
     """The additive pieces of `F(q)` (all in nats).
 
-    `elbo = expected_loglik - kl`. `expected_loglik` already includes the base-measure
-    constant `base_measure` (so it is a genuine `E_q[log p(y|eta)]`); `kl` is the summed
-    per-effect KL. `is_q1` records which integrator ran (free-form Q1 vs Gaussian Q2)."""
+    `elbo = expected_loglik - kl - intercept_kl`. `expected_loglik` already includes the
+    base-measure constant `base_measure` (so it is a genuine `E_q[log p(y|eta)]`) and, for a
+    shared intercept, integrates over q(b0) too; `kl` is the summed per-effect KL;
+    `intercept_kl` is KL(q(b0) || N(0, intercept_prior_variance)) (0 for a profiled/null
+    intercept, which is plugged in). `is_q1` records which integrator ran (free-form Q1 vs
+    Gaussian Q2)."""
 
     elbo: float
     expected_loglik: float
     kl: float
+    intercept_kl: float
     base_measure: float
     is_q1: bool
 
@@ -90,8 +95,8 @@ def _base_measure(base: ResponseModel, y) -> float:
 
 def _predictor_mean(data, state):
     """The full posterior mean of the linear predictor `E[eta] = sum_l X(alpha_l mu_l) +
-    b0 + glm_offset` (n,). The effects' mean is the aggregate message; the flat-prior
-    intercept is plugged in at its posterior mean."""
+    b0 + glm_offset` (n,). The effects' mean is the aggregate message; the intercept enters
+    at its posterior mean (its spread, when integrated, is folded into the offset table)."""
     fs = state.family_state
     eta = jnp.asarray(state.total_message.mean)
     eta = eta + jnp.asarray(fs.glm_offset) + float(fs.intercept_value)
@@ -115,12 +120,14 @@ def compute_elbo(
     integrated by the Compress Gaussian-mixture peel. In both cases ALL L effects are folded
     (nothing held out) and the expected log-likelihood is read off at `E[eta]`.
 
-    The intercept is a flat-prior nuisance: its variational factor `q(b0)` has no proper
-    prior, so integrating it out would add only an ill-defined (improper-prior) constant.
-    We therefore PLUG IN `b0 = fs.intercept_value` (its posterior mean) and give it no KL.
-    This keeps `F(q)` well-defined and comparable across fits; the interesting variational
-    object is `q` over the effects. (For a profiled intercept, `intercept_value` is the
-    converged shared value.)
+    The intercept b0 is a variational factor q(b0) with a diffuse N(0, tau) prior (tau =
+    fs.intercept_prior_variance). For a SHARED intercept its spread is integrated (its
+    variance folds into the offset table for Q2, its free-form nodes for Q1) and its KL,
+    KL(q(b0) || N(0, tau)), is subtracted -- dropping it would be a real O(v0) error in the
+    likelihood, not a constant. A "profiled"/"null" intercept is a point (b0 profiled per
+    feature inside the kernel, or the frozen null fit), so it is plugged in at
+    `intercept_value` with no b0 KL. The b0 prior tau is diffuse, so its KL is dominated by a
+    `~0.5 log(tau)` term common to all fits on the same data.
 
     Accuracy is controlled by `order` (Gauss-Hermite nodes per Gaussian component / per
     node) and `M` (Chebyshev degree of the residual). The defaults are the exact-reference
@@ -141,41 +148,47 @@ def compute_elbo(
 
     y = jnp.asarray(data.y)
     n = y.shape[0]
-    eta = _predictor_mean(data, state)  # (n,) full posterior mean of the predictor
+    eta = _predictor_mean(data, state)  # (n,) posterior mean of the predictor (b0 mean in)
+
+    # A shared intercept is a genuine q(b0) whose spread must be integrated; profiled/null
+    # is a point (plugged in via eta). intercept_kl is the b0 factor's KL (0 unless shared).
+    integrate_b0 = fs.intercept == "shared"
+    intercept_var = float(getattr(fs, "intercept_var", 0.0)) if integrate_b0 else 0.0
+    intercept_kl = float(getattr(fs, "intercept_kl", 0.0)) if integrate_b0 else 0.0
 
     is_q1 = effects[0].b_nodes is not None
     if is_q1:
-        # free-form Q1: fold every effect against its TRUE node posterior (intercept
-        # plugged in via eta, not folded), then read the smoothed log-lik at E[eta].
+        # free-form Q1: fold every effect against its TRUE node posterior; when the intercept
+        # is shared its free-form q(b0) folds too (include_intercept), else it rides in eta.
         smoother = CompressSelfNorm(inner=MixtureGH(order=order), M=M)
         aux = _selfnorm_fold_aux(
-            data, state, smoother, base, y, n, effects, include_intercept=False
+            data, state, smoother, base, y, n, effects, include_intercept=integrate_b0
         )
         ll = smoother.terms(base, eta, aux)[0]
     else:
         # Gaussian Q2: build a FRESH exact integrator over all effects' Gaussian mixtures,
         # independent of whatever smoother (if any) the fit used -- so a plug-in gIBSS Q2
-        # state and an exact Q2-CAVI state are scored identically. offset_var=0: the
-        # intercept is plugged in, not integrated.
+        # state and an exact Q2-CAVI state are scored identically. offset_var folds the
+        # shared intercept's N(0, v0) spread (0 when the intercept is plugged in).
         smoother = Compress(inner=MixtureGH(order=order), M=M)
         scored = replace(
             state,
             family_state=replace(fs, response=Smoothed(base, smoother)),
         )
-        aux = _build_offset_table(data, scored, effects, 0.0)
+        aux = _build_offset_table(data, scored, effects, intercept_var)
         ll = smoother.terms(base, eta, aux)[0]
 
-    expected_loglik = float(jnp.sum(ll))
     base_measure = _base_measure(base, y) if include_base_measure else 0.0
-    expected_loglik += base_measure
+    expected_loglik = float(jnp.sum(ll)) + base_measure
     kl = float(sum(float(e.kl) for e in effects))
-    elbo = expected_loglik - kl
+    elbo = expected_loglik - kl - intercept_kl
 
     if return_breakdown:
         return ELBOBreakdown(
             elbo=elbo,
             expected_loglik=expected_loglik,
             kl=kl,
+            intercept_kl=intercept_kl,
             base_measure=base_measure,
             is_q1=is_q1,
         )
