@@ -159,16 +159,18 @@ class GLMFamilyState:
                 f"or 'vi_gh'"
             )
         if self.kernel == "vi_gh":
-            # any offset-integrated-cumulant smoother works: CharFnOffset (exact CF
-            # product) or Compress (quadrature peel). Both hand vi_gh the same table
-            # contract (y, obar=0, center=0, hw, coef_ll, coef_g, coef_w).
-            ok = isinstance(self.response, Smoothed) and isinstance(
+            # Two responses are valid: (a) a CAVI table smoother -- Smoothed(base,
+            # CharFnOffset() | Compress()) -- for the exact Q2 mixture offset; or (b) a
+            # PLAIN base (not Smoothed) for the PLUG-IN Q2 (offset = the other effects'
+            # mean, no table). Anything else (e.g. a pointwise GH/Taylor scheme) is wrong.
+            ok = (not isinstance(self.response, Smoothed)) or isinstance(
                 self.response.smoother, (CharFnOffset, Compress)
             )
             if not ok:
                 raise ValueError(
-                    "kernel='vi_gh' (CAVI in Q2) needs response = Smoothed(base, "
-                    f"CharFnOffset()|Compress()); got {self.response!r}."
+                    "kernel='vi_gh' needs response = Smoothed(base, "
+                    "CharFnOffset()|Compress()) for exact CAVI in Q2, or a plain base "
+                    f"for the plug-in Q2 (offset_integration='none'); got {self.response!r}."
                 )
         if self.intercept not in ("shared", "profiled", "null"):
             raise ValueError(
@@ -643,12 +645,16 @@ def _intercept_freeform(data, state, order=15, prior_variance=1e6):
 def _cavi_mode(fs):
     """The variational treatment the intercept AND the effects use: the single source of
     truth routed on by both `estimate_intercept_step` and `update_effect_index_step`.
-      'q2'     -- Gaussian q, exact CAVI in Q2 (kernel='vi_gh').
-      'q1'     -- free-form q, exact CAVI in Q1 (offset_integration='compress_selfnorm').
-      'plugin' -- everything else (gh / taylor / jj / none): the classic point intercept
-                  and the aggregate-message offset."""
+      'q2'       -- Gaussian q, exact CAVI in Q2 (vi_gh + CharFnOffset/Compress table).
+      'q2_plugin'-- Gaussian q, PLUG-IN Q2 (vi_gh on a plain base): the offset is the
+                    other effects' MEAN (no table), so the effect aux is plain y and the
+                    intercept is the plain point strategy -- same routing as 'plugin'.
+      'q1'       -- free-form q, exact CAVI in Q1 (offset_integration='compress_selfnorm').
+      'plugin'   -- everything else (gh / taylor / jj / none): classic point intercept
+                    and the aggregate-message offset."""
     if fs.kernel == "vi_gh":
-        return "q2"
+        smoother = fs.response.smoother if isinstance(fs.response, Smoothed) else None
+        return "q2" if isinstance(smoother, (CharFnOffset, Compress)) else "q2_plugin"
     if isinstance(getattr(fs.response, "smoother", None), CompressSelfNorm):
         return "q1"
     return "plugin"

@@ -242,9 +242,12 @@ def test_invalid_configurations_raise():
     # Gaussian cumulant is quadratic: offset integration is exact and free
     with pytest.raises(ValueError, match="quadratic cumulant"):
         fit_glm_susie(X, y, family="gaussian", offset_integration="gh")
-    # Gaussian q needs a scheme (it IS the E_q operator)
-    with pytest.raises(ValueError, match="offset-integration scheme"):
-        fit_glm_susie(X, y, variational_family="gaussian")
+    # Gaussian q + offset_integration='none' is now VALID (plug-in Q2, gibss_gaussian);
+    # but compress_selfnorm (exact free-form Q1) has no Gaussian-q meaning -> rejected.
+    fit_glm_susie(X, y, variational_family="gaussian", max_iter=3)  # plug-in: runs
+    with pytest.raises(ValueError, match="unconstrained"):
+        fit_glm_susie(X, y, variational_family="gaussian",
+                      offset_integration="compress_selfnorm")
     # unknown intercept: rejected downstream by GLMFamilyState
     with pytest.raises(ValueError, match="intercept"):
         fit_glm_susie(X, y, intercept="wat")
