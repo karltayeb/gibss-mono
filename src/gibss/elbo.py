@@ -47,6 +47,13 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
+from .linear import is_bcoo
+from .poisson_offset import (
+    log_kappa_dense,
+    log_kappa_q1_dense,
+    log_kappa_q1_sparse,
+    log_kappa_sparse,
+)
 from .response import (
     Bernoulli,
     Compress,
@@ -103,6 +110,41 @@ def _predictor_mean(data, state):
     return eta
 
 
+def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var):
+    r"""Analytic per-row expected log-likelihood `y_i E[eta_i] - E[e^{eta_i}]` for a Poisson
+    base -- no quadrature. Because `A = exp`, `E[e^{eta_i}] = e^{E[eta_i] + logkappa_i}` with
+    `logkappa` the zero-mean offset log-MGF over ALL effects (+ the shared intercept spread),
+    computed by the closed-form Gaussian-mixture MGF in Q2, or the exact node-weighted sum
+    over the free-form quadrature law in Q1. `eta` is `E[eta]` (the predictor mean)."""
+    fs = state.family_state
+    X = data.X
+    effects = list(state.single_effects)
+    if is_q1:
+        node_effects = [
+            (jnp.asarray(e.b_nodes).T, jnp.asarray(e.log_node_weight).T)
+            for e in effects
+            if e.b_nodes is not None
+        ]
+        icpt = None
+        if integrate_b0 and fs.intercept_b_nodes is not None:
+            icpt = (fs.intercept_b_nodes, fs.intercept_log_node_weight)
+        n = jnp.asarray(data.y).shape[0]
+        if is_bcoo(X):
+            logk = log_kappa_q1_sparse(X, node_effects, n, intercept=icpt)
+        else:
+            logk = log_kappa_q1_dense(X, node_effects, n, intercept=icpt)
+    else:
+        # Gaussian Q2: the intercept's N(0, v0) spread folds via offset_var (0 if plugged in).
+        if is_bcoo(X):
+            eff = [(e.alpha, e.mu, e.var) for e in effects]
+            logk = log_kappa_sparse(X, eff, offset_var=intercept_var)
+        else:
+            eff = [(X, e.alpha, e.mu, e.var) for e in effects]
+            logk = log_kappa_dense(eff, jnp.asarray(data.y).shape[0], offset_var=intercept_var)
+    y = jnp.asarray(data.y)
+    return y * eta - jnp.exp(eta + logk)
+
+
 def compute_elbo(
     data,
     state,
@@ -131,7 +173,10 @@ def compute_elbo(
 
     Accuracy is controlled by `order` (Gauss-Hermite nodes per Gaussian component / per
     node) and `M` (Chebyshev degree of the residual). The defaults are the exact-reference
-    setting, higher than the in-loop fit uses; the ELBO converges as they grow.
+    setting, higher than the in-loop fit uses; the ELBO converges as they grow. The Poisson
+    (log-link) base is a special case: its offset integral is the closed-form MGF, so the
+    expected log-likelihood is computed ANALYTICALLY (exact, `order`/`M` unused) in both Q1
+    and Q2 -- the Gaussian-mixture MGF for Q2, the node-weighted sum for Q1.
 
     Returns the ELBO as a float, or an `ELBOBreakdown` if `return_breakdown=True`.
     Supports Bernoulli / Poisson / Gaussian bases; other bases give the ELBO up to the
@@ -157,7 +202,12 @@ def compute_elbo(
     intercept_kl = float(getattr(fs, "intercept_kl", 0.0)) if integrate_b0 else 0.0
 
     is_q1 = effects[0].b_nodes is not None
-    if is_q1:
+    if isinstance(base, Poisson):
+        # Poisson is analytic: A = exp turns the offset integral into a moment-generating
+        # function -- a closed-form Gaussian-mixture MGF (Q2) or an exact node-weighted sum
+        # over the free-form quadrature law (Q1). No Chebyshev/GH peel, so no order/M error.
+        ll = _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var)
+    elif is_q1:
         # free-form Q1: fold every effect against its TRUE node posterior; when the intercept
         # is shared its free-form q(b0) folds too (include_intercept), else it rides in eta.
         smoother = CompressSelfNorm(inner=MixtureGH(order=order), M=M)

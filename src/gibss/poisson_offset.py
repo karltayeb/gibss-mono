@@ -52,6 +52,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 
 from jax.ops import segment_sum
@@ -63,6 +64,8 @@ from .response import Poisson, ResponseModel, Smoother
 __all__ = [
     "log_kappa_dense",
     "log_kappa_sparse",
+    "log_kappa_q1_dense",
+    "log_kappa_q1_sparse",
     "PoissonLogNormalOffset",
 ]
 
@@ -117,6 +120,88 @@ def log_kappa_sparse(X, effects, offset_var=0.0, entry_chunk=1 << 16):
             acc = acc + segment_sum(g, r, num_segments=n)
         # log(1 + acc) = log E[e^{o_li}]; log1p keeps precision when acc is small.
         logk = logk + (jnp.log1p(acc) - mean)
+    return logk
+
+
+# --------------------------------------------------------------------------------------
+# Free-form (Q1) node folds. A Q1 effect's posterior IS the discrete quadrature law: value
+# nodes `b_cm` over features c and nodes m, with self-normalized weights `W_cm = softmax`.
+# For the Poisson MGF `E[e^{psi}]` this is an EXACT finite sum `sum_{c,m} W_cm e^{x_ic b_cm}`
+# -- no interpolation, the Q1 analogue of the Gaussian MGF above. Used by the analytic ELBO.
+# --------------------------------------------------------------------------------------
+
+
+def _log_node_mgf_intercept(node_law):
+    """Zero-mean log-MGF `log(sum_m W_m e^{b_m}) - sum_m W_m b_m` of the free-form intercept
+    (all-ones column, so `psi = b0`), a SCALAR. `node_law = (b0_nodes, logW0)` each (Q,)."""
+    b0, logW0 = node_law
+    b0 = jnp.asarray(b0)
+    logw = jnp.asarray(logW0)
+    logw = logw - logsumexp(logw)  # normalize
+    W0 = jnp.exp(logw)
+    return logsumexp(logw + b0) - jnp.sum(W0 * b0)
+
+
+def log_kappa_q1_dense(X, effects, n, intercept=None):
+    """Per-row zero-mean log-MGF (n,) for FREE-FORM (Q1) effects on a dense design.
+
+    `effects` is a list of `(b_nodes, logW)` each `(C, Q)` -- value nodes and log
+    unnormalized JOINT weights over (feature, node). `intercept` is an optional
+    `(b0_nodes, logW0)` for the shared free-form intercept (all-ones column). Each effect's
+    contribution is `log(sum_{c,m} W_cm e^{x_ic b_cm}) - sum_{c,m} W_cm x_ic b_cm`, the log
+    of the node-weighted MGF minus the mean carried in eta -- computed stably in log space,
+    reduced feature-by-feature with a `lax.scan` (peak memory `O(n Q)`)."""
+    X = jnp.asarray(X)
+    logk = jnp.zeros(n)
+    for b_nodes, logW in effects:
+        b_nodes = jnp.asarray(b_nodes)                       # (C, Q)
+        logw = jnp.asarray(logW)
+        logw = logw - logsumexp(logw)                        # normalize over all (C, Q)
+        W = jnp.exp(logw)
+        mean = X @ jnp.sum(W * b_nodes, axis=1)              # (n,) = sum_{c,m} W_cm x_ic b_cm
+
+        def body(carry_logS, comp):
+            xc, bc, lwc = comp                               # (n,), (Q,), (Q,)
+            logS_c = logsumexp(lwc[None, :] + xc[:, None] * bc[None, :], axis=1)  # (n,)
+            return jnp.logaddexp(carry_logS, logS_c), None
+
+        logS, _ = jax.lax.scan(
+            body, jnp.full(n, -jnp.inf), (X.T, b_nodes, logw)
+        )
+        logk = logk + (logS - mean)
+    if intercept is not None:
+        logk = logk + _log_node_mgf_intercept(intercept)
+    return logk
+
+
+def log_kappa_q1_sparse(X, effects, n, intercept=None, entry_chunk=1 << 16):
+    """Sparse (BCOO) analogue of `log_kappa_q1_dense` via the zero-clumping identity: an
+    off-support feature (x_ic = 0) contributes its marginal node mass `pi_c = sum_m W_cm`,
+    so `E[e^{psi}] = 1 + sum_{c in supp}(sum_m W_cm e^{x_ic b_cm} - pi_c)` (uses sum_c pi_c
+    = 1). `effects` is a list of `(b_nodes, logW)` each `(C, Q)`; `intercept` optional."""
+    op = BCOOOperator(X)
+    idx = X.indices
+    rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
+    nnz = vals.shape[0]
+
+    logk = jnp.zeros(n)
+    for b_nodes, logW in effects:
+        b_nodes = jnp.asarray(b_nodes)                       # (C, Q)
+        logw = jnp.asarray(logW)
+        W = jax.nn.softmax(logw.reshape(-1)).reshape(logw.shape)  # (C, Q), joint
+        pi = jnp.sum(W, axis=1)                              # (C,) marginal feature mass
+        A = jnp.sum(W * b_nodes, axis=1)                     # (C,) per-feature E[b]
+        mean = op.matvec(A)                                 # (n,) off-support x=0 -> 0
+        acc = jnp.zeros(n)
+        for k0 in range(0, nnz, entry_chunk):
+            k1 = min(k0 + entry_chunk, nnz)
+            r, c, xv = rows[k0:k1], cols[k0:k1], vals[k0:k1]
+            # sum_m W_cm e^{x b_cm} - pi_c per support entry
+            s = jnp.sum(W[c] * jnp.exp(xv[:, None] * b_nodes[c]), axis=1) - pi[c]
+            acc = acc + segment_sum(s, r, num_segments=n)
+        logk = logk + (jnp.log1p(acc) - mean)
+    if intercept is not None:
+        logk = logk + _log_node_mgf_intercept(intercept)
     return logk
 
 

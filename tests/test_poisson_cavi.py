@@ -287,6 +287,94 @@ def test_poisson_front_doors_agree_and_integrate_intercept():
     assert float(compute_elbo(data, q2_cavi)) >= float(compute_elbo(data, q2_plugin)) - 1e-6
 
 
+# ------------------------------------------------------------------ analytic ELBO
+def _poisson_elbo_reference(data, st, is_q1):
+    """Independent Poisson ELBO -- E[e^eta] by the Gaussian-mixture MGF (Q2) or the exact
+    node-weighted sum (Q1), sharing no code with `compute_elbo`'s analytic path."""
+    from scipy.special import gammaln, logsumexp, softmax
+
+    from gibss.elbo import _predictor_mean
+
+    fs = st.family_state
+    X = np.asarray(data.X.todense()) if hasattr(data.X, "todense") else np.asarray(data.X)
+    y = np.asarray(data.y)
+    n = X.shape[0]
+    if is_q1:
+        E_exp, E_eta = np.ones(n), np.zeros(n)
+        for e in st.single_effects:
+            b = np.asarray(e.b_nodes)
+            W = softmax(np.asarray(e.log_node_weight).reshape(-1)).reshape(b.shape)
+            E_exp *= np.einsum("mc,imc->i", W, np.exp(X[:, None, :] * b[None, :, :]))
+            E_eta += np.einsum("mc,imc->i", W, X[:, None, :] * b[None, :, :])
+        b0 = np.asarray(fs.intercept_b_nodes)
+        W0 = softmax(np.asarray(fs.intercept_log_node_weight))
+        E_exp *= np.sum(W0 * np.exp(b0))
+        E_eta += np.sum(W0 * b0)
+    else:
+        E_eta = np.asarray(_predictor_mean(data, st))
+        logk = np.full(n, 0.5 * float(fs.intercept_var))
+        for e in st.single_effects:
+            a, mu, var = np.asarray(e.alpha), np.asarray(e.mu), np.asarray(e.var)
+            with np.errstate(divide="ignore"):  # log(0) = -inf for a zero-weight feature
+                loga = np.log(a)
+            logk += logsumexp(
+                loga[None, :] + X * mu[None, :] + 0.5 * X**2 * var[None, :], axis=1
+            ) - X @ (a * mu)
+        E_exp = np.exp(E_eta + logk)
+    ll = np.sum(y * E_eta - E_exp) - np.sum(gammaln(y + 1.0))
+    return ll - sum(float(e.kl) for e in st.single_effects) - float(fs.intercept_kl)
+
+
+def _fit_q2(X, y):
+    return fit_glm_susie(X, y, L=3, method="cf_cavi", family="poisson", max_iter=80)
+
+
+def _fit_q1(X, y):
+    return fit_glm_susie(X, y, L=3, family="poisson", variational_family="unconstrained",
+                         offset_integration="compress_selfnorm", max_iter=80)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("which", ["q2", "q1"])
+def test_poisson_elbo_is_analytic_order_M_invariant(which):
+    """The Poisson ELBO is computed analytically: `compute_elbo` is INVARIANT to the
+    quadrature knobs `order`/`M` (a quadrature peel never is), and equals an independent
+    MGF/node reference exactly."""
+    from gibss.elbo import compute_elbo
+    from gibss.linear import prep_data
+
+    rng = np.random.default_rng(0)
+    X, y = _poisson_data(rng, n=400, p=30, idx=[7, 20], val=[1.0, -0.9], b0=0.5)
+    data = prep_data(X, y, center=False)
+    st = _fit_q2(X, y) if which == "q2" else _fit_q1(X, y)
+
+    base = float(compute_elbo(data, st))
+    for order, M in [(4, 8), (16, 64), (64, 256)]:
+        assert abs(compute_elbo(data, st, order=order, M=M) - base) < 1e-9
+    assert abs(base - _poisson_elbo_reference(data, st, which == "q1")) < 1e-8
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("which", ["q2", "q1"])
+def test_poisson_elbo_sparse_matches_dense(which):
+    """The analytic ELBO on a sparse (BCOO) fit equals the dense-materialized fit's."""
+    from gibss.elbo import compute_elbo
+    from gibss.linear import prep_data
+
+    rng = np.random.default_rng(4)
+    n, p = 400, 30
+    Xd = rng.standard_normal((n, p))
+    Xd[np.abs(Xd) < 0.3] = 0.0
+    beta = np.zeros(p)
+    beta[[3, 17]] = [1.0, -0.9]
+    y = rng.poisson(np.exp(0.4 + Xd @ beta)).astype(float)
+    Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
+    fit = _fit_q2 if which == "q2" else _fit_q1
+    e_sp = float(compute_elbo(prep_data(Xb, y, center=False), fit(Xb, y)))
+    e_dn = float(compute_elbo(prep_data(jnp.asarray(Xd), y, center=False), fit(jnp.asarray(Xd), y)))
+    assert abs(e_sp - e_dn) < 1e-7
+
+
 # ------------------------------------------------------------------ guards
 def test_poisson_lognormal_offset_rejects_non_poisson():
     with pytest.raises(TypeError, match="Poisson"):
