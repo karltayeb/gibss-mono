@@ -152,7 +152,7 @@ def test_cf_cavi_intercept_stationarity():
     """At convergence the shared intercept q(b0)=N(m0,v0) satisfies its OWN flat-prior
     CAVI stationarity as a unit-ones-column effect: b0 solves the GH-averaged score
     against the (single) effect's offset-integrated cumulant, and 1/v0 = sum_i E_b0[A''].
-    Validates `_intercept_vi_gh` independently of the engine (L=1 so the b0 offset is one
+    Validates `_intercept_gaussian` independently of the engine (L=1 so the b0 offset is one
     effect, reusable via `_brute_atilde1_deriv`)."""
     rng = np.random.default_rng(7)
     X, y = _logit_data(rng, n=250, p=5, signal_idx=[2], signal_val=[1.8])

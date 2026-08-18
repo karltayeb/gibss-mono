@@ -1,6 +1,6 @@
 """Exact-CAVI shared-intercept update under the self-normalized offset fold.
 
-`glm.estimate_intercept_quad` must integrate the intercept likelihood over ALL effects'
+`glm._intercept_freeform` must integrate the intercept likelihood over ALL effects'
 current quadrature posteriors (symmetric to how each effect integrates the OTHERS), not
 plug in the effects' MEAN. This checks the fitted intercept posterior (mean AND variance)
 against a dense numerical reference
@@ -80,7 +80,7 @@ def test_intercept_quad_matches_dense_reference():
         assert s.converged
         order = s.family_state.quadrature_order
         data = prep_data(X, y)
-        m_new, v_new, _, _ = glm.estimate_intercept_quad(data, s, order=order)
+        m_new, v_new, _, _ = glm._intercept_freeform(data, s, order=order)
         m_old, v_old = _old_plugin(s, X, y, order)
         grid = np.linspace(m_new - 2.0, m_new + 2.0, 2001)
         m_ref, v_ref = _dense_reference(s, X, y, grid)
@@ -102,7 +102,7 @@ def test_intercept_quad_matches_plugin_with_no_effects():
     resp = Smoothed(Bernoulli(), CompressSelfNorm(M=48))
     state = glm.initialize_state(data, L=2, response=resp)  # effects unfit (b_nodes None)
     order = state.family_state.quadrature_order
-    m_new, v_new, _, _ = glm.estimate_intercept_quad(data, state, order=order)
+    m_new, v_new, _, _ = glm._intercept_freeform(data, state, order=order)
     m_old, v_old = _old_plugin(state, X, y, order)
     assert abs(m_new - m_old) < 1e-9
     assert abs(v_new - v_old) < 1e-9
