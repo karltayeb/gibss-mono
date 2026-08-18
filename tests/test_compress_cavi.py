@@ -56,6 +56,7 @@ def _fit(X, y, method, **kw):
     )
 
 
+@pytest.mark.slow
 def test_compress_cavi_resolves_to_vi_gh():
     rng = np.random.default_rng(0)
     X, y = _logit_data(rng, n=200, p=20, signal_idx=[3], signal_val=[2.0])
@@ -66,6 +67,7 @@ def test_compress_cavi_resolves_to_vi_gh():
     assert isinstance(fs.response.smoother, Compress)
 
 
+@pytest.mark.slow
 def test_compress_matches_cf_dense():
     rng = np.random.default_rng(1)
     X, y = _logit_data(rng, n=350, p=40, signal_idx=[5, 22], signal_val=[2.5, -2.2])
@@ -77,6 +79,7 @@ def test_compress_matches_cf_dense():
     assert np.corrcoef(np.asarray(a.pip), np.asarray(b.pip))[0, 1] > 0.9999
 
 
+@pytest.mark.slow
 def test_compress_matches_cf_sparse():
     rng = np.random.default_rng(2)
     n, p = 500, 60
@@ -91,6 +94,7 @@ def test_compress_matches_cf_sparse():
     assert np.corrcoef(np.asarray(a.pip), np.asarray(b.pip))[0, 1] > 0.9999
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("integ", ["cf", "compress"])
 def test_q2_dense_centering(integ):
     # Dense Q2 centering orthogonalizes the intercept from the effects (better mean-field
@@ -112,6 +116,7 @@ def test_q2_dense_centering(integ):
     assert np.asarray(s.pip)[c] > 0.9
 
 
+@pytest.mark.slow
 def test_q2_sparse_centering_matches_dense():
     # Sparse-centered Q2 (Compress): the centered offset fold + the centered effect kernel
     # (glm_vi_gh_center_ser) together == the manual dense-centered fit, to machine
@@ -163,6 +168,7 @@ def test_cf_requires_gaussian_vfam():
                       variational_family="unconstrained")
 
 
+@pytest.mark.slow
 def test_compress_matrix():
     # compress is Q2-only: gaussian -> vi_gh; unconstrained is rejected (the moment-
     # projected Q1 path was removed -- use compress_selfnorm for exact free-form Q1).

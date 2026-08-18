@@ -169,6 +169,7 @@ def test_gold_q1_freeform_fixed_point():
 
 
 # --------------------------------------------------------------------- family gap
+@pytest.mark.slow
 def test_q1_q2_family_gap():
     """Q1 (free-form) and Q2 (Gaussian) are the SAME model up to the family restriction:
     near-Gaussian (easy, large n) they nearly coincide; strongly non-Gaussian (small n,

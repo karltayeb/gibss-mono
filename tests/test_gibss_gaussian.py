@@ -97,6 +97,7 @@ def test_gibss_gaussian_plugin_stationarity():
     assert checked == 2
 
 
+@pytest.mark.slow
 def test_gibss_gaussian_differs_from_exact_cavi():
     """Plug-in is NOT exact CAVI: at L>1 it ignores the other effects' variance, so the
     posteriors differ measurably from cf_cavi; they converge as the leave-one-out coupling

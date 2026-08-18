@@ -18,6 +18,7 @@ import numpy as np
 
 from gibss import glm
 from gibss.methods import fit_glm_susie
+import pytest
 
 jax.config.update("jax_enable_x64", True)
 
@@ -38,6 +39,7 @@ def _flm(state):
     return np.stack([np.asarray(e.feature_log_marginal) for e in state.single_effects])
 
 
+@pytest.mark.slow
 def test_profiled_selfnorm_runs_and_carries_nodes():
     X, y, truth = _sim(0)
     s = fit_glm_susie(
@@ -53,6 +55,7 @@ def test_profiled_selfnorm_runs_and_carries_nodes():
         assert e.b_nodes.shape[1] == X.shape[1]
 
 
+@pytest.mark.slow
 def test_center_dense_selfnorm_runs_and_matches_manual_centering():
     X, y, truth = _sim(1)
     s = fit_glm_susie(X, y, L=3, offset_integration="compress_selfnorm", center=True)

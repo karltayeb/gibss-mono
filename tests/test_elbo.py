@@ -241,6 +241,7 @@ def test_family_ordering():
     assert e_cavi >= e_plug - slack
 
 
+@pytest.mark.slow
 def test_cf_and_compress_q2_agree():
     # cf_cavi and compress_cavi target the SAME Q2 CAVI fixed point, so their fitted q's
     # (and thus ELBOs) coincide to quadrature accuracy.

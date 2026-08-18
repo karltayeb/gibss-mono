@@ -20,6 +20,7 @@ from gibss.methods import fit_glm_susie
 from gibss.operators import DenseOperator
 from gibss.response import Bernoulli, CompressSelfNorm, Smoothed
 from gibss.response_ser import glm_ser_nodes
+import pytest
 
 jax.config.update("jax_enable_x64", True)
 
@@ -73,6 +74,7 @@ def _old_plugin(state, X, y, order):
     return float(mu[0]), float(var[0])
 
 
+@pytest.mark.slow
 def test_intercept_quad_matches_dense_reference():
     for seed in (0, 1, 2):
         X, y = _sim(seed)

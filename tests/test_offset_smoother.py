@@ -391,6 +391,7 @@ def test_compress_sequential_matches_product_mixture(Ks):
             assert jnp.allclose(a, b, atol=1e-6)
 
 
+@pytest.mark.slow
 def test_compress_sequential_large_K_is_feasible():
     # the fold reduces over components one at a time (lax.scan), so a K=p offset law
     # never materializes the (n, M+1, K, Q) grid -- a K that would be multi-GB dense

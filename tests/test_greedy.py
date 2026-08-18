@@ -75,6 +75,7 @@ def test_no_signal_returns_single_effect():
     assert len(out.single_effects) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("stride", [1, 2, 3, 5, 10])
 def test_stride_recovers_same_exact_L(stride):
     # a coarse stride must reach the same exact answer as one-at-a-time (drop-nulls).

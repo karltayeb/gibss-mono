@@ -37,6 +37,7 @@ def _logit_data(rng, n, p, signal_idx, signal_val):
     return X, y
 
 
+@pytest.mark.slow
 def test_cf_cavi_fit_recovers_effects():
     rng = np.random.default_rng(0)
     X, y = _logit_data(rng, n=400, p=40, signal_idx=[5, 22], signal_val=[2.5, -2.2])
@@ -50,6 +51,7 @@ def test_cf_cavi_fit_recovers_effects():
     assert {5, 22} <= singletons
 
 
+@pytest.mark.slow
 def test_cf_cavi_fixed_point_self_consistent():
     """Re-running one effect's CAVI update from the converged state -- through the ACTUAL
     engine functions -- reproduces that effect. Validates the aux/offset plumbing and
@@ -186,6 +188,7 @@ def test_cf_cavi_intercept_stationarity():
     assert np.isclose(1.0 / v0, np.sum(Eb_w), rtol=2e-2, atol=1e-2)
 
 
+@pytest.mark.slow
 def test_cf_cavi_eb_prior_variance_fixed_point():
     """The EB prior-variance path (estimate_prior_variance=True, the DEFAULT) is otherwise
     validated only by PIP-recovery smoke tests for the whole CAVI family. At convergence
@@ -224,6 +227,7 @@ def test_cf_cavi_guards():
         fit_glm_susie(Xs, y, L=2, method="cf_cavi", center=True, max_iter=3)
 
 
+@pytest.mark.slow
 def test_cf_cavi_sparse_matches_dense():
     """BCOO and dense CF-CAVI fits agree to machine precision -- the zero-clumping sparse
     CF build is exact (uses sum_c alpha_c = 1), and the vi_gh kernel's entry-space

@@ -10,6 +10,7 @@ import numpy as np
 from jax.experimental import sparse
 
 from gibss.methods import fit_glm_susie
+import pytest
 
 jax.config.update("jax_enable_x64", True)
 
@@ -25,6 +26,7 @@ def _sim(seed, n=250, p=30, signals=((3, 1.8), (17, -1.6)), b0=0.4, sparse_x=Fal
     return jnp.asarray(X), jnp.asarray(y), [j for j, _ in signals]
 
 
+@pytest.mark.slow
 def test_selfnorm_dense_recovers_signals():
     X, y, truth = _sim(0)
     s = fit_glm_susie(X, y, L=3, offset_integration="compress_selfnorm")
@@ -33,6 +35,7 @@ def test_selfnorm_dense_recovers_signals():
     assert s.converged and s.n_iter < 100
 
 
+@pytest.mark.slow
 def test_selfnorm_sparse_recovers_signals():
     X, y, truth = _sim(1, n=350, p=40, signals=((5, 2.2), (22, -2.0)), b0=-1.0, sparse_x=True)
     Xsp = sparse.BCOO.fromdense(X)

@@ -23,6 +23,7 @@ jax.config.update("jax_enable_x64", True)
 
 from gibss.methods import fit_glm_susie
 from gibss.response import Bernoulli, Compress
+import pytest
 
 RNG = np.random.default_rng(0)
 BASE = Bernoulli()
@@ -105,6 +106,7 @@ def test_sparse_centered_with_intercept_init():
             assert jnp.allclose(a, b, atol=1e-9)
 
 
+@pytest.mark.slow
 def test_e2e_sparse_centered_matches_dense_centered():
     """`fit_glm_susie(center=True, compress_selfnorm)` on a BCOO design equals the
     equivalent dense-centered fit (feature_log_marginal, per the fit-equivalence rule),
