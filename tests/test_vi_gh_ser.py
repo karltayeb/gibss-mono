@@ -184,3 +184,41 @@ def test_fixed_point_satisfies_exact_cavi_stationarity():
     prec = 1.0 / pv + np.sum(X**2 * Eb_w, axis=0)  # exact curvature
     assert np.max(np.abs(grad_m)) < 1e-4, f"grad_m={grad_m}"
     assert np.allclose(1.0 / v, prec, rtol=1e-3, atol=1e-4)
+
+
+def test_glm_vi_gh_ser_separated_column_large_pv_converges():
+    """Regression: on a (near-)separated column at large prior variance the undamped
+    Newton m-step used to overshoot to +-inf, giving m ~ -200 and a confidently-wrong
+    large-NEGATIVE log_bf (which flips the PIP of the true signal). The +-4 damping must
+    keep it at the finite optimum. Checked against a direct brute-force ELBO maximum."""
+    from scipy.optimize import minimize
+    rng = np.random.default_rng(1)
+    n = 120
+    xc = rng.standard_normal(n)
+    y = (xc > 0).astype(float)  # perfectly separated by column c...
+    flip = rng.choice(n, 3, replace=False)
+    y[flip] = 1.0 - y[flip]  # ...with 3 flips -> near-separation (finite but huge MLE)
+    base = Bernoulli()
+    sm = CharFnOffset(M=48)
+    resp = Smoothed(base, sm)
+    aux = sm.build_aux(base, jnp.asarray(y), [])  # empty offset -> base cumulant
+    op = DenseOperator(jnp.asarray(xc[:, None]))
+    off = jnp.zeros(n)
+    gn, gw = np.polynomial.hermite.hermgauss(160)
+    gw = gw / np.sqrt(np.pi)
+
+    ll0 = -n * np.log(2.0)  # b=0 null at offset=0: sum_i -softplus(0)
+
+    def neg_elbo(z, pv):
+        m, v = z[0], np.exp(z[1])
+        b = m + np.sqrt(2 * v) * gn
+        eta = xc[:, None] * b[None, :]
+        ll = (gw * (y[:, None] * eta - np.logaddexp(0, eta))).sum(1).sum()
+        return -((ll - ll0) - 0.5 * (np.log(pv / v) + (v + m * m) / pv - 1))
+
+    for pv in (20.0, 100.0):
+        m, v, bf, kl = glm_vi_gh_ser(op, aux, off, pv, resp, order=20, n_iter=500)
+        assert np.isfinite(float(m[0])) and abs(float(m[0])) < 20  # not the +-inf overshoot
+        assert float(bf[0]) > 0  # the true signal has POSITIVE evidence, not -1e4
+        bfB = -minimize(neg_elbo, [1.0, 0.0], args=(pv,)).fun
+        assert abs(float(bf[0]) - bfB) < 1e-4

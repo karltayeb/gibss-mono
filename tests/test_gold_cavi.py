@@ -95,7 +95,7 @@ def test_gold_q2_stationarity(integ):
     grad_m = np.sum(Xn * Eb_g, 0) - m0 / pv          # stationary score, per feature
     prec = 1.0 / pv + np.sum(Xn**2 * Eb_w, 0)
     assert np.max(np.abs(grad_m)) < 2e-3
-    assert np.allclose(1.0 / v0, prec, rtol=1e-2, atol=1e-3)
+    assert np.allclose(1.0 / v0, prec, rtol=1e-4, atol=1e-4)
 
 
 # --------------------------------------------------------------------- gold-Q1
@@ -162,8 +162,8 @@ def test_gold_q1_freeform_fixed_point():
         q /= np.trapezoid(q, bg)
         mean = np.trapezoid(q * bg, bg)
         var = np.trapezoid(q * (bg - mean) ** 2, bg)
-        assert abs(mean - float(e0.mu[c])) < 5e-3, f"c={c}: mean {mean} vs {float(e0.mu[c])}"
-        assert abs(var - float(e0.var[c])) < 5e-3, f"c={c}: var {var} vs {float(e0.var[c])}"
+        assert abs(mean - float(e0.mu[c])) < 5e-5, f"c={c}: mean {mean} vs {float(e0.mu[c])}"
+        assert abs(var - float(e0.var[c])) < 5e-5, f"c={c}: var {var} vs {float(e0.var[c])}"
         checked += 1
     assert checked == 2
 

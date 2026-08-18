@@ -6,7 +6,6 @@ from typing import Any, Callable, Generic, TypeVar
 import jax
 import numpy as np
 import jax.numpy as jnp
-from jax.experimental import sparse
 
 
 Step = Callable[[Any, Any], Any]

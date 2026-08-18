@@ -135,6 +135,23 @@ def test_q2_sparse_centering_matches_dense():
                       variational_family="gaussian", center=True, max_iter=3)
 
 
+@pytest.mark.parametrize("integ,vfam", [
+    ("cf", "gaussian"), ("compress", "gaussian"), ("compress_selfnorm", "unconstrained"),
+])
+def test_null_intercept_cavi(integ, vfam):
+    # intercept="null" (score-analysis): fit b0 ONCE at the b=0 null and freeze it. For a
+    # CAVI offset the effects are empty at the null, so the offset-integrated cumulant is
+    # the base -> the frozen b0 must equal the base-logistic null MLE = logit(ybar). Guards
+    # the regression where the null freeze handed the CAVI smoother a (y, ov) 2-tuple.
+    rng = np.random.default_rng(9)
+    X, y = _logit_data(rng, n=200, p=8, signal_idx=[3], signal_val=[2.0])
+    st = fit_glm_susie(X, y, L=2, offset_integration=integ, variational_family=vfam,
+                       intercept="null", max_iter=30)
+    assert st.converged
+    yb = float(np.mean(np.asarray(y)))
+    assert abs(float(st.family_state.intercept_value) - np.log(yb / (1 - yb))) < 1e-6
+
+
 def test_cf_requires_gaussian_vfam():
     # cf is Q2-only (no closed-form CF for a free-form Q1 posterior); it must reject
     # variational_family='unconstrained'. (compress, by contrast, is valid for BOTH

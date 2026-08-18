@@ -575,7 +575,17 @@ def _intercept_point(data, state):
     / jj / vi) and the null-score fit. Returns (b0, v0)."""
     fs = state.family_state
     response = fs.response
-    aux = _aux(data, state, include_intercept_var=False)
+    # The CAVI table smoothers (CharFnOffset/Compress) consume a 7-tuple offset table, not
+    # (y, ov). This strategy is only reached for them via the null-score freeze
+    # (intercept="null"): the effects are empty at b=0, so the offset-integrated cumulant
+    # IS the base -- fit the null intercept on the base response with plain y.
+    if isinstance(response, Smoothed) and isinstance(
+        response.smoother, (CharFnOffset, Compress)
+    ):
+        response = response.base
+        aux = jnp.asarray(data.y)
+    else:
+        aux = _aux(data, state, include_intercept_var=False)
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset
 
     def terms_at(b0):

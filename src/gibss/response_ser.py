@@ -624,7 +624,9 @@ def glm_vi_ser(
         m, v, _, it = state
         _, g, w = smoothed(m, v)
         prec = inv_pv + op.local_moment(2, w)
-        step = (op.local_moment(1, g) - inv_pv * m) / prec
+        # Damp the Newton m-step (+-4 log-odds): undamped it overshoots to +-inf on a
+        # (near-)separated column at large prior variance -- same trust region as glm_ser.
+        step = jnp.clip((op.local_moment(1, g) - inv_pv * m) / prec, -4.0, 4.0)
         return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
 
     m, v, _, _ = jax.lax.while_loop(
@@ -642,7 +644,8 @@ def glm_vi_ser(
     ll = smoothed(m, v)[0]
     ll0 = response.terms(off_e, (y_e, ov_e))[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
-    return m, v, op.local_moment(0, ll - ll0) - kl, kl
+    elbo_rel = jnp.where(ok, op.local_moment(0, ll - ll0) - kl, 0.0)
+    return m, v, elbo_rel, kl
 
 
 @partial(jax.jit, static_argnames=("response", "order", "n_iter"))
@@ -716,7 +719,11 @@ def glm_vi_gh_ser(
         m, v, _, it = state
         _, g, w = smoothed(m, v)
         prec = inv_pv + op.local_moment(2, w)
-        step = (op.local_moment(1, g) - inv_pv * m) / prec
+        # Damp: the undamped Newton m-step overshoots on a (near-)separated column at
+        # large prior variance (w -> 0, prec -> inv_pv tiny), sending m to +-inf and a
+        # confidently-wrong log_bf. Clip to +-4 log-odds like glm_ser / the sibling
+        # vi_gh kernels; near the mode the raw step is small, so convergence is kept.
+        step = jnp.clip((op.local_moment(1, g) - inv_pv * m) / prec, -4.0, 4.0)
         return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
 
     m, v, _, _ = jax.lax.while_loop(
@@ -733,9 +740,13 @@ def glm_vi_gh_ser(
     ll = smoothed(m, v)[0]
     ll0 = response.terms(off_e, aux_e)[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
-    return m, v, op.local_moment(0, ll - ll0) - kl, kl
+    # A feature that failed to converge (reset to the null m=0) carries no evidence -> 0,
+    # never the large-negative ELBO evaluated at the reset point.
+    elbo_rel = jnp.where(ok, op.local_moment(0, ll - ll0) - kl, 0.0)
+    return m, v, elbo_rel, kl
 
 
+@partial(jax.jit, static_argnames=("response", "order", "n_iter", "background", "degree"))
 def glm_vi_gh_center_ser(
     op,
     aux,
@@ -816,6 +827,7 @@ def glm_vi_gh_center_ser(
     return m, v, (ll - ll0) - kl, kl
 
 
+@partial(jax.jit, static_argnames=("response", "order", "n_iter", "background", "degree"))
 def glm_vi_gh_profile_ser(
     op,
     aux,

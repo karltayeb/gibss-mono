@@ -62,7 +62,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import glm
-from .distributions import Normal, PointMass, ash_scale_mixture
+from .distributions import PointMass, ash_scale_mixture
 from .engine import (
     GIBSSState,
     Message,

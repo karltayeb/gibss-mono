@@ -145,7 +145,7 @@ def test_cf_cavi_matches_exact_cavi_stationarity():
     grad_m = np.sum(Xn * Eb_g, axis=0) - m0 / pv0
     prec = 1.0 / pv0 + np.sum(Xn**2 * Eb_w, axis=0)
     assert np.max(np.abs(grad_m)) < 1e-3, f"grad_m={grad_m}"
-    assert np.allclose(1.0 / v0, prec, rtol=1e-2, atol=1e-3)
+    assert np.allclose(1.0 / v0, prec, rtol=1e-4, atol=1e-4)
 
 
 def test_cf_cavi_intercept_stationarity():
@@ -180,7 +180,27 @@ def test_cf_cavi_intercept_stationarity():
     # (unlike the +-1 design columns), so the per-row M=48 Chebyshev table error (~6e-5)
     # accumulates coherently -- assert the n-INDEPENDENT per-observation residual.
     assert abs(np.sum(Eb_g)) / len(y) < 2e-4
+    # looser than the effect-variance checks: the intercept curvature sums the M=48
+    # Chebyshev-table A'' error over the UNIT (all-ones) column, which -- unlike the +-x
+    # design columns -- does not cancel, so the coherent accumulation is ~1e-2, not ~1e-6.
     assert np.isclose(1.0 / v0, np.sum(Eb_w), rtol=2e-2, atol=1e-2)
+
+
+def test_cf_cavi_eb_prior_variance_fixed_point():
+    """The EB prior-variance path (estimate_prior_variance=True, the DEFAULT) is otherwise
+    validated only by PIP-recovery smoke tests for the whole CAVI family. At convergence
+    each effect's stored prior_variance must satisfy the type-II MLE stationarity
+    sigma^2 = E_q[b^2] = sum_c alpha_c (mu_c^2 + var_c), recomputed here independently from
+    the posterior (alpha, mu, var)."""
+    rng = np.random.default_rng(11)
+    X, y = _logit_data(rng, n=400, p=30, signal_idx=[5, 18], signal_val=[2.2, -1.8])
+    st = fit_glm_susie(X, y, L=4, method="cf_cavi", estimate_prior_variance=True,
+                       max_iter=200, tol=1e-9)
+    assert st.converged
+    for e in st.single_effects:
+        a, mu, var = np.asarray(e.alpha), np.asarray(e.mu), np.asarray(e.var)
+        S = float(np.sum(a * (mu**2 + var)))  # E_q[b^2], the MLE fixed point
+        assert abs(float(e.prior_variance) - S) < 1e-6, (float(e.prior_variance), S)
 
 
 def test_cf_cavi_guards():
