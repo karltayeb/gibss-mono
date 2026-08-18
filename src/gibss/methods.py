@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from . import glm
 from .cf_offset import CharFnOffset
+from .poisson_offset import PoissonLogNormalOffset
 from .engine import fit_ibss, fit_ibss_greedy
 from .linear import is_bcoo
 from .response import (
@@ -145,16 +146,26 @@ def _resolve(cfg):
             # conjugate classic localjj; Smoother.validate rejects non-Bernoulli
             return Smoothed(base, JJFixed()), "jj"
         elif integ == "cf":
-            # CAVI in Q2 ONLY: the characteristic-function offset needs Gaussian effect
-            # posteriors (free-form Q1 has no closed-form CF). The offset is integrated
-            # over the OTHER effects' Gaussian mixture and b by GH -> the vi_gh kernel.
+            # CAVI in Q2 ONLY: the EXACT offset-integrated cumulant needs Gaussian effect
+            # posteriors (free-form Q1 has no closed-form transform). The offset is
+            # integrated over the OTHER effects' Gaussian mixture and b by GH -> vi_gh.
+            # The exact builder is family-specific: the logistic base uses the psi-tamed
+            # characteristic-function quadrature (CharFnOffset); the Poisson (log-link)
+            # base has an ANALYTIC offset cumulant e^{eta+logkappa} (the log-normal MGF =
+            # the CF at t=-i), so it uses the closed-form PoissonLogNormalOffset -- exact
+            # and cheaper, no quadrature grid.
             if vfam != "gaussian":
                 raise ValueError(
                     "offset_integration='cf' (CAVI in Q2) needs variational_family="
                     "'gaussian'; free-form Q1 posteriors have no closed-form "
                     "characteristic function -- use 'compress' or 'compress_selfnorm'."
                 )
-            return Smoothed(base, CharFnOffset(M=cfg["compress_degree"])), "vi_gh"
+            offset = (
+                PoissonLogNormalOffset()
+                if isinstance(base, Poisson)
+                else CharFnOffset(M=cfg["compress_degree"])
+            )
+            return Smoothed(base, offset), "vi_gh"
         elif integ == "compress":
             # CAVI in Q2 (gaussian): the Compress peel as the offset-integrated-cumulant
             # builder, interchangeable with "cf" behind the same table seam; GH over b.
@@ -283,14 +294,20 @@ def fit_glm_susie(
     # on dense; an EXPLICIT center=True on an unsupported combo is an error, not a fallback.
     smoother = getattr(response, "smoother", None)
     if kernel == "vi_gh":
-        if center and is_bcoo(X) and isinstance(smoother, CharFnOffset):
+        if center and is_bcoo(X) and isinstance(
+            smoother, (CharFnOffset, PoissonLogNormalOffset)
+        ):
             # Sparse centering: the Compress peel has a centered fold (self-normalized
-            # -c_j background) + a centered effect kernel (glm_vi_gh_center_ser). The CF
-            # closed-form product densifies under centering, so cf can't participate.
+            # -c_j background) + a centered effect kernel (glm_vi_gh_center_ser). Both the
+            # CF product and the Poisson MGF are CLOSED-FORM folds that exploit the exact
+            # zeros of the design (off-support entries contribute a neutral factor); under
+            # centering an off-support entry becomes -c_j (a per-feature background), so
+            # the zero-clumping breaks and the fold densifies. Neither can pre-center.
             raise ValueError(
-                "offset_integration='cf' cannot pre-center a sparse (BCOO) design (the "
-                "characteristic-function fold densifies under centering); use "
-                "offset_integration='compress', center=False, or densify X."
+                f"offset_integration='cf' cannot pre-center a sparse (BCOO) design (the "
+                f"{'characteristic-function' if isinstance(smoother, CharFnOffset) else 'Poisson MGF'} "
+                "fold densifies under centering); use offset_integration='compress', "
+                "center=False, or densify X."
             )
         if center is None:
             center = False  # default uncentered (layout-consistent); center=True honored

@@ -33,6 +33,7 @@ from .engine import (
 )
 from ._numerics import _gh_rule
 from .cf_offset import CharFnOffset
+from .poisson_offset import PoissonLogNormalOffset
 from .linear import (  # noqa: F401 (prep_data re-export)
     is_bcoo,
     prep_data,
@@ -160,15 +161,18 @@ class GLMFamilyState:
             )
         if self.kernel == "vi_gh":
             # any offset-integrated-cumulant smoother works: CharFnOffset (exact CF
-            # product) or Compress (quadrature peel). Both hand vi_gh the same table
-            # contract (y, obar=0, center=0, hw, coef_ll, coef_g, coef_w).
+            # product, logistic), Compress (quadrature peel, any base), or
+            # PoissonLogNormalOffset (analytic MGF, Poisson). The first two hand vi_gh the
+            # 7-tuple table contract; the analytic Poisson smoother hands (y, logkappa) --
+            # both are opaque pytrees to the GH kernel, consumed only via `terms`.
             ok = isinstance(self.response, Smoothed) and isinstance(
-                self.response.smoother, (CharFnOffset, Compress)
+                self.response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset)
             )
             if not ok:
                 raise ValueError(
                     "kernel='vi_gh' (CAVI in Q2) needs response = Smoothed(base, "
-                    f"CharFnOffset()|Compress()); got {self.response!r}."
+                    "CharFnOffset()|Compress()|PoissonLogNormalOffset()); got "
+                    f"{self.response!r}."
                 )
         if self.intercept not in ("shared", "profiled", "null"):
             raise ValueError(
@@ -265,6 +269,16 @@ def _build_offset_table(data, state, effects, offset_var):
     X = data.X
     y = jnp.asarray(data.y)
     n = y.shape[0]
+
+    if isinstance(smoother, PoissonLogNormalOffset):
+        # Analytic Poisson: the offset-integrated cumulant is closed form, so the aux is
+        # just (y, logkappa) -- no table, no re-centering (the mean lives in eta). Same
+        # effect-space inputs as CharFnOffset: the shared design + each effect's law.
+        if is_bcoo(X):
+            eff = [(e.alpha, e.mu, e.var) for e in effects]
+            return smoother.build_aux_sparse(base, y, X, eff, offset_var=offset_var)
+        eff = [(X, e.alpha, e.mu, e.var) for e in effects]
+        return smoother.build_aux(base, y, eff, offset_var=offset_var)
 
     if isinstance(smoother, Compress):
         if is_bcoo(X):
@@ -580,7 +594,7 @@ def _intercept_point(data, state):
     # (intercept="null"): the effects are empty at b=0, so the offset-integrated cumulant
     # IS the base -- fit the null intercept on the base response with plain y.
     if isinstance(response, Smoothed) and isinstance(
-        response.smoother, (CharFnOffset, Compress)
+        response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset)
     ):
         response = response.base
         aux = jnp.asarray(data.y)

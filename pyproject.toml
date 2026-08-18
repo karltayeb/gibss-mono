@@ -16,6 +16,15 @@ test = [
     "pytest",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Default run is the fast core: skip long-running integration/convergence tests.
+# Run the full suite with `pytest -m ""`; run only the slow tests with `pytest -m slow`.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: long-running integration/convergence test (excluded from the default fast core)",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
