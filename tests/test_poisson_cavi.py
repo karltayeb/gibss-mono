@@ -236,6 +236,57 @@ def test_q1_compress_selfnorm_poisson_recovers():
     assert _tops(st, 2) == [7, 25]
 
 
+# ------------------------------------------------------------------ front doors + routing
+def test_cf_cavi_poisson_routes_to_q2_not_plugin():
+    """Regression guard: the analytic Poisson smoother must be treated as an EXACT-CAVI Q2
+    response (`_cavi_mode == 'q2'`), so the offset table (logkappa) is built and fed to
+    `terms`. If it fell through to 'q2_plugin' the fit would pass plain (y, ov) as aux and
+    silently ignore the offset integration (or crash)."""
+    from gibss.glm import GLMFamilyState, _cavi_mode
+
+    fs = GLMFamilyState(
+        response=Smoothed(Poisson(), PoissonLogNormalOffset()), kernel="vi_gh",
+    )
+    assert _cavi_mode(fs) == "q2"
+    # a plain Poisson base under vi_gh is the PLUG-IN Q2 path
+    assert _cavi_mode(GLMFamilyState(response=Poisson(), kernel="vi_gh")) == "q2_plugin"
+
+
+@pytest.mark.slow
+def test_poisson_front_doors_agree_and_integrate_intercept():
+    """The three Poisson front doors -- gIBSS (Q1 plug-in), plug-in Q2, and analytic CAVI Q2
+    -- run, recover the signals, and fit a proper shared intercept (q(b0) with variance and a
+    KL). The analytic CAVI Q2 offset table actually bites: its per-feature evidence differs
+    from plug-in Q2 (the variance-weighted rate), and its ELBO is >= the plug-in's."""
+    from gibss.elbo import compute_elbo
+    from gibss.linear import prep_data
+
+    rng = np.random.default_rng(0)
+    n, p = 500, 40
+    X = rng.standard_normal((n, p))
+    beta = np.zeros(p)
+    beta[[7, 25]] = [1.0, -0.9]
+    y = rng.poisson(np.exp(0.6 + X @ beta)).astype(float)
+
+    q1 = fit_glm_susie(X, y, L=2, method="poisson", max_iter=80)
+    q2_plugin = fit_glm_susie(X, y, L=2, method="gibss_gaussian", family="poisson", max_iter=80)
+    q2_cavi = fit_glm_susie(X, y, L=2, method="cf_cavi", family="poisson", max_iter=80)
+
+    for st in (q1, q2_plugin, q2_cavi):
+        assert _tops(st, 2) == [7, 25]
+        fs = st.family_state
+        assert fs.intercept_var > 0.0 and fs.intercept_kl > 0.0   # proper q(b0)
+        assert abs(fs.intercept_value - q1.family_state.intercept_value) < 0.05  # consistent
+
+    assert isinstance(q2_cavi.family_state.response.smoother, PoissonLogNormalOffset)
+    # the offset table bites: analytic CAVI differs from plug-in and has a >= ELBO
+    flm_c = np.array([e.feature_log_marginal for e in q2_cavi.single_effects])
+    flm_p = np.array([e.feature_log_marginal for e in q2_plugin.single_effects])
+    assert np.max(np.abs(flm_c - flm_p)) > 1e-4
+    data = prep_data(X, y, center=False)
+    assert float(compute_elbo(data, q2_cavi)) >= float(compute_elbo(data, q2_plugin)) - 1e-6
+
+
 # ------------------------------------------------------------------ guards
 def test_poisson_lognormal_offset_rejects_non_poisson():
     with pytest.raises(TypeError, match="Poisson"):

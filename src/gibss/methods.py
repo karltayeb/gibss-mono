@@ -91,6 +91,9 @@ PRESETS = {
     "localjj": {"variational_family": "gaussian", "offset_integration": "jj"},
     "cf_cavi": {"variational_family": "gaussian", "offset_integration": "cf"},
     "compress_cavi": {"variational_family": "gaussian", "offset_integration": "compress"},
+    # plug-in Q2 (gIBSS with a Gaussian effect): plug in the other effects' mean, no
+    # offset integration; the effect b is Gaussian-VI-integrated (glm_vi_gh_ser, plain base).
+    "gibss_gaussian": {"variational_family": "gaussian", "offset_integration": "none"},
     "globaljj": {"offset_integration": "jj_fixed"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
@@ -198,10 +201,19 @@ def _resolve(cfg):
     if vfam == "unconstrained":
         return response, "quad"
     if not isinstance(response, Smoothed):
+        # gaussian + offset_integration='none' = PLUG-IN CAVI in Q2 (gIBSS with a Gaussian
+        # effect posterior): the offset is the OTHER effects' MEAN (a fixed point, no
+        # integration over their uncertainty), and the effect b is integrated by GH. This
+        # is glm_vi_gh_ser on a plain base -> the vi_gh kernel, no offset table. The Q1
+        # analog (free-form plug-in = classic gIBSS) is unconstrained+none -> the 'quad'
+        # kernel above, i.e. the default 'logistic'.
+        if cfg["offset_integration"] == "none":
+            return response, "vi_gh"
         raise ValueError(
             "variational_family='gaussian' needs an offset-integration scheme "
             "(the scheme is the variational expectation operator E_q): set "
-            "offset_integration to 'gh', 'taylor2' or 'jj'"
+            "offset_integration to 'gh', 'taylor2', 'jj' (single-Gaussian offset), "
+            "'cf'/'compress' (exact-mixture CAVI), or 'none' (plug-in mean)."
         )
     return response, "vi"
 
