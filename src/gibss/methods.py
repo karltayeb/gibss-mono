@@ -72,9 +72,8 @@ _DEFAULTS = {
     "variational_family": "unconstrained",  # "unconstrained" | "gaussian"
     "offset_integration": "none",  # "none" | key of _SMOOTHERS
     "offset_quadrature_points": 15,
-    "compress_degree": 48,  # Chebyshev degree M for offset_integration="compress"
     "effect_quadrature_points": 15,
-    "compress_degree": 48,  # Chebyshev degree M for the cf offset table
+    "compress_degree": 48,  # Chebyshev degree M for the compress/cf offset tables
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
