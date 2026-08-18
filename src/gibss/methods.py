@@ -269,16 +269,24 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
-    # CAVI in Q2 (cf) works on dense AND sparse (BCOO) designs -- the CF fold has a
-    # zero-clumping sparse path -- but always UNCENTERED: pre-centering (a column-shift
-    # reparameterization) fills the zeros and has not been validated with the CF fold.
+    # CAVI in Q2 (vi_gh): DENSE pre-centering is supported and desirable -- it
+    # orthogonalizes the intercept from the effects, so the mean-field factorization
+    # q(b0) prod q(b_l) (whose whole premise is posterior independence) becomes accurate.
+    # Both builders read the eagerly-centered X. SPARSE is not yet supported here: the CF
+    # fold densifies under centering (off-support entries stop clumping), and the Compress
+    # sparse fold needs a centered variant. Default is uncentered (layout-consistent).
     if kernel == "vi_gh":
-        if center:
-            raise ValueError(
-                "offset_integration='cf' does not support pre-centering yet; "
-                "pass center=False."
-            )
-        center = False
+        if is_bcoo(X):
+            if center:
+                raise ValueError(
+                    "CAVI in Q2 (offset_integration='cf'/'compress' + "
+                    "variational_family='gaussian') does not support pre-centering on a "
+                    "sparse (BCOO) design yet; pass center=False, or densify X. Dense "
+                    "centering IS supported."
+                )
+            center = False
+        elif center is None:
+            center = False  # dense default: uncentered; center=True is honored
 
     # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
     # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row

@@ -91,6 +91,27 @@ def test_compress_matches_cf_sparse():
     assert np.corrcoef(np.asarray(a.pip), np.asarray(b.pip))[0, 1] > 0.9999
 
 
+@pytest.mark.parametrize("integ", ["cf", "compress"])
+def test_q2_dense_centering(integ):
+    # Dense Q2 centering orthogonalizes the intercept from the effects (better mean-field
+    # factorization). Correctness: eager centering == a fit on the MANUALLY pre-centered
+    # design with center=False (to machine precision), and it recovers the signal on an
+    # off-center design. Both builders.
+    rng = np.random.default_rng(6)
+    n, p, c = 300, 15, 4
+    X = rng.standard_normal((n, p)) + 2.0  # off-center, so centering matters
+    beta = np.zeros(p); beta[c] = 2.2
+    y = (rng.uniform(size=n) < _sigmoid(X @ beta - 4.0)).astype(float)
+    Xc = X - X.mean(0)[None, :]
+    kw = dict(L=3, offset_integration=integ, variational_family="gaussian",
+              estimate_prior_variance=False, prior_variance=1.0, max_iter=80)
+    s = fit_glm_susie(jnp.asarray(X), jnp.asarray(y), center=True, **kw)
+    sm = fit_glm_susie(jnp.asarray(Xc), jnp.asarray(y), center=False, **kw)
+    flm = lambda st: np.stack([np.asarray(e.feature_log_marginal) for e in st.single_effects])
+    assert np.max(np.abs(flm(s) - flm(sm))) < 1e-6  # eager centering == manual centering
+    assert np.asarray(s.pip)[c] > 0.9
+
+
 def test_cf_requires_gaussian_vfam():
     # cf is Q2-only (no closed-form CF for a free-form Q1 posterior); it must reject
     # variational_family='unconstrained'. (compress, by contrast, is valid for BOTH
