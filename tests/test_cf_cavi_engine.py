@@ -191,12 +191,17 @@ def test_cf_cavi_guards():
         fit_glm_susie(
             X, y, L=2, offset_integration="cf", variational_family="unconstrained"
         )
-    # cf rejects explicit pre-centering (MVP)
-    with pytest.raises(ValueError, match="pre-centering"):
-        fit_glm_susie(X, y, L=2, method="cf_cavi", center=True)
     # cf rejects a profiled intercept (MVP)
     with pytest.raises(ValueError, match="profiled-intercept"):
         fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled")
+    # cf supports DENSE centering (orthogonalizes the intercept from the effects) but
+    # rejects SPARSE centering (its closed-form product densifies under centering).
+    fit_glm_susie(X, y, L=2, method="cf_cavi", center=True, max_iter=5)  # dense: runs
+    import jax.numpy as jnp
+    from jax.experimental import sparse
+    Xs = sparse.BCOO.fromdense(jnp.asarray(X))
+    with pytest.raises(ValueError, match="cf"):
+        fit_glm_susie(Xs, y, L=2, method="cf_cavi", center=True, max_iter=3)
 
 
 def test_cf_cavi_sparse_matches_dense():
