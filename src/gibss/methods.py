@@ -155,11 +155,21 @@ def _resolve(cfg):
                     "characteristic function -- use 'compress' or 'compress_selfnorm'."
                 )
             return Smoothed(base, CharFnOffset(M=cfg["compress_degree"])), "vi_gh"
-        elif integ == "compress" and vfam == "gaussian":
-            # CAVI in Q2: the Compress peel as the offset-integrated-cumulant builder,
-            # interchangeable with "cf" behind the same table seam; GH over b (vi_gh).
-            # (compress + unconstrained falls through to the Q1 quad kernel below.)
-            return Smoothed(base, _SMOOTHERS["compress"](cfg)), "vi_gh"
+        elif integ == "compress":
+            # CAVI in Q2 (gaussian): the Compress peel as the offset-integrated-cumulant
+            # builder, interchangeable with "cf" behind the same table seam; GH over b.
+            if vfam == "gaussian":
+                return Smoothed(base, _SMOOTHERS["compress"](cfg)), "vi_gh"
+            # unconstrained: the old moment-projected Q1 path is REMOVED -- free-form
+            # effects with a Gaussian-moment offset is dominated by 'compress_selfnorm'
+            # (exact free-form Q1, same fold cost -- it reuses the quad nodes 'compress'
+            # would compute and discard) and by 'compress'/'cf' + gaussian (exact Q2).
+            raise ValueError(
+                "offset_integration='compress' + variational_family='unconstrained' is "
+                "not supported (it was a moment-projected Q1 approximation). Use "
+                "offset_integration='compress_selfnorm' for EXACT free-form CAVI in Q1, "
+                "or variational_family='gaussian' for CAVI in Q2."
+            )
         else:
             response = Smoothed(base, _SMOOTHERS[integ](cfg))
 

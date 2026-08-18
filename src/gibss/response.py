@@ -1608,9 +1608,9 @@ class CompressSelfNorm(Compress):
     folds each other effect (and the intercept) against its TRUE, non-Gaussian posterior
     via raw quadrature `(b_nodes, logW)` (`build_aux_selfnorm_sequential[_sparse]`) instead
     of the Gaussian-moment mixture. The in-loop `Compress.terms` is identical (plug-in +
-    Chebyshev residual); only the amortized aux BUILDER differs, dispatched on this type in
-    `glm._compress_fold_aux`. With the quadrature-exact kernel this makes the IBSS sweep's
-    fixed point the exact mean-field (CAVI) posterior."""
+    Chebyshev residual); only the amortized aux BUILDER differs, built for the quad kernel
+    by `glm._selfnorm_effect_aux`. With the quadrature-exact kernel this makes the IBSS
+    sweep's fixed point the exact mean-field (CAVI) posterior."""
 
 
 @dataclass(frozen=True)

@@ -222,14 +222,6 @@ def _aux(data, state, include_intercept_var=True):
         return y
     ov = _offset_var(state, include_intercept_var)
     smoother = fs.response.smoother
-    if isinstance(smoother, Compress):
-        # M1: the offset is the aggregate message, treated as a single Gaussian
-        # o ~ N(0, ov) (its mean already lives in the fixed offset). Compress
-        # precomputes the K=1 residual tables once here; M2 replaces this with the
-        # per-target sequential fold over the OTHER effects' mixtures.
-        ov = jnp.broadcast_to(ov, (y.shape[0],))
-        z = jnp.zeros((y.shape[0], 1))
-        return smoother.build_aux(fs.response.base, y, z, ov[:, None], z)
     if smoother.takes_row_param and fs.kernel != "jj":
         return y, ov, jnp.asarray(fs.row_param)
     return y, ov
@@ -730,56 +722,17 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
     return (y_, z, z, hw, cll, cg, cw)
 
 
-def _compress_fold_aux(data, state, l):
-    """M2: the per-target offset aux for Compress. The EXACT offset of target l is the
-    SUM of the other effects, so we fold their per-row mixtures one at a time (sparse
-    zero-clumping on BCOO, dense otherwise) -- not a single moment-matched Gaussian.
-
-    The fold's `obar` is the offset mean; the engine keeps that mean in `eta` (the fixed
-    offset = LOO message mean + base), so we RE-CENTER the aux to obar=0, center=0 (the
-    coefficients are unchanged, since the fit interval was centered at -obar). Then
-    `Compress.terms(eta, aux)` evaluates Atilde at eta - obar = the mean-free predictor,
-    with no double-counting and no change to the engine's mean-in-eta convention. Null/
-    empty effects fold as point masses at 0, so they cost ~nothing and need no special
-    casing."""
+def _selfnorm_effect_aux(data, state, l):
+    """Exact free-form CAVI-in-Q1 offset aux (CompressSelfNorm): fold every OTHER effect
+    against its TRUE non-Gaussian posterior via self-normalized raw quadrature
+    `(b_nodes, logW)`, plus the shared intercept as one additive all-ones effect. The mean
+    rides in eta (the fold re-centers to obar=0). Dense + sparse (zero-clumping)."""
     fs = state.family_state
-    comp, base = fs.response.smoother, fs.response.base
-    y = jnp.asarray(data.y)
-    n = y.shape[0]
     others = [e for i, e in enumerate(state.single_effects) if i != l]
-    if isinstance(comp, CompressSelfNorm):
-        return _selfnorm_fold_aux(data, state, comp, base, y, n, others)
-    # the shared intercept's posterior uncertainty is part of the offset too (as it is
-    # in the GH path's ov); fold it as one extra N(0, intercept_var) Gaussian. Zero
-    # under profiled (intercept_var stays 0) and under MeanMessage (mean-only mode).
-    iv = 0.0 if isinstance(state.total_message, MeanMessage) else float(fs.intercept_var)
-    if is_bcoo(data.X):
-        # sparse zero-clumping fold of the X-effects. The shared intercept's N(0, iv) is
-        # folded FIRST (as the starting cumulant) rather than appended: convolution
-        # commutes, so we seed the fold with the intercept's residual (a cheap K=1 build)
-        # and cumulative variance iv, then fold the X-effects on top.
-        effects = [(e.alpha, e.mu, e.var) for e in others]
-        init = None
-        if iv > 0:
-            z1 = jnp.zeros((n, 1))
-            _, _, _, _, cll0, cg0, cw0 = comp.build_aux(base, y, z1, jnp.full((n, 1), iv), z1)
-            init = (-cll0, -cg0, cw0, iv)  # (cr0, cr1, cr2, V0)
-        aux = comp.build_aux_sequential_sparse(base, y, data.X, effects, init=init)
-    else:
-        Xd = jnp.asarray(data.X)
-        effects = [
-            (Xd * jnp.asarray(e.mu)[None, :],
-             Xd**2 * jnp.asarray(e.var)[None, :],
-             jnp.broadcast_to(jnp.log(jnp.asarray(e.alpha))[None, :], Xd.shape))
-            for e in others
-        ]
-        if iv > 0:  # intercept as a zero-mean single-Gaussian "effect"
-            zc = jnp.zeros((n, 1))
-            effects.append((zc, jnp.full((n, 1), iv), zc))
-        aux = comp.build_aux_sequential(base, y, effects)
-    y_, _obar, _center, hw, cll, cg, cw = aux
-    z = jnp.zeros_like(hw)  # re-center: obar -> 0, center -> 0 (coeffs unchanged)
-    return (y_, z, z, hw, cll, cg, cw)
+    return _selfnorm_fold_aux(
+        data, state, fs.response.smoother, fs.response.base,
+        jnp.asarray(data.y), data.X.shape[0], others,
+    )
 
 
 def update_effect_index_step(data, l, state):
@@ -790,16 +743,15 @@ def update_effect_index_step(data, l, state):
     # Smoothed response additionally receives the LOO message offset through aux:
     #   vi_gh (Q2 CAVI): the OTHER effects' Gaussian mixtures folded exactly, via the
     #     CF product or the Compress peel (`_offset_table_aux`).
-    #   quad + Compress/CompressSelfNorm (Q1 CAVI): the OTHER effects folded by the
-    #     sequential peel -- Gaussian-moment (Compress) or exact free-form self-normalized
-    #     (CompressSelfNorm) -- via `_compress_fold_aux`.
+    #   quad + CompressSelfNorm (Q1 CAVI, exact free-form): the OTHER effects folded
+    #     against their true self-normalized posteriors (`_selfnorm_effect_aux`).
     # The LOO message MEAN carries the offset mean in eta in every case.
     offset = _effect_offset(fs, state)
     smoother = fs.response.smoother if isinstance(fs.response, Smoothed) else None
     if fs.kernel == "vi_gh":
         aux = _offset_table_aux(data, state, l)
-    elif isinstance(smoother, Compress):
-        aux = _compress_fold_aux(data, state, l)
+    elif isinstance(smoother, CompressSelfNorm):
+        aux = _selfnorm_effect_aux(data, state, l)
     else:
         aux = _aux(data, state)
     new_effect = _fit_effect(

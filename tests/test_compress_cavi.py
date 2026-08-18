@@ -102,13 +102,17 @@ def test_cf_requires_gaussian_vfam():
                       variational_family="unconstrained")
 
 
-def test_compress_both_families():
-    # compress resolves to vi_gh (Q2) with gaussian q and to quad (Q1) with unconstrained.
+def test_compress_matrix():
+    # compress is Q2-only: gaussian -> vi_gh; unconstrained is rejected (the moment-
+    # projected Q1 path was removed -- use compress_selfnorm for exact free-form Q1).
     rng = np.random.default_rng(4)
     X, y = _logit_data(rng, n=150, p=15, signal_idx=[3], signal_val=[1.8])
     q2 = fit_glm_susie(X, y, L=2, offset_integration="compress",
                        variational_family="gaussian", max_iter=20)
-    q1 = fit_glm_susie(X, y, L=2, offset_integration="compress",
-                       variational_family="unconstrained", max_iter=20)
     assert q2.family_state.kernel == "vi_gh"
+    with pytest.raises(ValueError, match="compress_selfnorm"):
+        fit_glm_susie(X, y, L=2, offset_integration="compress",
+                      variational_family="unconstrained", max_iter=5)
+    q1 = fit_glm_susie(X, y, L=2, offset_integration="compress_selfnorm",
+                       variational_family="unconstrained", max_iter=20)
     assert q1.family_state.kernel == "quad"

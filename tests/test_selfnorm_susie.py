@@ -25,15 +25,12 @@ def _sim(seed, n=250, p=30, signals=((3, 1.8), (17, -1.6)), b0=0.4, sparse_x=Fal
     return jnp.asarray(X), jnp.asarray(y), [j for j, _ in signals]
 
 
-def test_selfnorm_dense_recovers_signals_and_matches_gaussian():
+def test_selfnorm_dense_recovers_signals():
     X, y, truth = _sim(0)
     s = fit_glm_susie(X, y, L=3, offset_integration="compress_selfnorm")
-    s0 = fit_glm_susie(X, y, L=3, offset_integration="compress")
     top = {int(j) for j in np.argsort(-np.asarray(s.pip))[: len(truth)]}
     assert set(truth) <= top
     assert s.converged and s.n_iter < 100
-    # both are approximations of the same posterior -> close ser_log_bf on an easy problem
-    assert np.allclose(np.asarray(s.ser_log_bf), np.asarray(s0.ser_log_bf), atol=0.5)
 
 
 def test_selfnorm_sparse_recovers_signals():
