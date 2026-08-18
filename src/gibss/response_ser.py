@@ -816,6 +816,96 @@ def glm_vi_gh_center_ser(
     return m, v, (ll - ll0) - kl, kl
 
 
+def glm_vi_gh_profile_ser(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 60,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """PROFILED-intercept variant of `glm_vi_gh_ser` (CAVI in Q2): q(b|gamma=j)=N(m_j,v_j)
+    integrated by GH over b against the offset-integrated cumulant table, with a per-feature
+    intercept b0_j maximized out pointwise -- never modeled as a factor, so no shared q(b0)
+    variance is folded (that would double-count b0's uncertainty; the profile already
+    absorbs it locally). The per-feature evidence is offset-shift invariant.
+
+    Joint 2-D Newton on (b0, m) with the GH-averaged smoothed weights, split into the
+    all-rows intercept background (`_background`) + the support-only correction, exactly as
+    in `glm_vi_profile_ser` -- off-support entries have x=0 so b_j drops out there and the
+    background needs no GH. v by Price + the envelope theorem (dF/db0=0 at the profiled
+    point): 1/v = 1/pv + sum x^2 E_b[w]. `aux` must be built with offset_var=0 (no shared
+    intercept). Returns (m, v, elbo_rel, coefficient_kl, b0, precision) -- the
+    glm_profile_ser contract; elbo_rel is the profiled per-feature evidence vs the null."""
+    offset = jnp.asarray(offset)
+    aux_e = _tmap(op.broadcast_rows, aux)
+    off_e = op.broadcast_rows(offset)
+    x = op.entry_x
+    inv_pv = 1.0 / prior_variance
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)
+
+    def _bg(b0):
+        return _background(response, offset, aux, b0, background, degree)
+
+    c0, ll_null = _profile_null(response, offset, aux)
+
+    def gh_terms(m, v, b0):
+        # GH-average over b_j of the offset-table terms at the SUPPORT predictor
+        # eta = offset + b0 + x(m + sqrt(2v) z_k); plus the x=0 config eta = offset + b0
+        # (off-support: b_j drops out, no GH). Both entry-space.
+        b0e = op.broadcast_cols(b0)
+        me, ve = op.broadcast_cols(m), op.broadcast_cols(v)
+        sd = jnp.sqrt(2.0 * jnp.maximum(x**2 * ve, 0.0))
+        eta = off_e + b0e + x * me
+        lead = (-1,) + (1,) * jnp.ndim(eta)
+        shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)
+        aux_o = _tmap(lambda a: a[None, ...], aux_e)
+        ll, g, w = response.terms(shft, aux_o)
+        W = wts.reshape(lead)
+        supp = (jnp.sum(W * ll, 0), jnp.sum(W * g, 0), jnp.sum(W * w, 0))
+        zero = response.terms(off_e + b0e, aux_e)  # x = 0 config (no b_j dependence)
+        return supp, zero
+
+    def body(state):
+        m, v, b0, _, it = state
+        (_, g, w), (_, g0, w0) = gh_terms(m, v, b0)
+        BGw, BGg, _ = _bg(b0)
+        H00 = BGw + op.local_moment(0, w - w0)  # intercept curvature (all rows)
+        H0b = op.local_moment(1, w)
+        S2w = op.local_moment(2, w)
+        Hbb = S2w + inv_pv
+        gb0 = BGg + op.local_moment(0, g - g0)  # intercept score (all rows)
+        gb = op.local_moment(1, g) - inv_pv * m
+        det = H00 * Hbb - H0b**2
+        db0 = jnp.clip((Hbb * gb0 - H0b * gb) / det, -4.0, 4.0)
+        dm = jnp.clip((H00 * gb - H0b * gb0) / det, -4.0, 4.0)
+        resid = jnp.maximum(jnp.max(jnp.abs(dm)), jnp.max(jnp.abs(db0)))
+        return m + dm, 1.0 / (inv_pv + S2w), b0 + db0, resid, it + 1
+
+    m, v, b0, _, _ = jax.lax.while_loop(
+        lambda s: (s[4] < n_iter) & (s[3] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.full(op.p, c0), jnp.inf, 0),
+    )
+    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0) & jnp.isfinite(b0)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+    b0 = jnp.where(ok, b0, c0)
+
+    (ll, _, w), (ll0s, _, _) = gh_terms(m, v, b0)
+    _, _, BGll = _bg(b0)
+    ll_alt = BGll + op.local_moment(0, ll - ll0s)  # all-rows E_q[ll] at (m, v, b0)
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    prec = inv_pv + op.local_moment(2, w)
+    return m, v, ll_alt - ll_null - kl, kl, b0, prec
+
+
 @partial(jax.jit, static_argnames=("response", "n_iter", "background", "degree"))
 def glm_vi_profile_ser(
     op,

@@ -192,3 +192,53 @@ def test_q1_q2_family_gap():
     assert np.isfinite(easy) and np.isfinite(hard)
     assert easy < 0.5           # near-Gaussian: the two families almost agree
     assert hard > easy          # the genuine family restriction shows up when it should
+
+
+# --------------------------------------------------------------- gold profiled vi_gh
+def test_gold_profiled_vi_gh():
+    """Profiled vi_gh (glm_vi_gh_profile_ser) matches an INDEPENDENT brute-force profiled
+    Gaussian-VI -- a 2-D (m, b0) Newton, GH over b, analytic null -- to machine precision
+    at L=1: the exact profiled-Q2 fixed point (m, v) AND the shift-invariant evidence.
+    (Profiling absorbs b0's uncertainty locally, so the offset carries no shared q(b0).)"""
+    rng = np.random.default_rng(2)
+    X, y = _logit_data(rng, n=300, p=8, idx=[3], val=[1.8])
+    pv = 1.0
+    st = fit_glm_susie(
+        X, y, L=1, intercept="profiled", offset_integration="cf",
+        variational_family="gaussian", estimate_prior_variance=False,
+        prior_variance=pv, max_iter=150, tol=1e-10,
+    )
+    e = st.single_effects[0]
+    Xn, yn = np.asarray(X), np.asarray(y)
+    gn, gw = np.polynomial.hermite.hermgauss(80)
+    gw = gw / np.sqrt(np.pi)
+
+    def brute(xj):  # profiled Gaussian-VI for one feature
+        m, b0, v = 0.0, 0.0, pv
+        for _ in range(400):
+            b = m + np.sqrt(2 * v) * gn
+            eta = b0 + xj[:, None] * b[None, :]
+            s = _sigmoid(eta)
+            Eg = (gw * (yn[:, None] - s)).sum(1)
+            Ew = (gw * (s * (1 - s))).sum(1)
+            gm, gb0 = np.sum(xj * Eg) - m / pv, np.sum(Eg)
+            H00, H0b = np.sum(Ew), np.sum(xj * Ew)
+            Hbb = np.sum(xj**2 * Ew) + 1 / pv
+            det = H00 * Hbb - H0b**2
+            m += np.clip((H00 * gm - H0b * gb0) / det, -4, 4)
+            b0 += np.clip((Hbb * gb0 - H0b * gm) / det, -4, 4)
+            v = 1 / (1 / pv + np.sum(xj**2 * Ew))
+        b = m + np.sqrt(2 * v) * gn
+        eta = b0 + xj[:, None] * b[None, :]
+        ll = (gw * (yn[:, None] * eta - np.logaddexp(0, eta))).sum(1).sum()
+        kl = 0.5 * (np.log(pv / v) + (v + m**2) / pv - 1)
+        yb = yn.mean()
+        b0s = np.log(yb / (1 - yb))
+        ll0 = np.sum(yn * b0s - np.logaddexp(0, b0s))  # analytic profiled null
+        return m, v, ll - ll0 - kl
+
+    for c in (3, 0):
+        mB, vB, bfB = brute(Xn[:, c])
+        assert abs(mB - float(e.mu[c])) < 1e-4, f"c={c} m"
+        assert abs(vB - float(e.var[c])) < 1e-4, f"c={c} v"
+        assert abs(bfB - float(e.feature_log_bf[c])) < 1e-3, f"c={c} log_bf"

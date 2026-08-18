@@ -52,6 +52,7 @@ from .response_ser import (
     glm_ser,
     glm_ser_nodes,
     glm_vi_gh_center_ser,
+    glm_vi_gh_profile_ser,
     glm_vi_gh_ser,
     glm_vi_profile_ser,
     glm_vi_ser,
@@ -168,12 +169,6 @@ class GLMFamilyState:
                 raise ValueError(
                     "kernel='vi_gh' (CAVI in Q2) needs response = Smoothed(base, "
                     f"CharFnOffset()|Compress()); got {self.response!r}."
-                )
-            if self.intercept == "profiled":
-                raise ValueError(
-                    "kernel='vi_gh' has no profiled-intercept variant yet (the "
-                    "intercept would need integrating over the effect mixture too); "
-                    "use intercept='shared' or 'null'."
                 )
         if self.intercept not in ("shared", "profiled", "null"):
             raise ValueError(
@@ -412,6 +407,13 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     elif fs.kernel == "vi":
         mu, var, log_bf, coefficient_kl = glm_vi_ser(
             op, aux, offset, prior_variance, fs.response,
+        )
+    elif fs.kernel == "vi_gh" and profiled:
+        # CAVI in Q2 with a profiled per-feature intercept: b0_j maximized out pointwise
+        # (no shared q(b0) -> the table was built with offset_var=0, so no double-count).
+        mu, var, log_bf, coefficient_kl, _, _ = glm_vi_gh_profile_ser(
+            op, aux, offset, prior_variance, fs.response, order=order,
+            background=fs.background,
         )
     elif fs.kernel == "vi_gh":
         # CAVI in Q2: `aux` is the CharFnOffset table built from the OTHER effects'
