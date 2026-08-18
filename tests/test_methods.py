@@ -131,6 +131,19 @@ def test_family_object_passthrough():
     np.testing.assert_array_equal(np.asarray(a.alpha), np.asarray(b.alpha))
 
 
+def test_compress_gaussian_resolves_to_vi_gh():
+    # Consolidated: compress + gaussian is a valid Q2 CAVI path (the vi_gh kernel
+    # integrates b by GH against the offset-integrated cumulant table). The exact
+    # free-form compress_selfnorm, by contrast, has no Gaussian-q meaning and rejects it.
+    X, y = _data("logistic")
+    st = fit_glm_susie(X, y, L=2, offset_integration="compress",
+                       variational_family="gaussian", max_iter=5)
+    assert st.family_state.kernel == "vi_gh"
+    with pytest.raises(ValueError, match="unconstrained"):
+        fit_glm_susie(X, y, L=2, offset_integration="compress_selfnorm",
+                      variational_family="gaussian", max_iter=5)
+
+
 def test_prior_variance_threads_through():
     X, y = _data("logistic")
     st = fit_glm_susie(

@@ -6,7 +6,6 @@ from typing import Any, Callable, Generic, TypeVar
 import jax
 import numpy as np
 import jax.numpy as jnp
-from jax.experimental import sparse
 
 
 Step = Callable[[Any, Any], Any]
@@ -282,6 +281,15 @@ class BaseSERState:
     marginal_log_likelihood: float  # SER-level: logsumexp(feature_log_marginal) - log p
     null_log_marginal: float
     kl: float
+    # Raw quadrature representation of the per-feature posterior, populated only by the
+    # adaptive-GH `quad` kernel (None otherwise). `b_nodes[m, j]` is the m-th effect-value
+    # node for feature j; `log_node_weight[m, j]` its log-unnormalized posterior weight
+    # (the fitting quadrature's log-integrand, with the uniform feature prior folded in).
+    # `softmax(log_node_weight)` over all (m, j) is the SER's joint posterior over
+    # (node, feature); this is exactly the `(b_nodes, logW)` contract the self-normalized
+    # offset fold consumes (`Compress.build_aux_selfnorm_sequential`). Shapes (order, p).
+    b_nodes: Any = None
+    log_node_weight: Any = None
 
     def get_cs(self, coverage: float = 0.95) -> tuple[int, ...]:
         """Indices of the smallest set of features with sum(alpha) >= coverage."""

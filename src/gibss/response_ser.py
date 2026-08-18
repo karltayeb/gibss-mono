@@ -25,12 +25,16 @@ from ._numerics import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
 
 __all__ = [
     "glm_ser",
+    "glm_ser_nodes",
     "glm_center_ser",
+    "glm_center_ser_nodes",
     "build_ser_state",
     "glm_profile_map",
     "glm_profile_ser",
+    "glm_profile_ser_nodes",
     "glm_jj_ser",
     "glm_vi_ser",
+    "glm_vi_gh_ser",
     "glm_vi_profile_ser",
     "glm_linear_ser",
     "glm_linear_profile_ser",
@@ -184,18 +188,7 @@ def glm_profile_map(
     return b, b0, var, log_bf
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "response",
-        "order",
-        "n_iter",
-        "background",
-        "node_intercept",
-        "node_newton",
-    ),
-)
-def glm_profile_ser(
+def _glm_profile_ser_impl(
     op,
     aux,
     offset,
@@ -207,14 +200,18 @@ def glm_profile_ser(
     node_intercept: str = "linear",
     node_newton: int = 4,
 ):
-    """Per-column profiled-intercept SER: glm_profile_map mode + a GH tail over b with
-    per-node intercept. Response-generic form of `ser_ops.profile_ser`.
+    """Shared body of `glm_profile_ser` / `glm_profile_ser_nodes`. Per-column
+    profiled-intercept SER: glm_profile_map mode + a GH tail over b with per-node
+    intercept. Response-generic form of `ser_ops.profile_ser`.
 
     node_intercept: 'linear' (Cox-Reid one step) or 'newton' (re-profile b0 at each
     node via the row-background -- more accurate in the tails, cheap under chebyshev).
-    Returns (mu, var, feature_log_bf, coefficient_kl, b0_hat, precision). For a
-    `quadratic` response prefer `glm_linear_profile_ser` (closed form; the
-    engine enforces this)."""
+    Returns the 8-tuple (mu, var, feature_log_bf, coefficient_kl, b0_hat, precision,
+    b_nodes, log_node_weight): the profiled per-feature Laplace summaries plus the
+    adaptive-GH nodes over b and their log-unnormalized weights (each (order, p)). The
+    b-posterior the nodes represent is the profile-marginalized one -- the object the
+    profiled model's self-normalized offset fold consumes. For a `quadratic` response
+    prefer `glm_linear_profile_ser` (closed form; the engine enforces this)."""
     aux = _tmap(jnp.asarray, aux)
     offset = jnp.asarray(offset)
     aux_e = _tmap(op.broadcast_rows, aux)
@@ -287,7 +284,75 @@ def glm_profile_ser(
 
     logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, b0_nodes, BGll)
     mu, var, log_norm, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
-    return mu, var, log_norm, coefficient_kl, b0_hat, 1.0 / var_lap
+    return mu, var, log_norm, coefficient_kl, b0_hat, 1.0 / var_lap, b_nodes, logint
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "response",
+        "order",
+        "n_iter",
+        "background",
+        "node_intercept",
+        "node_newton",
+    ),
+)
+def glm_profile_ser(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 30,
+    background: str = "exact",
+    node_intercept: str = "linear",
+    node_newton: int = 4,
+):
+    """Per-column profiled-intercept SER: `(mu, var, feature_log_bf, coefficient_kl,
+    b0_hat, precision)`. See `_glm_profile_ser_impl` for the method and
+    `glm_profile_ser_nodes` for the raw quadrature nodes the self-normalized offset
+    fold consumes."""
+    return _glm_profile_ser_impl(
+        op, aux, offset, prior_variance, response, order, n_iter,
+        background, node_intercept, node_newton,
+    )[:6]
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "response",
+        "order",
+        "n_iter",
+        "background",
+        "node_intercept",
+        "node_newton",
+    ),
+)
+def glm_profile_ser_nodes(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 30,
+    background: str = "exact",
+    node_intercept: str = "linear",
+    node_newton: int = 4,
+):
+    """`glm_profile_ser` plus the raw quadrature representation of the (profiled)
+    per-feature posterior: `(mu, var, feature_log_bf, coefficient_kl, b0_hat,
+    precision, b_nodes, log_node_weight)`, the last two each (order, p).
+    `softmax(log_node_weight)` over all (node, feature) is the SER's joint posterior
+    over (node, feature) -- the `(b_nodes, logW)` contract the self-normalized offset
+    fold consumes under `intercept='profiled'`."""
+    return _glm_profile_ser_impl(
+        op, aux, offset, prior_variance, response, order, n_iter,
+        background, node_intercept, node_newton,
+    )
 
 
 def build_ser_state(
@@ -297,6 +362,8 @@ def build_ser_state(
     coefficient_kl,
     prior_variance,
     null_log_marginal=0.0,
+    b_nodes=None,
+    log_node_weight=None,
 ):
     """Assemble a `BaseSERState` from a kernel's per-feature outputs.
 
@@ -329,6 +396,8 @@ def build_ser_state(
         marginal_log_likelihood=float(log_norm - jnp.log(float(p)) + null_log_marginal),
         null_log_marginal=null_log_marginal,
         kl=kl,
+        b_nodes=b_nodes,
+        log_node_weight=log_node_weight,
     )
 
 
@@ -555,7 +624,9 @@ def glm_vi_ser(
         m, v, _, it = state
         _, g, w = smoothed(m, v)
         prec = inv_pv + op.local_moment(2, w)
-        step = (op.local_moment(1, g) - inv_pv * m) / prec
+        # Damp the Newton m-step (+-4 log-odds): undamped it overshoots to +-inf on a
+        # (near-)separated column at large prior variance -- same trust region as glm_ser.
+        step = jnp.clip((op.local_moment(1, g) - inv_pv * m) / prec, -4.0, 4.0)
         return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
 
     m, v, _, _ = jax.lax.while_loop(
@@ -573,7 +644,278 @@ def glm_vi_ser(
     ll = smoothed(m, v)[0]
     ll0 = response.terms(off_e, (y_e, ov_e))[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
-    return m, v, op.local_moment(0, ll - ll0) - kl, kl
+    elbo_rel = jnp.where(ok, op.local_moment(0, ll - ll0) - kl, 0.0)
+    return m, v, elbo_rel, kl
+
+
+@partial(jax.jit, static_argnames=("response", "order", "n_iter"))
+def glm_vi_gh_ser(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 100,
+    tol: float = 1e-8,
+):
+    """Gaussian-restricted variational SER whose effect `b` is integrated by explicit
+    Gauss-Hermite quadrature over a response that ALREADY carries the offset.
+
+    Same q(b | gamma=j) = N(m_j, v_j) coordinate ascent as `glm_vi_ser`, but the two
+    kernels take the Gaussian expectation `E_{b ~ N(m,v)}` differently:
+
+      glm_vi_ser  : the offset AND the effect are folded through ONE Gaussian
+                    convolution seam (`ve = x^2 v + ov`) -- requires a `Smoothed(base,
+                    pointwise scheme)` and can only represent a SINGLE-Gaussian offset.
+      glm_vi_gh_ser: the offset is pre-integrated INSIDE `response` (any
+                    offset-integrated cumulant, e.g. a Chebyshev-table smoother --
+                    `Smoothed(base, CharFnOffset()/Compress()/...)`), and only the
+                    effect `b` is integrated here, by `order`-node GH over the fixed
+                    per-row cumulant `E_b[response.terms(offset + x b, aux)]`.
+
+    This is what CAVI in Q2 for a GLM needs: the offset under q_{-j} in Q2 is a Gaussian
+    MIXTURE (a convolution of L-1 p-component mixtures), which the single-Gaussian
+    convolution of `glm_vi_ser` cannot represent but a CF/table smoother can. Being GH
+    over `b`, it works with ANY `response` providing a smooth cumulant `terms(eta, aux)
+    -> (y*eta - Atilde, y - Atilde', Atilde'')`; a plain base (empty offset) reduces it
+    to a Gaussian-VI SER with no offset integration (== glm_vi_ser with ov=0).
+
+    `aux` is the per-row data `response.terms` consumes (the table `(y, obar, center,
+    halfwidth, coef_ll, coef_g, coef_w)` for a compress/CF smoother, or plain `y` for a
+    base); it is treated as an opaque pytree and broadcast leaf-wise. `offset` is the
+    deterministic predictor added outside the table, and must be CONSISTENT with the
+    smoother's mean convention (CharFnOffset: intercept + s; Compress: intercept only) --
+    the kernel only evaluates `terms(offset + x b, aux)` and cannot detect a mismatch.
+    Stationarity: m solves the GH-averaged score, 1/v = 1/pv + sum_i x^2 E_b[weight]
+    (Price's theorem). Returns (m, v, elbo_rel, coefficient_kl = KL(q_j || prior)), the
+    `build_ser_state` contract; `elbo_rel` is the per-feature ELBO minus the b=0 null.
+    Shared intercept only (no profiled variant here)."""
+    offset = jnp.asarray(offset)
+    aux_e = _tmap(op.broadcast_rows, aux)
+    off_e = op.broadcast_rows(offset)
+    x = op.entry_x
+    inv_pv = 1.0 / prior_variance
+
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+
+    def smoothed(m, v):
+        # E_{b ~ N(m, v)} of the offset-integrated cumulant terms, by GH over b. The
+        # variance folded here is the EFFECT's alone (x^2 v); the offset is already
+        # integrated inside `response`/`aux`, so -- unlike glm_vi_ser -- there is no ov.
+        ve = x**2 * op.broadcast_cols(v)
+        eta = off_e + x * op.broadcast_cols(m)
+        sd = jnp.sqrt(2.0 * jnp.maximum(ve, 0.0))
+        lead = (-1,) + (1,) * jnp.ndim(eta)
+        shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)  # (order, *eta)
+        aux_o = _tmap(lambda a: a[None, ...], aux_e)  # open the GH-node axis on aux
+        ll, g, w = response.terms(shft, aux_o)
+        W = wts.reshape(lead)
+        return jnp.sum(W * ll, 0), jnp.sum(W * g, 0), jnp.sum(W * w, 0)
+
+    def body(state):
+        m, v, _, it = state
+        _, g, w = smoothed(m, v)
+        prec = inv_pv + op.local_moment(2, w)
+        # Damp: the undamped Newton m-step overshoots on a (near-)separated column at
+        # large prior variance (w -> 0, prec -> inv_pv tiny), sending m to +-inf and a
+        # confidently-wrong log_bf. Clip to +-4 log-odds like glm_ser / the sibling
+        # vi_gh kernels; near the mode the raw step is small, so convergence is kept.
+        step = jnp.clip((op.local_moment(1, g) - inv_pv * m) / prec, -4.0, 4.0)
+        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    )
+    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+
+    # ELBO - baseline: E_q[ll] is the GH-averaged ll at (m, v); baseline is b = 0, where
+    # ve = 0 so no GH is needed (the offset is already in the table -> terms at offset).
+    ll = smoothed(m, v)[0]
+    ll0 = response.terms(off_e, aux_e)[0]
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    # A feature that failed to converge (reset to the null m=0) carries no evidence -> 0,
+    # never the large-negative ELBO evaluated at the reset point.
+    elbo_rel = jnp.where(ok, op.local_moment(0, ll - ll0) - kl, 0.0)
+    return m, v, elbo_rel, kl
+
+
+@partial(jax.jit, static_argnames=("response", "order", "n_iter", "background", "degree"))
+def glm_vi_gh_center_ser(
+    op,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 100,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """Sparse-CENTERED variant of `glm_vi_gh_ser`: the Gaussian-VI effect update on a
+    centered design, `eta = offset + (x_ij - c_j) b`, where a zero entry is NOT a point
+    mass at o=0 but at `-c_j b` (a per-feature off-support BACKGROUND). The effect `b` is
+    integrated by GH over q(b)=N(m,v) as in `glm_vi_gh_ser`; the centered score/curvature
+    at each GH-b node reuse `glm_center_ser`'s support+background split: support entries
+    carry `(x_ij - c_j)`, and the all-rows off-support fill `-c_j` is summed once via
+    `_background` (a Chebyshev-in-shift surrogate, O(n D) not O(n p)) with the support
+    rows corrected out. `center` is the per-column mean `c` (p,), GIVEN. Returns
+    (m, v, elbo_rel, coefficient_kl); shared intercept only."""
+    offset = jnp.asarray(offset)
+    c = jnp.asarray(center)
+    aux_e = _tmap(op.broadcast_rows, aux)
+    off_e = op.broadcast_rows(offset)
+    x_e = op.entry_x
+    c_e = op.broadcast_cols(c)
+    xc_e = x_e - c_e  # (x_ij - c_j) at support entries
+    inv_pv = 1.0 / prior_variance
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+
+    def sc_at(b):
+        # centered (loglik, score, curvature) per feature at a single b (p,), all-rows:
+        # support entries use (x-c); the off-support fill uses -c (the `_background` sum
+        # over ALL rows, minus the support rows already counted at the support predictor).
+        b_e = op.broadcast_cols(b)
+        eta_e = off_e + xc_e * b_e  # support predictor
+        eta_bg_e = off_e - c_e * b_e  # support rows at the background shift (correction)
+        ll_e, g_e, w_e = response.terms(eta_e, aux_e)
+        ll_b, g_b, w_b = response.terms(eta_bg_e, aux_e)
+        BGw, BGg, BGl = _background(response, offset, aux, -c * b, background, degree)
+        ll = BGl + op.local_moment(0, ll_e - ll_b)
+        score = op.local_moment(0, xc_e * g_e) - c * (BGg - op.local_moment(0, g_b))
+        curv = op.local_moment(0, xc_e**2 * w_e) + c**2 * (BGw - op.local_moment(0, w_b))
+        return ll, score, curv
+
+    def smoothed(m, v):
+        # E_{b ~ N(m, v)} of the centered (ll, score, curv), by GH over b (per feature).
+        sd = jnp.sqrt(2.0 * jnp.maximum(v, 0.0))
+        bk = m[None, :] + sd[None, :] * nodes[:, None]  # (order, p) per-feature b nodes
+        ll_k, sc_k, cv_k = jax.vmap(sc_at)(bk)  # (order, p) each
+        W = wts[:, None]
+        return jnp.sum(W * ll_k, 0), jnp.sum(W * sc_k, 0), jnp.sum(W * cv_k, 0)
+
+    def body(state):
+        m, v, _, it = state
+        _, score, curv = smoothed(m, v)
+        prec = inv_pv + curv  # 1/v = 1/pv + sum_i (x-c)^2 E_b[weight]  (Price)
+        step = jnp.clip((score - inv_pv * m) / prec, -4.0, 4.0)
+        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    )
+    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+    # ELBO - baseline: GH-averaged centered loglik at (m, v) minus the b=0 null (already
+    # per-feature summed inside `sc_at`), minus the KL.
+    ll = smoothed(m, v)[0]
+    ll0 = sc_at(jnp.zeros(op.p))[0]
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    return m, v, (ll - ll0) - kl, kl
+
+
+@partial(jax.jit, static_argnames=("response", "order", "n_iter", "background", "degree"))
+def glm_vi_gh_profile_ser(
+    op,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 60,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """PROFILED-intercept variant of `glm_vi_gh_ser` (CAVI in Q2): q(b|gamma=j)=N(m_j,v_j)
+    integrated by GH over b against the offset-integrated cumulant table, with a per-feature
+    intercept b0_j maximized out pointwise -- never modeled as a factor, so no shared q(b0)
+    variance is folded (that would double-count b0's uncertainty; the profile already
+    absorbs it locally). The per-feature evidence is offset-shift invariant.
+
+    Joint 2-D Newton on (b0, m) with the GH-averaged smoothed weights, split into the
+    all-rows intercept background (`_background`) + the support-only correction, exactly as
+    in `glm_vi_profile_ser` -- off-support entries have x=0 so b_j drops out there and the
+    background needs no GH. v by Price + the envelope theorem (dF/db0=0 at the profiled
+    point): 1/v = 1/pv + sum x^2 E_b[w]. `aux` must be built with offset_var=0 (no shared
+    intercept). Returns (m, v, elbo_rel, coefficient_kl, b0, precision) -- the
+    glm_profile_ser contract; elbo_rel is the profiled per-feature evidence vs the null."""
+    offset = jnp.asarray(offset)
+    aux_e = _tmap(op.broadcast_rows, aux)
+    off_e = op.broadcast_rows(offset)
+    x = op.entry_x
+    inv_pv = 1.0 / prior_variance
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)
+
+    def _bg(b0):
+        return _background(response, offset, aux, b0, background, degree)
+
+    c0, ll_null = _profile_null(response, offset, aux)
+
+    def gh_terms(m, v, b0):
+        # GH-average over b_j of the offset-table terms at the SUPPORT predictor
+        # eta = offset + b0 + x(m + sqrt(2v) z_k); plus the x=0 config eta = offset + b0
+        # (off-support: b_j drops out, no GH). Both entry-space.
+        b0e = op.broadcast_cols(b0)
+        me, ve = op.broadcast_cols(m), op.broadcast_cols(v)
+        sd = jnp.sqrt(2.0 * jnp.maximum(x**2 * ve, 0.0))
+        eta = off_e + b0e + x * me
+        lead = (-1,) + (1,) * jnp.ndim(eta)
+        shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)
+        aux_o = _tmap(lambda a: a[None, ...], aux_e)
+        ll, g, w = response.terms(shft, aux_o)
+        W = wts.reshape(lead)
+        supp = (jnp.sum(W * ll, 0), jnp.sum(W * g, 0), jnp.sum(W * w, 0))
+        zero = response.terms(off_e + b0e, aux_e)  # x = 0 config (no b_j dependence)
+        return supp, zero
+
+    def body(state):
+        m, v, b0, _, it = state
+        (_, g, w), (_, g0, w0) = gh_terms(m, v, b0)
+        BGw, BGg, _ = _bg(b0)
+        H00 = BGw + op.local_moment(0, w - w0)  # intercept curvature (all rows)
+        H0b = op.local_moment(1, w)
+        S2w = op.local_moment(2, w)
+        Hbb = S2w + inv_pv
+        gb0 = BGg + op.local_moment(0, g - g0)  # intercept score (all rows)
+        gb = op.local_moment(1, g) - inv_pv * m
+        det = H00 * Hbb - H0b**2
+        db0 = jnp.clip((Hbb * gb0 - H0b * gb) / det, -4.0, 4.0)
+        dm = jnp.clip((H00 * gb - H0b * gb0) / det, -4.0, 4.0)
+        resid = jnp.maximum(jnp.max(jnp.abs(dm)), jnp.max(jnp.abs(db0)))
+        return m + dm, 1.0 / (inv_pv + S2w), b0 + db0, resid, it + 1
+
+    m, v, b0, _, _ = jax.lax.while_loop(
+        lambda s: (s[4] < n_iter) & (s[3] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.full(op.p, c0), jnp.inf, 0),
+    )
+    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0) & jnp.isfinite(b0)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+    b0 = jnp.where(ok, b0, c0)
+
+    (ll, _, w), (ll0s, _, _) = gh_terms(m, v, b0)
+    _, _, BGll = _bg(b0)
+    ll_alt = BGll + op.local_moment(0, ll - ll0s)  # all-rows E_q[ll] at (m, v, b0)
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    prec = inv_pv + op.local_moment(2, w)
+    return m, v, ll_alt - ll_null - kl, kl, b0, prec
 
 
 @partial(jax.jit, static_argnames=("response", "n_iter", "background", "degree"))
@@ -675,8 +1017,7 @@ def glm_vi_profile_ser(
     return m, v, ll_alt - ll_null - kl, kl, b0, prec
 
 
-@partial(jax.jit, static_argnames=("order", "n_iter", "response"))
-def glm_ser(
+def _glm_ser_impl(
     op: DesignOperator,
     aux,
     offset,
@@ -686,14 +1027,11 @@ def glm_ser(
     n_iter: int = 50,
     tol: float = 1e-8,
 ):
-    """Per-column SER for an arbitrary response. `aux` is per-observation auxiliary
-    data (y for Bernoulli/Poisson, llr for the two-group marginal, `(y, offset_var)`
-    for a `Smoothed` family); any pytree of per-row arrays works.
-
-    Returns per-feature (mu, var, feature_log_bf, coefficient_kl), the log-BF
-    relative to the b=0 fit at `offset` (what alpha uses). For a `quadratic`
-    response prefer `glm_linear_ser` (closed-form weighted linear regression; the engine enforces this).
-    """
+    """Shared body of `glm_ser` / `glm_ser_nodes`. Returns the 6-tuple `(mu, var,
+    feature_log_bf, coefficient_kl, b_nodes, log_node_weight)` -- the per-feature Laplace
+    summaries plus the adaptive-GH nodes and their log-unnormalized weights (each
+    (order, p)). `aux` is per-observation auxiliary data (y for Bernoulli/Poisson, llr for
+    the two-group marginal, `(y, offset_var)` for a `Smoothed` family)."""
     aux = _tmap(jnp.asarray, aux)
     offset = jnp.asarray(offset)
     aux_e = _tmap(op.broadcast_rows, aux)
@@ -749,14 +1087,49 @@ def glm_ser(
         return logint, bb, dll
 
     logint, b_nodes, dll_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p) x3
-    return _posterior_moments(logint, b_nodes, dll_nodes)
+    mu, var, log_bf, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
+    return mu, var, log_bf, coefficient_kl, b_nodes, logint
 
 
-@partial(
-    jax.jit,
-    static_argnames=("response", "order", "n_iter", "background", "degree"),
-)
-def glm_center_ser(
+@partial(jax.jit, static_argnames=("order", "n_iter", "response"))
+def glm_ser(
+    op: DesignOperator,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+):
+    """Per-column SER for an arbitrary response: `(mu, var, feature_log_bf,
+    coefficient_kl)`, the log-BF relative to the b=0 fit at `offset` (what alpha uses).
+    `aux` is per-observation auxiliary data (y for Bernoulli/Poisson, llr for the
+    two-group marginal, `(y, offset_var)` for a `Smoothed` family). For a `quadratic`
+    response prefer `glm_linear_ser`. See `glm_ser_nodes` for the raw quadrature nodes."""
+    return _glm_ser_impl(op, aux, offset, prior_variance, response, order, n_iter, tol)[:4]
+
+
+@partial(jax.jit, static_argnames=("order", "n_iter", "response"))
+def glm_ser_nodes(
+    op: DesignOperator,
+    aux,
+    offset,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+):
+    """`glm_ser` plus the raw quadrature representation of the per-feature posterior:
+    `(mu, var, feature_log_bf, coefficient_kl, b_nodes, log_node_weight)`, the last two
+    each (order, p). `softmax(log_node_weight)` over all (node, feature) is the SER's
+    joint posterior over (node, feature) -- the `(b_nodes, logW)` contract the
+    self-normalized offset fold (`Compress.build_aux_selfnorm_sequential`) consumes."""
+    return _glm_ser_impl(op, aux, offset, prior_variance, response, order, n_iter, tol)
+
+
+def _glm_center_ser_impl(
     op: DesignOperator,
     aux,
     offset,
@@ -769,24 +1142,12 @@ def glm_center_ser(
     background: str = "chebyshev",
     degree: int = 40,
 ):
-    """Per-column SER with the EXACT per-feature Laplace of `glm_ser`, but on a design
-    centered by a FIXED offset `center` (c_j): the single-effect model is
-    eta_i = offset_i + (x_ij - c_j) b_j with c_j GIVEN (unweighted mean, null-weighted,
-    or the leave-one-out null-weighted center when updating effect l -- computed by the
-    caller, NOT profiled here). Distinct from `glm_profile_ser`, which SOLVES a
-    per-feature intercept; here c_j is a fixed reparameterization.
-
-    On a sparse `op` centering fills the zeros (every off-support x_ij = 0 becomes
-    -c_j, whose weight depends on b_j), so a naive fit is dense O(n*p). Instead each
-    all-rows reduction splits into a support term (O(nnz), the real entries) plus the
-    off-support fill-in, whose sum over rows is the 1-D background B(s_j) = sum_i
-    f(offset_i + s_j) at the per-feature scalar shift s_j = -c_j b_j -- the SAME
-    `_background` primitive the profiled kernel uses, amortized by the Chebyshev
-    surrogate (O(n*D + D*p)). On a dense (full-grid) op the off-support set is empty
-    and the correction cancels, so this reduces to `glm_ser` on the centered design.
-
-    Returns (mu, var, feature_log_bf, coefficient_kl), the log-BF relative to the b=0
-    fit at `offset` (a feature-independent baseline that cancels in alpha)."""
+    """Shared body of `glm_center_ser` / `glm_center_ser_nodes`. Returns the 6-tuple
+    `(mu, var, feature_log_bf, coefficient_kl, b_nodes, log_node_weight)` -- the
+    centered per-feature Laplace summaries plus the adaptive-GH nodes over b and their
+    log-unnormalized weights (each (order, p)). The b-posterior the nodes represent is
+    the centered single-effect one (`eta = offset + (x_ij - c_j) b`); the sparse-centered
+    self-normalized offset fold consumes it. See `glm_center_ser` for the method."""
     aux = _tmap(jnp.asarray, aux)
     offset = jnp.asarray(offset)
     c = jnp.asarray(center)
@@ -861,4 +1222,77 @@ def glm_center_ser(
         return logint, dll
 
     logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, BGll)
-    return _posterior_moments(logint, b_nodes, dll_nodes)
+    mu, var, log_bf, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
+    return mu, var, log_bf, coefficient_kl, b_nodes, logint
+
+
+@partial(
+    jax.jit,
+    static_argnames=("response", "order", "n_iter", "background", "degree"),
+)
+def glm_center_ser(
+    op: DesignOperator,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """Per-column SER with the EXACT per-feature Laplace of `glm_ser`, but on a design
+    centered by a FIXED offset `center` (c_j): the single-effect model is
+    eta_i = offset_i + (x_ij - c_j) b_j with c_j GIVEN (unweighted mean, null-weighted,
+    or the leave-one-out null-weighted center when updating effect l -- computed by the
+    caller, NOT profiled here). Distinct from `glm_profile_ser`, which SOLVES a
+    per-feature intercept; here c_j is a fixed reparameterization.
+
+    On a sparse `op` centering fills the zeros (every off-support x_ij = 0 becomes
+    -c_j, whose weight depends on b_j), so a naive fit is dense O(n*p). Instead each
+    all-rows reduction splits into a support term (O(nnz), the real entries) plus the
+    off-support fill-in, whose sum over rows is the 1-D background B(s_j) = sum_i
+    f(offset_i + s_j) at the per-feature scalar shift s_j = -c_j b_j -- the SAME
+    `_background` primitive the profiled kernel uses, amortized by the Chebyshev
+    surrogate (O(n*D + D*p)). On a dense (full-grid) op the off-support set is empty
+    and the correction cancels, so this reduces to `glm_ser` on the centered design.
+
+    Returns (mu, var, feature_log_bf, coefficient_kl), the log-BF relative to the b=0
+    fit at `offset` (a feature-independent baseline that cancels in alpha). See
+    `glm_center_ser_nodes` for the raw quadrature nodes the self-normalized offset
+    fold consumes."""
+    return _glm_center_ser_impl(
+        op, aux, offset, center, prior_variance, response, order, n_iter, tol,
+        background, degree,
+    )[:4]
+
+
+@partial(
+    jax.jit,
+    static_argnames=("response", "order", "n_iter", "background", "degree"),
+)
+def glm_center_ser_nodes(
+    op: DesignOperator,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Bernoulli(),
+    order: int = 15,
+    n_iter: int = 50,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 40,
+):
+    """`glm_center_ser` plus the raw quadrature representation of the centered
+    per-feature posterior: `(mu, var, feature_log_bf, coefficient_kl, b_nodes,
+    log_node_weight)`, the last two each (order, p). `softmax(log_node_weight)` over all
+    (node, feature) is the SER's joint posterior over (node, feature) -- the `(b_nodes,
+    logW)` contract the sparse-CENTERED self-normalized offset fold
+    (`Compress.build_aux_selfnorm_sequential_sparse_centered`) consumes."""
+    return _glm_center_ser_impl(
+        op, aux, offset, center, prior_variance, response, order, n_iter, tol,
+        background, degree,
+    )

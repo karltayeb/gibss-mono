@@ -18,14 +18,18 @@ family, Gaussian q without a smoothing scheme).
 from __future__ import annotations
 
 from . import glm
+from .cf_offset import CharFnOffset
 from .engine import fit_ibss, fit_ibss_greedy
 from .linear import is_bcoo
 from .response import (
     GH,
     Bernoulli,
+    Compress,
+    CompressSelfNorm,
     Gaussian,
     JJEnvelope,
     JJFixed,
+    MixtureGH,
     Poisson,
     ResponseModel,
     Smoothed,
@@ -45,10 +49,21 @@ _FAMILIES = {
 # smoother constructors, keyed by public name; each receives the resolved config
 _SMOOTHERS = {
     "gh": lambda cfg: GH(order=cfg["offset_quadrature_points"]),
+    "compress": lambda cfg: Compress(
+        inner=MixtureGH(order=cfg["offset_quadrature_points"]),
+        M=cfg["compress_degree"],
+    ),
+    # self-normalized offset: fold each other effect (and the intercept) against its TRUE
+    # non-Gaussian quadrature posterior -> the IBSS fixed point is the exact CAVI posterior.
+    "compress_selfnorm": lambda cfg: CompressSelfNorm(M=cfg["compress_degree"]),
     "taylor2": lambda cfg: Taylor(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
+    # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).
+    # "compress" (above) doubles as the Q2 peel builder (gaussian) and the Q1 fold
+    # (unconstrained); _resolve routes on variational_family.
+    "cf": lambda cfg: CharFnOffset(M=cfg["compress_degree"]),
 }
 
 _DEFAULTS = {
@@ -58,6 +73,7 @@ _DEFAULTS = {
     "offset_integration": "none",  # "none" | key of _SMOOTHERS
     "offset_quadrature_points": 15,
     "effect_quadrature_points": 15,
+    "compress_degree": 48,  # Chebyshev degree M for the compress/cf offset tables
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
@@ -72,6 +88,8 @@ PRESETS = {
     "linear": {"family": "gaussian"},
     "smoothed": {"offset_integration": "gh"},
     "localjj": {"variational_family": "gaussian", "offset_integration": "jj"},
+    "cf_cavi": {"variational_family": "gaussian", "offset_integration": "cf"},
+    "compress_cavi": {"variational_family": "gaussian", "offset_integration": "compress"},
     "globaljj": {"offset_integration": "jj_fixed"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
@@ -126,11 +144,46 @@ def _resolve(cfg):
         elif integ == "jj" and vfam == "gaussian" and cfg["intercept"] == "shared":
             # conjugate classic localjj; Smoother.validate rejects non-Bernoulli
             return Smoothed(base, JJFixed()), "jj"
+        elif integ == "cf":
+            # CAVI in Q2 ONLY: the characteristic-function offset needs Gaussian effect
+            # posteriors (free-form Q1 has no closed-form CF). The offset is integrated
+            # over the OTHER effects' Gaussian mixture and b by GH -> the vi_gh kernel.
+            if vfam != "gaussian":
+                raise ValueError(
+                    "offset_integration='cf' (CAVI in Q2) needs variational_family="
+                    "'gaussian'; free-form Q1 posteriors have no closed-form "
+                    "characteristic function -- use 'compress' or 'compress_selfnorm'."
+                )
+            return Smoothed(base, CharFnOffset(M=cfg["compress_degree"])), "vi_gh"
+        elif integ == "compress":
+            # CAVI in Q2 (gaussian): the Compress peel as the offset-integrated-cumulant
+            # builder, interchangeable with "cf" behind the same table seam; GH over b.
+            if vfam == "gaussian":
+                return Smoothed(base, _SMOOTHERS["compress"](cfg)), "vi_gh"
+            # unconstrained: the old moment-projected Q1 path is REMOVED -- free-form
+            # effects with a Gaussian-moment offset is dominated by 'compress_selfnorm'
+            # (exact free-form Q1, same fold cost -- it reuses the quad nodes 'compress'
+            # would compute and discard) and by 'compress'/'cf' + gaussian (exact Q2).
+            raise ValueError(
+                "offset_integration='compress' + variational_family='unconstrained' is "
+                "not supported (it was a moment-projected Q1 approximation). Use "
+                "offset_integration='compress_selfnorm' for EXACT free-form CAVI in Q1, "
+                "or variational_family='gaussian' for CAVI in Q2."
+            )
         else:
             response = Smoothed(base, _SMOOTHERS[integ](cfg))
 
     if getattr(response, "quadratic", False):
         return response, "linear"
+    if isinstance(getattr(response, "smoother", None), Compress) and vfam != "unconstrained":
+        # reachable only for compress_selfnorm + gaussian (compress + gaussian returned
+        # vi_gh above). The self-normalized fold IS the free-form Q1 offset; there is no
+        # Gaussian-q meaning for it.
+        raise ValueError(
+            "offset_integration='compress_selfnorm' (exact free-form CAVI in Q1) needs "
+            "variational_family='unconstrained' (the 'quad' kernel). For a Gaussian q "
+            "(CAVI in Q2) use offset_integration='compress' or 'cf'."
+        )
     if vfam == "unconstrained":
         return response, "quad"
     if not isinstance(response, Smoothed):
@@ -216,26 +269,48 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
-    # Pre-centering support depends on layout AND kernel: dense X is centered eagerly
-    # (every kernel), but on sparse (BCOO) X only quad (via glm_center_ser's row
-    # background) and linear (row-wise exact through a CenteredOperator) consume it; the
-    # vi/jj kernels' per-entry variance/tilt would drop the off-support fill-in.
-    # center=None -> on wherever supported (so the default centers everything it can
-    # without crashing a method sweep); an EXPLICIT center=True on an unsupported
-    # sparse + vi/jj combo is a clear error, not a fit.
-    center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear")
-    if center is None:
-        center = center_supported
-    elif center and not center_supported:
-        raise ValueError(
-            f"center=True is not supported for the resolved kernel={kernel!r} on a "
-            f"sparse (BCOO) design (only 'quad' and 'linear' consume sparse "
-            f"pre-centering; the vi/jj kernels' per-entry variance/tilt would drop the "
-            f"off-support fill-in). For the SAME intercept-decoupling benefit on sparse, "
-            f"use intercept='profiled' (a per-feature intercept, invariant to column "
-            f"shifts -- so centering is unnecessary). Otherwise pass center=False, or "
-            f"densify X."
-        )
+    # Pre-centering support depends on kernel AND builder. Centering orthogonalizes the
+    # intercept from the effects, so the mean-field factorization q(b0) prod q(b_l) -- whose
+    # premise IS posterior independence -- becomes accurate; always desirable where the fold
+    # can consume it.
+    #   vi_gh (Q2): dense -> both builders read the eagerly-centered X. Sparse -> the
+    #     Compress peel has a centered fold (the -c_j off-support background split); the CF
+    #     fold densifies under centering (off-support entries stop clumping) -> rejected.
+    #   compress_selfnorm (Q1, quad): dense + sparse (its self-normalized centered fold).
+    #   quad / linear (classic): dense eager; sparse via glm_center_ser / CenteredOperator.
+    #   vi / jj: dense only (their per-entry variance/tilt drops the sparse off-support fill).
+    # Default (center=None) is uncentered on sparse (layout-consistent), centered where free
+    # on dense; an EXPLICIT center=True on an unsupported combo is an error, not a fallback.
+    smoother = getattr(response, "smoother", None)
+    if kernel == "vi_gh":
+        if center and is_bcoo(X) and isinstance(smoother, CharFnOffset):
+            # Sparse centering: the Compress peel has a centered fold (self-normalized
+            # -c_j background) + a centered effect kernel (glm_vi_gh_center_ser). The CF
+            # closed-form product densifies under centering, so cf can't participate.
+            raise ValueError(
+                "offset_integration='cf' cannot pre-center a sparse (BCOO) design (the "
+                "characteristic-function fold densifies under centering); use "
+                "offset_integration='compress', center=False, or densify X."
+            )
+        if center is None:
+            center = False  # default uncentered (layout-consistent); center=True honored
+    elif isinstance(smoother, Compress):  # compress_selfnorm (quad): dense + sparse center
+        if center is None:
+            center = False
+    else:
+        center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear")
+        if center is None:
+            center = center_supported
+        elif center and not center_supported:
+            raise ValueError(
+                f"center=True is not supported for the resolved kernel={kernel!r} on a "
+                f"sparse (BCOO) design (only 'quad' and 'linear' consume sparse "
+                f"pre-centering; the vi/jj kernels' per-entry variance/tilt would drop "
+                f"the off-support fill-in). For the SAME intercept-decoupling benefit on "
+                f"sparse, use intercept='profiled' (a per-feature intercept, invariant to "
+                f"column shifts -- so centering is unnecessary). Otherwise pass "
+                f"center=False, or densify X."
+            )
 
     data = glm.prep_data(X, y, center=center)
     init = (
