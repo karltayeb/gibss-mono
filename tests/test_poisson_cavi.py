@@ -355,6 +355,40 @@ def test_poisson_elbo_is_analytic_order_M_invariant(which):
 
 
 @pytest.mark.slow
+def test_poisson_elbo_integrates_point_intercept_q1():
+    """A plug-in gIBSS Q1 state carries a POINT (shared) intercept -- no free-form nodes,
+    but a real Gaussian q(b0)=N(m0,v0). compute_elbo must INTEGRATE that spread, not plug in
+    the mean: dropping the 0.5*v0 Jensen term is an O(1)-in-n error (v0 ~ 1/sum A'', sum A''
+    ~ n). Pinned by equivalence to an independent GH-node integration of N(m0,v0) -- the
+    analytic 0.5*v0 term must match folding b0's Gaussian as raw nodes."""
+    from dataclasses import replace
+
+    from gibss._numerics import _gh_rule
+    from gibss.elbo import compute_elbo
+    from gibss.linear import prep_data
+
+    rng = np.random.default_rng(1)
+    X, y = _poisson_data(rng, n=300, p=12, idx=[3], val=[1.2], b0=0.4)
+    data = prep_data(X, y, center=False)
+    gibss = fit_glm_susie(X, y, L=2, family="poisson", estimate_prior_variance=False,
+                          prior_variance=1.0, max_iter=500, tol=1e-11)
+    fs = gibss.family_state
+    assert fs.intercept == "shared" and fs.intercept_b_nodes is None and fs.intercept_var > 0
+
+    # independent reference: give q(b0)=N(m0,v0) GH nodes so the node path integrates it
+    xg, lwg = _gh_rule(31)
+    b0n = float(fs.intercept_value) + np.sqrt(2.0 * float(fs.intercept_var)) * np.asarray(xg)
+    gref = replace(gibss, family_state=replace(
+        fs, intercept_b_nodes=jnp.asarray(b0n), intercept_log_node_weight=jnp.asarray(lwg)))
+
+    e_gibss = float(compute_elbo(data, gibss))
+    assert abs(e_gibss - float(compute_elbo(data, gref))) < 1e-9      # b0 spread integrated
+    # the Jensen term is real, not a no-op: plugging b0 in (v0 -> 0) STRICTLY raises the ELL
+    plug = replace(gibss, family_state=replace(fs, intercept_var=0.0))
+    assert float(compute_elbo(data, plug)) > e_gibss + 1e-6
+
+
+@pytest.mark.slow
 @pytest.mark.parametrize("which", ["q2", "q1"])
 def test_poisson_elbo_sparse_matches_dense(which):
     """The analytic ELBO on a sparse (BCOO) fit equals the dense-materialized fit's."""

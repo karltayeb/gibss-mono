@@ -133,6 +133,13 @@ def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var):
             logk = log_kappa_q1_sparse(X, node_effects, n, intercept=icpt)
         else:
             logk = log_kappa_q1_dense(X, node_effects, n, intercept=icpt)
+        # A SHARED intercept fit as a POINT (plug-in gIBSS: no free-form nodes) still has a
+        # Gaussian q(b0) = N(m0, v0); integrate its spread (the 0.5 v0 zero-mean log-MGF)
+        # rather than plug in the mean. Dropping it loses an O(1)-in-n Jensen term
+        # (v0 ~ 1/sum A'', sum A'' ~ n, so 0.5 v0 sum A'' stays order 1) while intercept_kl
+        # is still charged -- the same fix the Q2 path gets for free via offset_var.
+        if integrate_b0 and fs.intercept_b_nodes is None:
+            logk = logk + 0.5 * jnp.asarray(intercept_var)
     else:
         # Gaussian Q2: the intercept's N(0, v0) spread folds via offset_var (0 if plugged in).
         if is_bcoo(X):
