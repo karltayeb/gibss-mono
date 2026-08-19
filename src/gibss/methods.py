@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from . import glm
 from .cf_offset import CharFnOffset
-from .poisson_offset import PoissonLogNormalOffset
+from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .engine import fit_ibss, fit_ibss_greedy
 from .linear import is_bcoo
 from .response import (
@@ -184,14 +184,32 @@ def _resolve(cfg):
                 "offset_integration='compress_selfnorm' for EXACT free-form CAVI in Q1, "
                 "or variational_family='gaussian' for CAVI in Q2."
             )
+        elif integ == "compress_selfnorm":
+            # EXACT free-form CAVI in Q1: fold each OTHER effect (and the intercept) against
+            # its TRUE non-Gaussian quadrature posterior. Like the "cf" seam above, the
+            # builder is family-specific: the Poisson (log-link) base has an ANALYTIC
+            # node-weighted offset cumulant e^{eta+logkappa} (PoissonSelfNormOffset) -- exact
+            # and cheaper, and it cures the Chebyshev-on-exp width cliff that makes the
+            # compressed fold oscillate on the Poisson base; the general base uses the
+            # compressed self-normalized fold (CompressSelfNorm).
+            offset = (
+                PoissonSelfNormOffset()
+                if isinstance(base, Poisson)
+                else _SMOOTHERS["compress_selfnorm"](cfg)
+            )
+            response = Smoothed(base, offset)
         else:
             response = Smoothed(base, _SMOOTHERS[integ](cfg))
 
     if getattr(response, "quadratic", False):
         return response, "linear"
-    if isinstance(getattr(response, "smoother", None), Compress) and vfam != "unconstrained":
+    if (
+        isinstance(getattr(response, "smoother", None), (Compress, PoissonSelfNormOffset))
+        and vfam != "unconstrained"
+    ):
         # reachable only for compress_selfnorm + gaussian (compress + gaussian returned
-        # vi_gh above). The self-normalized fold IS the free-form Q1 offset; there is no
+        # vi_gh above; the Poisson base uses the analytic PoissonSelfNormOffset, still a Q1
+        # quad fold). The self-normalized fold IS the free-form Q1 offset; there is no
         # Gaussian-q meaning for it.
         raise ValueError(
             "offset_integration='compress_selfnorm' (exact free-form CAVI in Q1) needs "
@@ -323,6 +341,21 @@ def fit_glm_susie(
             )
         if center is None:
             center = False  # default uncentered (layout-consistent); center=True honored
+    elif isinstance(smoother, PoissonSelfNormOffset):
+        # analytic Q1 Poisson fold (quad): DENSE pre-centering only. The sparse (BCOO)
+        # node-MGF fold uses the zero-clumping identity (an off-support entry contributes a
+        # constant), which breaks under centering (the entry becomes -c_j b) -- the same
+        # densification as the CF/MGF Q2 folds. Dense centering is transparent (X is
+        # centered eagerly and every fold reads the same X).
+        if center and is_bcoo(X):
+            raise ValueError(
+                "offset_integration='compress_selfnorm' with a Poisson base cannot "
+                "pre-center a sparse (BCOO) design (the analytic node-MGF fold's "
+                "zero-clumping breaks under centering). Use center=False, "
+                "intercept='profiled' (shift-invariant), or densify X."
+            )
+        if center is None:
+            center = False
     elif isinstance(smoother, Compress):  # compress_selfnorm (quad): dense + sparse center
         if center is None:
             center = False

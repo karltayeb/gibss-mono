@@ -33,7 +33,7 @@ from .engine import (
 )
 from ._numerics import _gh_rule
 from .cf_offset import CharFnOffset
-from .poisson_offset import PoissonLogNormalOffset
+from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .linear import (  # noqa: F401 (prep_data re-export)
     is_bcoo,
     prep_data,
@@ -693,7 +693,10 @@ def _cavi_mode(fs):
         smoother = fs.response.smoother if isinstance(fs.response, Smoothed) else None
         exact = (CharFnOffset, Compress, PoissonLogNormalOffset)
         return "q2" if isinstance(smoother, exact) else "q2_plugin"
-    if isinstance(getattr(fs.response, "smoother", None), CompressSelfNorm):
+    if isinstance(
+        getattr(fs.response, "smoother", None),
+        (CompressSelfNorm, PoissonSelfNormOffset),
+    ):
         return "q1"
     return "plugin"
 
@@ -775,7 +778,7 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
     for e in others:
         if e.b_nodes is None and math.isfinite(float(e.kl)):
             raise ValueError(
-                "CompressSelfNorm offset fold requires per-feature quad nodes on every "
+                "the self-normalized offset fold requires per-feature quad nodes on every "
                 "fitted effect, but a fitted effect (finite kl) has b_nodes=None. This "
                 "kernel/intercept combination does not expose quadrature nodes; the fold "
                 "would silently use a zero offset. Use kernel='quad'."
@@ -788,6 +791,32 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
         and fs.intercept_b_nodes is not None
         and float(fs.intercept_var) > 0.0
     )
+
+    if isinstance(comp, PoissonSelfNormOffset):
+        # Analytic Poisson fold: (y, logkappa) via the closed-form node-weighted MGF -- no
+        # Chebyshev table. `logkappa` centers each node law internally (mean lives in eta),
+        # so the RAW intercept nodes ride as the `intercept=` term (not the centered `bc`).
+        node_effects = [
+            (jnp.asarray(e.b_nodes).T, jnp.asarray(e.log_node_weight).T) for e in others
+        ]
+        icpt = (
+            (jnp.asarray(fs.intercept_b_nodes), jnp.asarray(fs.intercept_log_node_weight))
+            if have_icpt
+            else None
+        )
+        if is_bcoo(data.X):
+            if getattr(data, "column_center", None) is not None:
+                raise NotImplementedError(
+                    "PoissonSelfNormOffset (analytic Q1 Poisson fold) does not support "
+                    "sparse (BCOO) implicit pre-centering: the node-MGF zero-clumping "
+                    "identity assumes an off-support entry contributes a constant, but "
+                    "under centering it becomes (-c_j) b. Pass center=False, use "
+                    "intercept='profiled' (shift-invariant), or the general "
+                    "CompressSelfNorm fold."
+                )
+            return comp.build_aux_sparse(base, y, data.X, node_effects, intercept=icpt)
+        return comp.build_aux(base, y, jnp.asarray(data.X), node_effects, intercept=icpt)
+
     if have_icpt:
         bc = jnp.asarray(fs.intercept_b_nodes) - float(fs.intercept_value)  # centered (order,)
         lw0 = jnp.asarray(fs.intercept_log_node_weight)

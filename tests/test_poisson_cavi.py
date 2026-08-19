@@ -29,8 +29,13 @@ import pytest
 from jax.experimental import sparse as jsp
 
 from gibss.methods import fit_glm_susie
-from gibss.poisson_offset import PoissonLogNormalOffset, log_kappa_dense, log_kappa_sparse
-from gibss.response import Bernoulli, Poisson, Smoothed
+from gibss.poisson_offset import (
+    PoissonLogNormalOffset,
+    PoissonSelfNormOffset,
+    log_kappa_dense,
+    log_kappa_sparse,
+)
+from gibss.response import Bernoulli, CompressSelfNorm, Poisson, Smoothed
 
 
 def _poisson_data(rng, n, p, idx, val, b0=0.2):
@@ -234,6 +239,65 @@ def test_q1_compress_selfnorm_poisson_recovers():
         offset_integration="compress_selfnorm", max_iter=80,
     )
     assert _tops(st, 2) == [7, 25]
+    # Poisson base routes the Q1 self-normalized fold to the analytic node-MGF smoother.
+    assert isinstance(st.family_state.response.smoother, PoissonSelfNormOffset)
+
+
+@pytest.mark.slow
+def test_q1_poisson_analytic_agrees_with_chebyshev_selfnorm():
+    """The analytic node-MGF fold (PoissonSelfNormOffset) and the generic Chebyshev
+    self-normalized fold (CompressSelfNorm, forced on the Poisson base) target the SAME exact
+    free-form Q1 fixed point. On an easy problem (small accumulated offset variance, where the
+    Chebyshev residual is still accurate) the per-feature evidence agrees within the peel's
+    truncation error -- the analytic fold is a drop-in for the compressed one, minus the
+    width cliff."""
+    rng = np.random.default_rng(6)
+    X, y = _poisson_data(rng, n=400, p=25, idx=[4, 15], val=[0.9, -0.8])
+    kw = dict(L=2, variational_family="unconstrained", max_iter=60,
+              estimate_prior_variance=False, prior_variance=1.0)
+    g_analytic = fit_glm_susie(
+        X, y, family="poisson", offset_integration="compress_selfnorm", **kw
+    )
+    # passing a pre-built Smoothed response bypasses the Poisson special-case routing,
+    # forcing the OLD Chebyshev self-normalized fold on the Poisson base as the reference.
+    g_cheb = fit_glm_susie(X, y, family=Smoothed(Poisson(), CompressSelfNorm(M=48)), **kw)
+
+    assert isinstance(g_analytic.family_state.response.smoother, PoissonSelfNormOffset)
+    assert isinstance(g_cheb.family_state.response.smoother, CompressSelfNorm)
+    flm_a = np.array([e.feature_log_marginal for e in g_analytic.single_effects])
+    flm_c = np.array([e.feature_log_marginal for e in g_cheb.single_effects])
+    assert np.max(np.abs(flm_a - flm_c)) < 0.2
+    assert _tops(g_analytic, 2) == _tops(g_cheb, 2) == [4, 15]
+
+
+@pytest.mark.slow
+def test_q1_poisson_analytic_elbo_is_monotone():
+    """The payoff: the analytic Q1 Poisson CAVI sweep has a MONOTONE non-decreasing ELBO.
+    The Chebyshev self-normalized fold destabilizes here -- for A=exp the residual grows
+    exponentially while the fold's interval only widens as sqrt(V), so the sequential L=5
+    peel crosses the width cliff and the ELBO oscillates. The closed-form node MGF has no
+    such basis mismatch, so each sweep is a genuine coordinate ascent."""
+    from gibss.elbo import compute_elbo
+    from gibss.linear import prep_data
+
+    rng = np.random.default_rng(0)
+    n, p, L = 300, 60, 5
+    X = rng.standard_normal((n, p))
+    beta = np.zeros(p)
+    causal = rng.choice(p, L, replace=False)
+    beta[causal] = rng.standard_normal(L) * 1.2
+    y = rng.poisson(np.exp(X @ beta - 0.5)).astype(float)
+    data = prep_data(X, y, center=False)
+
+    prev = -np.inf
+    for it in range(1, 11):
+        st = fit_glm_susie(
+            X, y, L=L, family="poisson", offset_integration="compress_selfnorm",
+            max_iter=it, tol=0.0,  # exactly `it` sweeps
+        )
+        el = float(compute_elbo(data, st))
+        assert el >= prev - 1e-6, f"ELBO decreased at sweep {it}: {el} < {prev}"
+        prev = el
 
 
 # ------------------------------------------------------------------ front doors + routing
@@ -435,3 +499,65 @@ def test_cf_poisson_sparse_centering_rejected():
     Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
     with pytest.raises(ValueError, match="Poisson MGF"):
         fit_glm_susie(Xb, y, method="cf_cavi", family="poisson", center=True)
+
+
+def test_poisson_selfnorm_offset_rejects_non_poisson():
+    with pytest.raises(TypeError, match="Poisson"):
+        PoissonSelfNormOffset().validate(Bernoulli())
+    # Smoothed validates the (base, smoother) pairing at construction.
+    Smoothed(Poisson(), PoissonSelfNormOffset())
+    with pytest.raises(TypeError, match="Poisson"):
+        Smoothed(Bernoulli(), PoissonSelfNormOffset())
+
+
+def test_compress_selfnorm_poisson_routes_to_q1():
+    """The analytic Poisson self-normalized smoother is treated as a free-form CAVI-in-Q1
+    response (`_cavi_mode == 'q1'`), so the effect/intercept updates build the node-MGF fold
+    aux. Routing regression guard, parallel to `test_cf_cavi_poisson_routes_to_q2_not_plugin`."""
+    from gibss.glm import GLMFamilyState, _cavi_mode
+
+    fs = GLMFamilyState(
+        response=Smoothed(Poisson(), PoissonSelfNormOffset()), kernel="quad",
+    )
+    assert _cavi_mode(fs) == "q1"
+
+
+def test_q1_poisson_intercept_mean_not_double_counted():
+    """Correctness invariant for the analytic fold: the intercept mean carried in eta
+    (`intercept_value`) must equal the node-weighted mean the fold removes internally
+    (`_log_node_mgf_intercept` centers by `sum W_m b0_m`). If these diverged the intercept
+    mean would be double-counted against the predictor. Cheap L=1 fit, exact equality."""
+    from scipy.special import softmax
+
+    rng = np.random.default_rng(3)
+    X, y = _poisson_data(rng, n=300, p=12, idx=[4], val=[1.0], b0=0.6)
+    st = fit_glm_susie(X, y, L=1, family="poisson",
+                       offset_integration="compress_selfnorm", max_iter=40)
+    fs = st.family_state
+    b0 = np.asarray(fs.intercept_b_nodes)
+    W0 = softmax(np.asarray(fs.intercept_log_node_weight))
+    assert abs(float(fs.intercept_value) - float(np.sum(W0 * b0))) < 1e-9
+
+
+def test_compress_selfnorm_poisson_needs_unconstrained_vfam():
+    """The self-normalized fold IS the free-form Q1 offset; a Gaussian q has no meaning for
+    it. The Poisson analytic smoother is gated the same way as the generic CompressSelfNorm."""
+    rng = np.random.default_rng(0)
+    X, y = _poisson_data(rng, n=60, p=5, idx=[1], val=[0.8])
+    with pytest.raises(ValueError, match="variational_family"):
+        fit_glm_susie(X, y, family="poisson", offset_integration="compress_selfnorm",
+                      variational_family="gaussian")
+
+
+def test_compress_selfnorm_poisson_sparse_centering_rejected():
+    """The analytic node-MGF fold uses the sparse zero-clumping identity, which breaks under
+    implicit pre-centering (an off-support entry becomes -c_j b, not a constant); an explicit
+    center=True on a BCOO design is an error, not a silent uncentered fallback."""
+    rng = np.random.default_rng(0)
+    Xd = rng.standard_normal((60, 5))
+    Xd[np.abs(Xd) < 0.3] = 0.0
+    y = rng.poisson(np.exp(0.2 + Xd[:, 1])).astype(float)
+    Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
+    with pytest.raises(ValueError, match="pre-center|zero-clumping"):
+        fit_glm_susie(Xb, y, family="poisson",
+                      offset_integration="compress_selfnorm", center=True)

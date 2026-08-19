@@ -67,6 +67,7 @@ __all__ = [
     "log_kappa_q1_dense",
     "log_kappa_q1_sparse",
     "PoissonLogNormalOffset",
+    "PoissonSelfNormOffset",
 ]
 
 
@@ -241,6 +242,74 @@ class PoissonLogNormalOffset(Smoother):
         """Exact Poisson terms with the offset folded into the rate: `Atilde = e^{eta +
         logkappa}`, all derivatives equal. `eta`, `y`, `logkappa` broadcast elementwise
         (the kernels open the GH-node axis on every leaf)."""
+        y, logk = aux
+        e = jnp.exp(jnp.asarray(eta) + jnp.asarray(logk))
+        y = jnp.asarray(y)
+        return y * eta - e, y - e, e
+
+
+@dataclass(frozen=True)
+class PoissonSelfNormOffset(Smoother):
+    r"""Exact free-form (Q1 / CAVI) offset-integrated cumulant for the Poisson base.
+
+    `Atilde(eta) = E_o[e^{eta + o}] = e^{eta + logkappa}` in closed form, with `logkappa`
+    the per-row zero-mean offset log-MGF built from the OTHER effects' TRUE, non-Gaussian
+    free-form posteriors -- each effect's raw quadrature node law `(b_nodes, logW)` -- plus
+    the shared free-form intercept's node law. The Q1 analogue of `PoissonLogNormalOffset`:
+    that class folds Gaussian-MIXTURE effect laws (CAVI in Q2); this one folds the raw
+    NODE law by the exact finite-sum MGF `sum_{c,m} W_cm e^{x_ic b_cm}` (CAVI in Q1). Both
+    are the same identity `Atilde = e^{eta} E[e^{o}]`, differing only in how `E[e^{o}]` is
+    formed -- and `logkappa` is already assembled by `log_kappa_q1_{dense,sparse}` (the
+    analytic-ELBO builders).
+
+    A drop-in for `CompressSelfNorm` behind the `quad` kernel's `terms` seam, but with NO
+    Chebyshev residual and NO offset quadrature. That is the whole point: `CompressSelfNorm`
+    fits the residual `R(z) = A(z + obar) - Atilde(z)` with a fixed-degree Chebyshev series
+    on an interval of halfwidth `~ T + kappa sqrt(V)`. For `A = exp` the exact residual
+    `R(z) = e^{z+obar}(e^{V/2} - 1)` grows EXPONENTIALLY while the interval only widens as
+    `sqrt(V)`, so a fixed-degree polynomial hits a hard width cliff and the Q1 Poisson CAVI
+    sweep oscillates (ELBO decreases) once the sequential fold accumulates enough offset
+    variance. The closed-form MGF has no such basis mismatch -- exact (`Ahat == Atilde`, so
+    the smoothed loglik is a true ELBO) and convex (weight `e^{.} > 0`). Requires x64.
+
+    `aux = (y, logkappa)`, both per-row `(n,)`: `logkappa` is row-only (the OTHER effects
+    are shared across the candidate features of the effect being updated), so the `quad`
+    kernel broadcasts it over the feature/node axes exactly like `y`. Sparse (BCOO) uses the
+    zero-clumping identity; it does NOT support implicit pre-centering (an off-support entry
+    stops contributing a constant under the `-c_j b` shift) -- the caller gates that.
+    """
+
+    def validate(self, base):
+        if not isinstance(base, Poisson):
+            raise TypeError(
+                "PoissonSelfNormOffset is the analytic free-form (Q1) Poisson (log-link) "
+                f"offset cumulant; it needs a Poisson base, got {type(base).__name__}. For "
+                "a general base use CompressSelfNorm; for Gaussian-q CAVI in Q2 use "
+                "PoissonLogNormalOffset."
+            )
+
+    def build_aux(self, base, y, X, effects, intercept=None):
+        """Dense build: `effects = [(b_nodes, logW)]` each `(C, Q)` -- the OTHER effects'
+        free-form node laws over the shared design `X`; `intercept` an optional
+        `(b0_nodes, logW0)` node law. Returns `aux = (y, logkappa)`; the offset mean lives
+        in eta (the node MGF is zero-mean)."""
+        self.validate(base)
+        y = jnp.asarray(y)
+        return y, log_kappa_q1_dense(X, effects, y.shape[0], intercept=intercept)
+
+    def build_aux_sparse(self, base, y, X, effects, intercept=None, entry_chunk=1 << 16):
+        """Sparse (BCOO) build via the zero-clumping identity (`log_kappa_q1_sparse`). Same
+        `aux = (y, logkappa)` contract. `X` shared, `effects = [(b_nodes, logW)]`."""
+        self.validate(base)
+        y = jnp.asarray(y)
+        return y, log_kappa_q1_sparse(
+            X, effects, y.shape[0], intercept=intercept, entry_chunk=entry_chunk
+        )
+
+    def terms(self, base: ResponseModel, eta, aux):
+        """Exact Poisson terms with the offset folded into the rate: `Atilde = e^{eta +
+        logkappa}`, all derivatives equal. Identical to `PoissonLogNormalOffset.terms`;
+        only the `logkappa` builder (node MGF vs Gaussian-mixture MGF) differs."""
         y, logk = aux
         e = jnp.exp(jnp.asarray(eta) + jnp.asarray(logk))
         y = jnp.asarray(y)
