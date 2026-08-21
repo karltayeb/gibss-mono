@@ -14,11 +14,44 @@ import numpy as np
 try:
     import matplotlib.pyplot as plt
     from matplotlib.axes import Axes
+    from matplotlib.legend_handler import HandlerBase
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Wedge
 except ImportError as e:  # pragma: no cover - exercised only without matplotlib
     raise ImportError(
         "gibss.plotting requires matplotlib. Install it with "
         "`pip install matplotlib` (or the 'plot' extra: `pip install gibss-mono[plot]`)."
     ) from e
+
+
+class _TwoColorCircle:
+    """Legend proxy: a circle split left/right into two colors, used to flag
+    that two credible sets overlap (share at least one variable)."""
+
+    def __init__(self, left_color, right_color):
+        self.left_color = left_color
+        self.right_color = right_color
+
+
+class _TwoColorHandler(HandlerBase):
+    """Renders a :class:`_TwoColorCircle` as two half-disc wedges."""
+
+    def create_artists(
+        self, legend, orig_handle, xdescent, ydescent, width, height, fontsize, trans
+    ):
+        cx, cy = width / 2 - xdescent, height / 2 - ydescent
+        r = height / 2
+        left = Wedge(
+            (cx, cy), r, 90, 270,
+            facecolor=orig_handle.left_color, edgecolor="white", linewidth=0.5,
+            transform=trans,
+        )
+        right = Wedge(
+            (cx, cy), r, -90, 90,
+            facecolor=orig_handle.right_color, edgecolor="white", linewidth=0.5,
+            transform=trans,
+        )
+        return [left, right]
 
 
 def plot_pip(
@@ -38,8 +71,11 @@ def plot_pip(
 
     Every variable is drawn as a small grey dot. Variables in a credible set are
     redrawn larger and colored by which set they belong to (one color per single
-    effect). If ``causal_idx`` is given, those variables are ringed and marked
-    with a dashed vertical line so the truth stands out against the fit.
+    effect). A variable in more than one set (duplicate or overlapping effects)
+    gets a filled core at its tightest set plus a concentric ring per additional
+    set, and each overlapping pair earns a half/half swatch in the legend. If
+    ``causal_idx`` is given, those variables are ringed and marked with a solid
+    vertical line so the truth stands out against the fit.
 
     Parameters
     ----------
@@ -107,30 +143,69 @@ def plot_pip(
     # base layer: every variable as a small grey dot
     ax.scatter(x, pip, s=15, color="0.75", zorder=1)
 
-    # credible sets: one color per single effect, drawn on top of the base layer.
-    # Draw larger sets first so tight, informative sets land on top of any
-    # diffuse (near-null) set that would otherwise overpaint them.
+    # credible sets: one color per single effect. A variable can belong to more
+    # than one set (duplicate/overlapping effects); we draw a filled core at the
+    # tightest set it belongs to and one hollow ring per additional set, so the
+    # overlap shows in place as concentric rings.
     colors = plt.get_cmap(cmap)
-    order = sorted(
-        (k for k in range(len(credible_sets)) if _keep(k)),
-        key=lambda k: len(credible_sets[k]),
-        reverse=True,
-    )
-    handles: dict[int, Any] = {}
-    for k in order:
-        idx = np.asarray(credible_sets[k], dtype=int)
-        handles[k] = ax.scatter(
-            x[idx],
-            pip[idx],
-            s=45,
-            color=colors(k % colors.N),
-            edgecolor="white",
-            linewidth=0.5,
-            zorder=3,
-            label=f"CS{k + 1} (n={len(idx)})",
+    displayed = [k for k in range(len(credible_sets)) if _keep(k)]
+
+    def _color(k: int):
+        return colors(k % colors.N)
+
+    # variable -> displayed sets containing it, ordered tightest (smallest) first
+    var_members: dict[int, list[int]] = {}
+    for k in displayed:
+        for v in credible_sets[k]:
+            var_members.setdefault(int(v), []).append(k)
+    for v in var_members:
+        var_members[v].sort(key=lambda k: len(credible_sets[k]))
+
+    CORE_S = 45.0
+    RING_STEP = 4.5  # ring spacing, in sqrt(marker-area) units
+    max_depth = max((len(ks) for ks in var_members.values()), default=0)
+    for depth in range(max_depth):
+        s = (np.sqrt(CORE_S) + depth * RING_STEP) ** 2
+        for k in displayed:
+            vs = [v for v, ks in var_members.items() if len(ks) > depth and ks[depth] == k]
+            if not vs:
+                continue
+            vs = np.asarray(vs, dtype=int)
+            if depth == 0:  # filled core at the tightest set
+                ax.scatter(
+                    x[vs], pip[vs], s=s, color=_color(k),
+                    edgecolor="white", linewidth=0.5, zorder=3,
+                )
+            else:  # hollow ring for each additional membership
+                ax.scatter(
+                    x[vs], pip[vs], s=s, facecolor="none",
+                    edgecolor=_color(k), linewidth=1.4, zorder=3,
+                )
+
+    # legend: one filled dot per displayed set (in effect order), then a
+    # half/half swatch for each pair of sets that overlap.
+    legend_handles: list[Any] = []
+    legend_labels: list[str] = []
+    for k in displayed:
+        legend_handles.append(
+            Line2D(
+                [0], [0], marker="o", linestyle="none",
+                markerfacecolor=_color(k), markeredgecolor="white", markersize=8,
+            )
         )
-    # legend entries follow effect order, not the (size-sorted) draw order
-    legend_handles = [handles[k] for k in sorted(handles)]
+        legend_labels.append(f"CS{k + 1} (n={len(credible_sets[k])})")
+
+    handler_map: dict[Any, Any] = {}
+    pairs: set[tuple[int, int]] = set()
+    for ks in var_members.values():
+        for i in range(len(ks)):
+            for j in range(i + 1, len(ks)):
+                pairs.add(tuple(sorted((ks[i], ks[j]))))
+    for a, b in sorted(pairs):
+        legend_handles.append(_TwoColorCircle(_color(a), _color(b)))
+        legend_labels.append(f"CS{a + 1} & CS{b + 1}")
+    if pairs:
+        handler_map[_TwoColorCircle] = _TwoColorHandler()
 
     # causal variables: full-height guide line + open ring, independent of CS color
     if causal_idx is not None and len(list(causal_idx)) > 0:
@@ -141,25 +216,20 @@ def plot_pip(
         # through the hollow center; the marker itself (grey/CS dot) sits above
         # this mask, so only the line is hidden, not the point.
         ax.scatter(
-            x[cidx],
-            pip[cidx],
-            s=90,
-            color=ax.get_facecolor(),
-            edgecolor="none",
-            zorder=0.5,
+            x[cidx], pip[cidx], s=90,
+            color=ax.get_facecolor(), edgecolor="none", zorder=0.5,
+        )
+        ax.scatter(
+            x[cidx], pip[cidx], s=95,
+            facecolor="none", edgecolor="black", linewidth=1.3, zorder=4,
         )
         legend_handles.append(
-            ax.scatter(
-                x[cidx],
-                pip[cidx],
-                s=95,
-                facecolor="none",
-                edgecolor="black",
-                linewidth=1.3,
-                zorder=4,
-                label="causal",
+            Line2D(
+                [0], [0], marker="o", linestyle="none",
+                markerfacecolor="none", markeredgecolor="black", markersize=9,
             )
         )
+        legend_labels.append("causal")
 
     ax.set_xlim(-0.5, p - 0.5)
     # a little headroom below 0 / above 1 so the PIP=0 and PIP=1 markers
@@ -175,7 +245,9 @@ def plot_pip(
     if show_legend and legend_handles:
         # place the legend outside the axes so it never overlaps the points
         ax.legend(
-            handles=legend_handles,
+            legend_handles,
+            legend_labels,
+            handler_map=handler_map or None,
             loc="upper left",
             bbox_to_anchor=(1.02, 1.0),
             fontsize=8,
