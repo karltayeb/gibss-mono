@@ -70,6 +70,33 @@ def test_snapshots_are_host_numpy_and_stripped(make_logistic_data):
         assert isinstance(e.alpha, np.ndarray)
 
 
+def test_snapshots_share_unchanged_effects(make_logistic_data):
+    """Only one effect changes per update, so consecutive effect snapshots must SHARE the
+    other L-1 effect objects by identity -- memory ~ distinct effect states, not
+    snapshots * L."""
+    X, y = make_logistic_data(seed=6, n=200, p=40, causal_idx=[3, 17, 25], effect_sizes=[1.5, -1.2, 1.0])
+    L = 4
+    hist = History()
+    fit_glm_susie(X, y, L=L, record=hist, max_iter=15)
+
+    eff = hist.by_phase("effect")
+    # within a sweep, exactly the updated index differs between consecutive snapshots;
+    # every other effect is the very same numpy object (aliased, not re-copied).
+    for a, b in zip(eff, eff[1:]):
+        if a.n_iter != b.n_iter:
+            continue
+        differ = [i for i in range(L) if a.state.single_effects[i] is not b.state.single_effects[i]]
+        assert differ == [b.effect_index]
+
+    # global check: far fewer distinct effect objects than a naive full-copy would store.
+    distinct = {id(r.state.single_effects[i]) for r in hist for i in range(L)}
+    naive = len(hist) * L
+    assert len(distinct) < naive / 2  # ~L-fold reduction; conservative bound
+
+    # sharing must not leave the recorder pinning a lookback after the fit finishes.
+    assert hist._prev_src is None and hist._prev_np is None
+
+
 def test_q1_snapshots_keep_nodes_and_resume(make_logistic_data):
     """A free-form (Q1) fit keeps b_nodes/log_node_weight, and a mid-fit snapshot
     resumes to the same fixed point as an uninterrupted run."""

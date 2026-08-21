@@ -424,16 +424,24 @@ def _to_numpy_leaf(x):
     return float(a) if a.ndim == 0 else a
 
 
+def effect_to_numpy(effect: Any) -> Any:
+    """Host-numpy copy of one single-effect dataclass (arrays -> np.asarray, 0-d -> float)."""
+    return replace(
+        effect, **{f: _to_numpy_leaf(getattr(effect, f)) for f in effect.__dataclass_fields__}
+    )
+
+
+def message_to_numpy(tm: Any) -> Any:
+    """Host-numpy copy of a total_message, rebuilt by its own type."""
+    return tm.__class__(*(_to_numpy_leaf(getattr(tm, f)) for f in tm.__dataclass_fields__))
+
+
 def state_to_numpy(state: GIBSSState) -> GIBSSState:
     """Move a fitted state to host numpy: numpy-ify every effect field (arrays ->
     np.asarray, 0-d -> float) and rebuild the total message by its type. Generic over
     the effect/message dataclasses -- one implementation for every family."""
-    effects = [
-        replace(e, **{f: _to_numpy_leaf(getattr(e, f)) for f in e.__dataclass_fields__})
-        for e in state.single_effects
-    ]
-    tm = state.total_message
-    tm = tm.__class__(*(_to_numpy_leaf(getattr(tm, f)) for f in tm.__dataclass_fields__))
+    effects = [effect_to_numpy(e) for e in state.single_effects]
+    tm = message_to_numpy(state.total_message)
     return replace(state, single_effects=effects, total_message=tm)
 
 
