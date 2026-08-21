@@ -27,7 +27,10 @@ def plot_pip(
     coverage: float = 0.95,
     causal_idx: Sequence[int] | None = None,
     variable_names: Sequence[str] | None = None,
+    max_cs_size: int | None = None,
+    min_log_bf: float | None = None,
     ax: Axes | None = None,
+    figsize: tuple[float, float] = (5.5, 3.5),
     cmap: str = "tab10",
     show_legend: bool = True,
 ) -> Axes:
@@ -49,8 +52,17 @@ def plot_pip(
         Optional variable indices to highlight as the ground-truth causal set.
     variable_names
         Optional per-variable labels for the x-ticks (length ``P``).
+    max_cs_size
+        If set, credible sets containing more than this many variables are not
+        drawn -- a simple way to hide diffuse, near-null sets.
+    min_log_bf
+        If set, only credible sets whose single effect has a SER log Bayes
+        factor of at least this value are drawn. Requires ``state.ser_log_bf``
+        (present on :class:`gibss.engine.GIBSSState`).
     ax
         Axes to draw into. A new figure/axes is created when ``None``.
+    figsize
+        Size of the created figure (ignored when ``ax`` is supplied).
     cmap
         Named qualitative colormap used to color the credible sets.
     show_legend
@@ -69,8 +81,28 @@ def plot_pip(
 
     credible_sets = state.get_credible_sets(coverage=coverage)
 
+    # per-effect SER log Bayes factor, only needed when filtering on it
+    log_bf = None
+    if min_log_bf is not None:
+        try:
+            log_bf = np.asarray(state.ser_log_bf, dtype=float)
+        except AttributeError as e:
+            raise AttributeError(
+                "min_log_bf filtering requires state.ser_log_bf (per-effect SER "
+                "log Bayes factor); this state does not expose it."
+            ) from e
+
+    def _keep(k: int) -> bool:
+        if len(credible_sets[k]) == 0:
+            return False
+        if max_cs_size is not None and len(credible_sets[k]) > max_cs_size:
+            return False
+        if log_bf is not None and log_bf[k] < min_log_bf:
+            return False
+        return True
+
     if ax is None:
-        _, ax = plt.subplots(figsize=(8, 3.5))
+        _, ax = plt.subplots(figsize=figsize)
 
     # base layer: every variable as a small grey dot
     ax.scatter(x, pip, s=15, color="0.75", zorder=1)
@@ -80,7 +112,7 @@ def plot_pip(
     # diffuse (near-null) set that would otherwise overpaint them.
     colors = plt.get_cmap(cmap)
     order = sorted(
-        (k for k, cs in enumerate(credible_sets) if len(cs) > 0),
+        (k for k in range(len(credible_sets)) if _keep(k)),
         key=lambda k: len(credible_sets[k]),
         reverse=True,
     )
@@ -119,7 +151,9 @@ def plot_pip(
         )
 
     ax.set_xlim(-0.5, p - 0.5)
-    ax.set_ylim(-0.02, 1.02)
+    # a little headroom below 0 / above 1 so the PIP=0 and PIP=1 markers
+    # (and the causal ring around them) are not clipped by the axes
+    ax.set_ylim(-0.06, 1.06)
     ax.set_xlabel("variable")
     ax.set_ylabel("PIP")
 
@@ -128,7 +162,15 @@ def plot_pip(
         ax.set_xticklabels(list(variable_names), rotation=90, fontsize=7)
 
     if show_legend and legend_handles:
-        ax.legend(handles=legend_handles, loc="upper right", fontsize=8, frameon=False)
+        # place the legend outside the axes so it never overlaps the points
+        ax.legend(
+            handles=legend_handles,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            fontsize=8,
+            frameon=False,
+            borderaxespad=0.0,
+        )
 
     # plain style: drop the top/right spines
     ax.spines["top"].set_visible(False)
