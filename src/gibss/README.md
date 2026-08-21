@@ -277,13 +277,19 @@ Schedules are plain dataclasses. You can extend them with helpers like `add_step
 
 ```python
 from gibss.legacy import localjj
-from gibss.engine import add_step, snapshot_state_step
+from gibss.engine import add_step, identity_step
 
 schedule = add_step(
     localjj.default_schedule(),
-    before_sweep=(snapshot_state_step, 0),
+    before_sweep=(identity_step, 0),
 )
 ```
+
+Convergence is not a `before/after_sweep` step -- it needs the previous sweep's state,
+which the engine holds as a loop local (never stored on the returned state) and passes to
+the `Schedule.check_convergence` callable `(data, prev_state, state) -> state`. Set it to
+one of `check_alpha_skl_convergence_step` / `check_skl_convergence_step`, or `None` to run
+to `max_iter`.
 
 You can also remove a step if you understand the consequence:
 

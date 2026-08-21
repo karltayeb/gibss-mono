@@ -6,7 +6,6 @@ Contract under test:
   - snapshots are FULL, host-numpy, resumable states -- Q1 free-form fits keep their
     `b_nodes`/`log_node_weight`, and a snapshot can be handed back as `init_state` to
     continue the fit;
-  - the transient `previous_state` convergence chain is stripped (bloat, not history);
   - granularity controls what phases are kept.
 """
 
@@ -63,8 +62,8 @@ def test_snapshots_are_host_numpy_and_stripped(make_logistic_data):
     fit_glm_susie(X, y, L=2, record=hist, max_iter=10)
     for r in hist:
         assert isinstance(r, Snapshot)
-        # previous_state (convergence transient) is dropped as bloat
-        assert r.state.previous_state is None
+        # convergence tracking lives in the engine loop, never on the recorded state
+        assert not hasattr(r.state, "previous_state")
         # every effect field is host numpy, not a device array
         e = r.state.single_effects[0]
         assert type(np.asarray(e.mu)).__module__ == "numpy"

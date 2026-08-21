@@ -10,6 +10,12 @@ import jax.numpy as jnp
 
 Step = Callable[[Any, Any], Any]
 IndexStep = Callable[[Any, int, Any], Any]
+# Convergence is the one hook that needs the PREVIOUS sweep's state, so it has its own
+# signature `(data, prev_state, state) -> state`. The engine holds `prev_state` as a loop
+# local and passes it in -- it is NEVER stored on the returned state (convergence is a
+# property of the iteration, not the model). Return `state` with `converged` set (and any
+# per-family diagnostic, e.g. an appended skl_history) when the stopping rule is met.
+ConvergenceCheck = Callable[[Any, Any, Any], Any]
 
 
 def _resolve_active_effects(L: int, active_effects: Any) -> list[int] | range:
@@ -145,6 +151,11 @@ def fit_ibss_greedy(
 
 
 def _execute_sweep(data, state, schedule, recorder=None):
+    # `prev_state` is the full state entering the sweep, held as a loop local ONLY for the
+    # convergence lookback -- it is never written back onto the returned state (that used to
+    # be `previous_state`, a heavy full-state copy living on the model). The convergence
+    # check reads whatever it needs from it (alpha/mu/var, family_state.intercept, ...).
+    prev_state = state
     state = _apply_steps(schedule.before_sweep, data, state)
 
     for l in state.update_order:
@@ -156,6 +167,8 @@ def _execute_sweep(data, state, schedule, recorder=None):
 
     state = _apply_steps(schedule.after_sweep, data, state)
     state = replace(state, n_iter=state.n_iter + 1)
+    if schedule.check_convergence is not None:
+        state = schedule.check_convergence(data, prev_state, state)
     if recorder is not None:
         recorder.observe("sweep", None, data, state)
     return state
@@ -191,6 +204,10 @@ class Schedule:
     effect_update: tuple[IndexStep, ...] = (identity_index_step,)
     after_effect_update: tuple[Step, ...] = (identity_step,)
     after_sweep: tuple[Step, ...] = (identity_step,)
+    # convergence check: run once per sweep with (data, prev_state, state); None = never
+    # converge (fit runs to max_iter). Unlike the tuple hooks it is a single callable with
+    # the three-arg signature above -- the engine owns the prev_state lookback.
+    check_convergence: ConvergenceCheck | None = None
     after_fit: tuple[Step, ...] = (identity_step,)
 
     def __repr__(self) -> str:
@@ -199,17 +216,23 @@ class Schedule:
 
 def format_schedule(schedule: Schedule) -> str:
     """Pretty print the schedule steps."""
+    def _step_name(step: Any) -> str:
+        name = getattr(step, "__name__", str(step))
+        if "partial" in str(type(step)):
+            name = f"partial({getattr(step.func, '__name__', str(step.func))})"
+        return name
+
     lines = ["Schedule:"]
     for field_name in schedule.__dataclass_fields__:
         steps = getattr(schedule, field_name)
         lines.append(f"  {field_name}:")
+        if not isinstance(steps, tuple):  # check_convergence: a single callable or None
+            lines.append(f"    {_step_name(steps) if steps is not None else '(none)'}")
+            continue
         if not steps:
             lines.append("    (empty)")
         for i, step in enumerate(steps):
-            name = getattr(step, "__name__", str(step))
-            if "partial" in str(type(step)):
-                name = f"partial({getattr(step.func, '__name__', str(step.func))})"
-            lines.append(f"    [{i}] {name}")
+            lines.append(f"    [{i}] {_step_name(step)}")
     return "\n".join(lines)
 
 
@@ -355,7 +378,6 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
     total_message: T_Message
     family_state: T_FamilyState
     converged: bool = False
-    previous_state: GIBSSState | None = None
     update_order: tuple[int, ...] = ()
     n_iter: int = 0
 
@@ -426,12 +448,6 @@ def replace_effect_in_gibss_state(state, l, new_effect):
     return replace(state, single_effects=single_effects)
 
 
-def snapshot_state_step(data: Any, state: GIBSSState) -> GIBSSState:
-    """Saves current state into previous_state, clearing inner snapshot."""
-    snapshot = replace(state, previous_state=None)
-    return replace(state, previous_state=snapshot)
-
-
 def gaussian_skl(mu1, v1, mu2, v2):
     """Symmetrized KL between N(mu1, v1) and N(mu2, v2)."""
     eps = 1e-15
@@ -468,12 +484,12 @@ def compute_alpha_skl(state: GIBSSState, old_state: GIBSSState) -> float:
     return float(total_skl)
 
 
-def check_skl_convergence_step(data: Any, state: GIBSSState) -> GIBSSState:
-    """Step for after_sweep: Compute full distributional SKL and mark convergence."""
-    if state.previous_state is None:
-        return state
-
-    skl = compute_total_skl(state, state.previous_state)
+def check_skl_convergence_step(
+    data: Any, prev_state: GIBSSState, state: GIBSSState
+) -> GIBSSState:
+    """check_convergence: full distributional SKL between the sweep's start and end."""
+    del data
+    skl = compute_total_skl(state, prev_state)
 
     if hasattr(state.family_state, "skl_history"):
         new_fs = replace(
@@ -487,12 +503,12 @@ def check_skl_convergence_step(data: Any, state: GIBSSState) -> GIBSSState:
     return state
 
 
-def check_alpha_skl_convergence_step(data: Any, state: GIBSSState) -> GIBSSState:
-    """Step for after_sweep: Compute SKL on alpha and mark convergence."""
-    if state.previous_state is None:
-        return state
-
-    skl = compute_alpha_skl(state, state.previous_state)
+def check_alpha_skl_convergence_step(
+    data: Any, prev_state: GIBSSState, state: GIBSSState
+) -> GIBSSState:
+    """check_convergence: categorical SKL on alpha between the sweep's start and end."""
+    del data
+    skl = compute_alpha_skl(state, prev_state)
 
     if hasattr(state.family_state, "skl_history"):
         new_fs = replace(

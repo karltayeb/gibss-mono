@@ -72,7 +72,6 @@ from .engine import (
     fit_ibss,
     fit_ibss_greedy,
     replace_effect_in_gibss_state,
-    snapshot_state_step,
     subtract_message_index_step,
     to_numpy_state_step,
 )
@@ -434,7 +433,6 @@ def default_schedule() -> Schedule:
     # the module docstring): the effects structure eta, which pins the intercept
     # to its interior value; the mixture M-step then sees the fresh b0.
     return Schedule(
-        before_sweep=(snapshot_state_step,),
         effect_update=(
             subtract_message_index_step,
             update_effect_index_step,
@@ -444,7 +442,7 @@ def default_schedule() -> Schedule:
         after_sweep=(
             update_intercept_step,
             update_mixture_step,
-            check_alpha_skl_convergence_step,
         ),
+        check_convergence=check_alpha_skl_convergence_step,
         after_fit=(to_numpy_state_step,),
     )

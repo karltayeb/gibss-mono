@@ -36,7 +36,6 @@ from ..engine import (
     add_message_index_step,
     check_alpha_skl_convergence_step,
     replace_effect_in_gibss_state,
-    snapshot_state_step,
     subtract_message_index_step,
     to_numpy_state_step,
     state_to_numpy as to_numpy_state,
@@ -263,7 +262,6 @@ def update_effect_index_step(data, l, state):
 
 def default_schedule() -> Schedule:
     return Schedule(
-        before_sweep=(snapshot_state_step,),
         before_effect_update=(estimate_intercept_step,),  # no-op when profile=True
         effect_update=(
             subtract_message_index_step,
@@ -271,6 +269,6 @@ def default_schedule() -> Schedule:
             update_prior_variance_index_step,
             add_message_index_step,
         ),
-        after_sweep=(check_alpha_skl_convergence_step,),
+        check_convergence=check_alpha_skl_convergence_step,
         after_fit=(to_numpy_state_step,),
     )

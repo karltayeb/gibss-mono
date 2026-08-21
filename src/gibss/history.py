@@ -13,9 +13,8 @@ recorder is supplied it does nothing (zero cost -- the default).
     hist[3].state.alpha                    # full host-numpy state at step 3
     hist.elbo_trace(data)                  # exact ELBO along the whole fit
 
-Because snapshots are FULL host-numpy states (`state_to_numpy`, with only the transient
-`previous_state` convergence chain stripped as bloat), they are self-contained AND
-resumable: every single-effect field is kept, including the Q1 free-form quadrature
+Because snapshots are FULL host-numpy states (`state_to_numpy`), they are self-contained
+AND resumable: every single-effect field is kept, including the Q1 free-form quadrature
 `b_nodes` / `log_node_weight` (not just the `mu/var/alpha` summaries), so a snapshot's
 `state` can be handed straight back as `init_state` to continue fitting -- set
 `converged=False` first if it had already converged. Anything derivable from a state --
@@ -26,7 +25,7 @@ fits (e.g. CAVI vs gIBSS) at single-effect granularity is a matter of zipping th
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
@@ -54,8 +53,7 @@ class Snapshot:
     (after after_fit). `effect_index` is the effect just updated (only for "effect"
     snapshots; None otherwise). `n_iter` is the number of COMPLETED sweeps at snapshot
     time -- so effect snapshots within the first sweep carry n_iter=0, and the "sweep"
-    snapshot closing it carries n_iter=1. `state` is a full host-numpy `GIBSSState` with
-    its `previous_state` chain cleared.
+    snapshot closing it carries n_iter=1. `state` is a full host-numpy `GIBSSState`.
     """
 
     phase: str
@@ -95,9 +93,7 @@ class History:
         del data
         if phase not in _GRANULARITY_PHASES[self.granularity]:
             return
-        # strip the transient previous_state chain BEFORE numpy-ifying so snapshots stay
-        # independent and light (previous_state is a convergence transient, not history).
-        snap = state_to_numpy(replace(state, previous_state=None))
+        snap = state_to_numpy(state)
         self.records.append(Snapshot(phase, int(state.n_iter), effect_index, snap))
 
     # -- sequence views ----------------------------------------------------------------

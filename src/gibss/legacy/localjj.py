@@ -26,7 +26,6 @@ from ..engine import (
     add_message_index_step,
     replace_effect_in_gibss_state,
     subtract_message_index_step,
-    snapshot_state_step,
     check_skl_convergence_step,
     to_numpy_state_step,
 )
@@ -307,7 +306,6 @@ def default_schedule() -> Schedule:
     - compute SKL after each sweep
     """
     return Schedule(
-        before_sweep=(snapshot_state_step,),
         before_effect_update=(estimate_intercept_step,),
         effect_update=(
             subtract_message_index_step,
@@ -315,6 +313,6 @@ def default_schedule() -> Schedule:
             update_prior_variance_index_step,
             add_message_index_step,
         ),
-        after_sweep=(check_skl_convergence_step,),
+        check_convergence=check_skl_convergence_step,
         after_fit=(to_numpy_state_step,),
     )

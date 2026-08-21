@@ -38,7 +38,6 @@ from ..engine import (
     add_message_index_step,
     compute_total_skl,
     replace_effect_in_gibss_state,
-    snapshot_state_step,
     subtract_message_index_step,
     to_numpy_state_step,
 )
@@ -197,16 +196,13 @@ def _fit_centered_ser(data, tau, offset, prior_variance, cbar, W) -> IRLSCentere
     )
 
 
-def check_convergence_step(data, state):
+def check_convergence_step(data, prev, state):
     """Converge only when both the effects (SKL) and the intercept are stable.
 
     The intercept lags the effects by an outer IRLS step, so converging on the
     effects alone stops one Newton step short of the intercept MLE.
     """
     del data
-    prev = state.previous_state
-    if prev is None:
-        return state
     skl = compute_total_skl(state, prev)
     d_intercept = abs(float(state.family_state.intercept) - float(prev.family_state.intercept))
     metric = max(skl, d_intercept)
@@ -378,7 +374,6 @@ def default_schedule() -> Schedule:
         # optimal local param given (q, b0). Refresh them after EVERY change so they
         # are never stale -- before-update follows the intercept change, after-update
         # follows the effect (q) change. cbar tracks the weights (recompute adjacent).
-        before_sweep=(snapshot_state_step,),
         before_effect_update=(
             update_intercept_step,
             update_working_data_step,
@@ -394,6 +389,6 @@ def default_schedule() -> Schedule:
             update_working_data_step,
             update_centering_step,
         ),
-        after_sweep=(check_convergence_step,),
+        check_convergence=check_convergence_step,
         after_fit=(to_numpy_state_step,),
     )
