@@ -264,6 +264,7 @@ def fit_glm_susie(
     tol_L=1.0,  # L="auto": stop when an added effect's ser_log_bf < tol_L (nats)
     stride=1,  # L="auto": effects added per round (>1 brackets coarsely, still exact)
     schedule=None,  # escape hatch; defaults to glm.default_schedule()
+    record=None,  # opt-in gibss.history.History sink; captures full-state fitting history
 ):
     """Fit a GLM SuSiE. Returns the fitted `GIBSSState`.
 
@@ -281,6 +282,14 @@ def fit_glm_susie(
     offset_integration="gh". Axis arguments not consulted by the resolved
     configuration are ignored (tuning knobs), but combinations implying a wrong
     model are rejected -- see `_resolve`.
+
+    Pass `record=History()` (see `gibss.history`) to capture the full fitting history --
+    a host-numpy snapshot after every single-effect update -- without putting any of it on
+    the returned state. Read it off the History object afterwards:
+
+        hist = History()
+        state = fit_glm_susie(X, y, method="cf_cavi", record=hist)
+        hist.states  # full resumable GIBSSState at each recorded step
     """
     explicit = {
         k: v
@@ -400,5 +409,8 @@ def fit_glm_susie(
     )
     sched = schedule if schedule is not None else glm.default_schedule()
     if greedy:
-        return fit_ibss_greedy(data, state, sched, tol_L=tol_L, stride=stride, max_L=L_alloc, max_iter=max_iter)
-    return fit_ibss(data, state, sched, max_iter=max_iter)
+        return fit_ibss_greedy(
+            data, state, sched, tol_L=tol_L, stride=stride, max_L=L_alloc,
+            max_iter=max_iter, recorder=record,
+        )
+    return fit_ibss(data, state, sched, max_iter=max_iter, recorder=record)

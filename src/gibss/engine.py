@@ -40,10 +40,16 @@ def fit_ibss(
     schedule: "Schedule",
     active_effects: Any | None = None,
     max_iter: int = 50,
+    recorder: Any | None = None,
 ) -> Any:
     """
     apply schedule to init_state unit maximum iterations or convergence
     if init_state.converged == True, only after_fit is applied.
+
+    `recorder` is an optional observer (see `gibss.history.History`) notified at each
+    schedule hook via `recorder.observe(phase, effect_index, data, state)`. It is a pure
+    side sink -- the fit is byte-for-byte identical with or without it -- so fitting
+    history stays OUT of the returned model state. None (the default) records nothing.
     """
     state = init_state
 
@@ -57,13 +63,17 @@ def fit_ibss(
         state = replace(state, update_order=order)
 
     state = _apply_steps(schedule.before_fit, data, state)
+    if recorder is not None:
+        recorder.observe("init", None, data, state)
 
     for _ in range(max_iter):
         if getattr(state, "converged", False):
             break
-        state = _execute_sweep(data, state, schedule)
+        state = _execute_sweep(data, state, schedule, recorder)
 
     state = _apply_steps(schedule.after_fit, data, state)
+    if recorder is not None:
+        recorder.observe("final", None, data, state)
     return state
 
 
@@ -76,6 +86,7 @@ def fit_ibss_greedy(
     stride: int = 1,
     max_L: int | None = None,
     max_iter: int = 50,
+    recorder: Any | None = None,
 ) -> Any:
     """Greedy forward-selection of L: grow the active effect set until it stops helping.
 
@@ -108,7 +119,10 @@ def fit_ibss_greedy(
         # fresh update_order for the grown active set + clear `converged` so the
         # warm-started fit actually runs (fit_ibss only seeds update_order when empty).
         state = replace(state, update_order=(), converged=False)
-        state = fit_ibss(data, state, schedule, active_effects=range(k), max_iter=max_iter)
+        state = fit_ibss(
+            data, state, schedule, active_effects=range(k), max_iter=max_iter,
+            recorder=recorder,
+        )
         keep = [
             j for j in range(k) if float(state.single_effects[j].ser_log_bf) >= tol_L
         ]
@@ -130,16 +144,20 @@ def fit_ibss_greedy(
     )
 
 
-def _execute_sweep(data, state, schedule):
+def _execute_sweep(data, state, schedule, recorder=None):
     state = _apply_steps(schedule.before_sweep, data, state)
 
     for l in state.update_order:
         state = _apply_steps(schedule.before_effect_update, data, state)
         state = _apply_index_steps(schedule.effect_update, data, l, state)
         state = _apply_steps(schedule.after_effect_update, data, state)
+        if recorder is not None:
+            recorder.observe("effect", l, data, state)
 
     state = _apply_steps(schedule.after_sweep, data, state)
     state = replace(state, n_iter=state.n_iter + 1)
+    if recorder is not None:
+        recorder.observe("sweep", None, data, state)
     return state
 
 
