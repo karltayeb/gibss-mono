@@ -132,11 +132,22 @@ def plot_pip(
     # legend entries follow effect order, not the (size-sorted) draw order
     legend_handles = [handles[k] for k in sorted(handles)]
 
-    # causal variables: dashed guide line + open ring, independent of CS color
+    # causal variables: full-height guide line + open ring, independent of CS color
     if causal_idx is not None and len(list(causal_idx)) > 0:
         cidx = np.asarray(list(causal_idx), dtype=int)
         for xc in cidx:
-            ax.axvline(xc, color="0.6", linestyle="--", linewidth=0.8, zorder=0)
+            ax.axvline(xc, color="0.6", linestyle="-", linewidth=0.8, zorder=0)
+        # mask the guide line inside the ring's footprint so it doesn't show
+        # through the hollow center; the marker itself (grey/CS dot) sits above
+        # this mask, so only the line is hidden, not the point.
+        ax.scatter(
+            x[cidx],
+            pip[cidx],
+            s=90,
+            color=ax.get_facecolor(),
+            edgecolor="none",
+            zorder=0.5,
+        )
         legend_handles.append(
             ax.scatter(
                 x[cidx],
