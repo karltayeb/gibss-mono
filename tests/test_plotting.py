@@ -118,21 +118,27 @@ def test_min_log_bf_without_ser_log_bf_raises():
         plot_pip(state, min_log_bf=1.0)
 
 
-def test_overlapping_cs_draws_ring_and_legend_swatch():
-    # var 0 is in both sets -> filled core (CS1) + one concentric ring (CS2)
+def test_overlapping_cs_draws_wedges_and_legend_swatch():
+    # var 0 is in both sets -> two-wedge pie marker; var 1 is a full dot
     state = FakeState(pip=[0.9, 0.4], credible_sets=((0,), (0, 1)))
     ax = plot_pip(state)
-    # base + CS1 core (var0) + CS2 core (var1) + CS2 ring (var0) = 4 collections
+    # base + CS2 full dot (var1) + two wedges (var0) = 4 collections
     assert len(ax.collections) == 4
-    # a hollow ring exists: no fill (empty facecolor) but a colored edge
-    assert any(
-        coll.get_facecolor().size == 0 and coll.get_edgecolor().size > 0
-        for coll in ax.collections[1:]
-    )
+    # every marker is filled (pie approach: no hollow rings)
+    assert all(coll.get_facecolor().size > 0 for coll in ax.collections)
     # overlap flagged in the legend, separate from the CS color entries
     labels = _legend_labels(ax)
     assert "CS1 (n=1)" in labels and "CS2 (n=2)" in labels
     assert "CS1 & CS2" in labels
+
+
+def test_three_way_overlap_splits_in_thirds():
+    # var 0 shared by three sets -> three wedges + a 3-way legend swatch
+    state = FakeState(pip=[0.95, 0.1], credible_sets=((0,), (0,), (0,)))
+    ax = plot_pip(state)
+    # base + three wedges = 4 collections
+    assert len(ax.collections) == 4
+    assert "CS1 & CS2 & CS3" in _legend_labels(ax)
 
 
 def test_disjoint_cs_has_no_overlap_swatch():
