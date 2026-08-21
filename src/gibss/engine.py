@@ -456,6 +456,67 @@ def replace_effect_in_gibss_state(state, l, new_effect):
     return replace(state, single_effects=single_effects)
 
 
+def warm_start_effects(cold_state, initial_state, data, *, fixed_prior_variance=None):
+    """Seed a freshly-initialized ``cold_state`` with the variational posterior q
+    of a previously (partially) fit ``initial_state``, for a warm-started refit.
+
+    Only q is carried across -- each seeded effect's ``mu``/``var``/``alpha`` (and
+    its raw quadrature nodes, which the first sweep recomputes anyway). Everything
+    that defines the model and the fit -- ``family_state``, kernel, intercept, L,
+    the prepped ``data`` -- stays as ``cold_state`` built it from the call, so the
+    caller's options always win over whatever ``initial_state`` was fit with.
+
+    The effects are seeded strongest-first (by ``ser_log_bf``) into ``cold_state``'s
+    L slots: if the call asks for fewer effects than ``initial_state`` has, the
+    weakest are dropped; if more, the extra slots stay empty (cold). ``total_message``
+    is rebuilt from the seeded effects against ``data`` (empty effects contribute a
+    zero message, so summing the seeds is exact), and ``converged``/``n_iter`` are
+    reset so the warm-started fit actually runs.
+
+    ``fixed_prior_variance`` (set when ``estimate_prior_variance=False``) overrides
+    every seeded effect's prior variance with the call's value -- a fixed prior is a
+    binding model choice, not a starting point. When estimating (the default), the
+    seeded prior variance is kept as the starting point and re-estimated in sweep 1.
+    """
+    seeds = list(initial_state.single_effects)
+    if not seeds:
+        return cold_state
+
+    cold_effects = list(cold_state.single_effects)
+    L_alloc = len(cold_effects)
+    p = len(np.asarray(cold_effects[0].alpha))
+    for e in seeds:
+        q = len(np.asarray(e.alpha))
+        if q != p:
+            raise ValueError(
+                f"initial_state has {q} features per effect but the design has {p}; "
+                "warm start needs the same feature set (same X columns)."
+            )
+
+    # strongest effects first, capped at the number of slots the call allocated
+    order = sorted(
+        range(len(seeds)), key=lambda j: float(seeds[j].ser_log_bf), reverse=True
+    )[:L_alloc]
+    seeded = []
+    for j in order:
+        e = effect_to_numpy(seeds[j])
+        if fixed_prior_variance is not None:
+            e = replace(e, prior_variance=float(fixed_prior_variance))
+        seeded.append(e)
+
+    new_effects = seeded + cold_effects[len(seeded):]
+    tm = cold_state.total_message  # zero at cold init; the right Message subtype
+    for e in seeded:
+        tm = tm.add(e.message(data))
+    return replace(
+        cold_state,
+        single_effects=new_effects,
+        total_message=tm,
+        converged=False,
+        n_iter=0,
+    )
+
+
 def gaussian_skl(mu1, v1, mu2, v2):
     """Symmetrized KL between N(mu1, v1) and N(mu2, v2)."""
     eps = 1e-15

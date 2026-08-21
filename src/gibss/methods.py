@@ -20,7 +20,7 @@ from __future__ import annotations
 from . import glm
 from .cf_offset import CharFnOffset
 from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
-from .engine import fit_ibss, fit_ibss_greedy
+from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
 from .response import (
     GH,
@@ -265,6 +265,7 @@ def fit_glm_susie(
     stride=1,  # L="auto": effects added per round (>1 brackets coarsely, still exact)
     schedule=None,  # escape hatch; defaults to glm.default_schedule()
     record=None,  # opt-in gibss.history.History sink; captures full-state fitting history
+    initial_state=None,  # warm start: seed q from a prior fit; call options still win
 ):
     """Fit a GLM SuSiE. Returns the fitted `GIBSSState`.
 
@@ -290,6 +291,19 @@ def fit_glm_susie(
         hist = History()
         state = fit_glm_susie(X, y, method="cf_cavi", record=hist)
         hist.states  # full resumable GIBSSState at each recorded step
+
+    Pass `initial_state=<a prior GIBSSState>` to WARM START: the fit resumes from
+    that state's per-effect posterior q (its `mu`/`var`/`alpha`), while EVERY other
+    option -- family, kernel, intercept, L, prior settings, centering -- comes from
+    THIS call and wins over whatever `initial_state` was fit with. This resumes a
+    partial fit (more iterations), or refines a cheap fit with a better kernel:
+
+        warm = fit_glm_susie(X, y, method="localjj", max_iter=5)
+        state = fit_glm_susie(X, y, method="cf_cavi", initial_state=warm)
+
+    Effects are seeded strongest-first into the L slots this call allocates (extra
+    effects grow cold, surplus ones are dropped). The design must have the same
+    features (X columns) as `initial_state` was fit on.
     """
     explicit = {
         k: v
@@ -407,6 +421,18 @@ def fit_glm_susie(
             skl_tolerance=tol,
         ),
     )
+    if initial_state is not None:
+        if greedy:
+            raise ValueError(
+                "initial_state (warm start) is not supported with L='auto' (greedy "
+                "forward-selection decides L itself, so a seeded q would fight the "
+                "search). Pass an explicit integer L to warm start."
+            )
+        state = warm_start_effects(
+            state, initial_state, data,
+            fixed_prior_variance=None if estimate_prior_variance else prior_variance,
+        )
+
     sched = schedule if schedule is not None else glm.default_schedule()
     if greedy:
         return fit_ibss_greedy(
