@@ -338,8 +338,9 @@ def fit_glm_susie(
     # premise IS posterior independence -- becomes accurate; always desirable where the fold
     # can consume it.
     #   vi_gh (Q2): dense -> both builders read the eagerly-centered X. Sparse -> the
-    #     Compress peel has a centered fold (the -c_j off-support background split); the CF
-    #     fold densifies under centering (off-support entries stop clumping) -> rejected.
+    #     Compress peel has a centered fold (the -c_j off-support background split), and the
+    #     CF fold recovers the same split closed-form (baseline G_l(t) + support jump), so
+    #     both consume sparse centering. The Poisson MGF fold still densifies -> rejected.
     #   compress_selfnorm (Q1, quad): dense + sparse (its self-normalized centered fold).
     #   quad / linear (classic): dense eager; sparse via glm_center_ser / CenteredOperator.
     #   vi / jj: dense only (their per-entry variance/tilt drops the sparse off-support fill).
@@ -347,20 +348,17 @@ def fit_glm_susie(
     # on dense; an EXPLICIT center=True on an unsupported combo is an error, not a fallback.
     smoother = getattr(response, "smoother", None)
     if kernel == "vi_gh":
-        if center and is_bcoo(X) and isinstance(
-            smoother, (CharFnOffset, PoissonLogNormalOffset)
-        ):
-            # Sparse centering: the Compress peel has a centered fold (self-normalized
-            # -c_j background) + a centered effect kernel (glm_vi_gh_center_ser). Both the
-            # CF product and the Poisson MGF are CLOSED-FORM folds that exploit the exact
-            # zeros of the design (off-support entries contribute a neutral factor); under
-            # centering an off-support entry becomes -c_j (a per-feature background), so
-            # the zero-clumping breaks and the fold densifies. Neither can pre-center.
+        if center and is_bcoo(X) and isinstance(smoother, PoissonLogNormalOffset):
+            # The Poisson MGF fold is a CLOSED-FORM fold that exploits the exact zeros of
+            # the design (an off-support entry contributes a neutral MGF factor); under
+            # centering an off-support entry becomes -c_j (a per-feature background), so the
+            # zero-clumping breaks and the fold densifies. (The Bernoulli CF fold instead
+            # recovers the split closed-form via `colmean` -- baseline G_l(t) + support jump
+            # -- so it DOES pre-center sparse; only the Poisson MGF cannot.)
             raise ValueError(
-                f"offset_integration='cf' cannot pre-center a sparse (BCOO) design (the "
-                f"{'characteristic-function' if isinstance(smoother, CharFnOffset) else 'Poisson MGF'} "
-                "fold densifies under centering); use offset_integration='compress', "
-                "center=False, or densify X."
+                "offset_integration='cf' with a Poisson base cannot pre-center a sparse "
+                "(BCOO) design (the Poisson MGF fold densifies under centering); use "
+                "center=False, intercept='profiled' (shift-invariant), or densify X."
             )
         if center is None:
             center = False  # default uncentered (layout-consistent); center=True honored

@@ -209,6 +209,51 @@ def test_sparse_build_matches_dense(L):
     assert np.max(np.abs(np.asarray(d2) - np.asarray(s2))) < 1e-10
 
 
+@pytest.mark.parametrize("L", [2, 4])
+def test_sparse_centered_build_matches_dense(L):
+    """CENTERED sparse build (baseline+support split) equals the dense build on the
+    eagerly-centered design, to machine precision -- i.e. sparse centering does NOT
+    densify. Dense reads `X - colmean`; sparse reads the uncentered BCOO + `colmean`."""
+    from jax.experimental import sparse
+
+    from gibss.cf_offset import offset_cf_sparse, smoothed_nodes_sparse
+
+    rng = np.random.default_rng(400 + L)
+    n, C = 30, 8
+    Xd = (rng.random((n, C)) < 0.35) * rng.standard_normal((n, C))
+    Xd = jnp.asarray(Xd)
+    colmean = Xd.mean(axis=0)
+    Xc = Xd - colmean[None, :]  # eagerly-centered dense design
+    Xs = sparse.BCOO.fromdense(Xd)  # uncentered sparse; centering applied inside
+    dense_eff, sparse_eff = [], []
+    for _ in range(L):
+        a = np.exp(rng.standard_normal(C))
+        a /= a.sum()
+        mu = rng.standard_normal(C)
+        var = 0.3 * np.exp(rng.standard_normal(C) * 0.3)
+        dense_eff.append((Xc, jnp.asarray(a), jnp.asarray(mu), jnp.asarray(var)))
+        sparse_eff.append((jnp.asarray(a), jnp.asarray(mu), jnp.asarray(var)))
+
+    # raw CF: centered sparse product == dense product on the centered design
+    tau = jnp.linspace(0.0, 6.0, 256)
+    pd, s_d, V_d = offset_cf(dense_eff, tau, n=n, offset_var=0.3)
+    ps, s_s, V_s = offset_cf_sparse(Xs, sparse_eff, tau, n=n, offset_var=0.3,
+                                    colmean=colmean)
+    assert np.max(np.abs(np.asarray(pd) - np.asarray(ps))) < 1e-9
+    assert np.allclose(np.asarray(pd[:, 0]), 1.0)  # phi(0) = 1 preserved under centering
+
+    # full Atilde table
+    zd, d0, d1, d2, hwd, sd, Vd = smoothed_nodes(dense_eff, M=48)
+    zs, t0, t1, t2, hws, ss, Vs = smoothed_nodes_sparse(Xs, sparse_eff, M=48,
+                                                        colmean=colmean)
+    assert np.allclose(np.asarray(hwd), np.asarray(hws))
+    assert np.allclose(np.asarray(sd), np.asarray(ss))
+    assert np.allclose(np.asarray(Vd), np.asarray(Vs))
+    assert np.max(np.abs(np.asarray(d0) - np.asarray(t0))) < 1e-9
+    assert np.max(np.abs(np.asarray(d1) - np.asarray(t1))) < 1e-9
+    assert np.max(np.abs(np.asarray(d2) - np.asarray(t2))) < 1e-9
+
+
 def test_empty_offset_is_base_cumulant():
     """No other effects -> Atilde = A exactly (the offset is a point mass at 0)."""
     n = 5

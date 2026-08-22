@@ -337,7 +337,12 @@ def _build_offset_table(data, state, effects, offset_var):
     # CharFnOffset: obar=0 already; the intercept variance folds via offset_var.
     if is_bcoo(X):
         eff = [(e.alpha, e.mu, e.var) for e in effects]
-        return smoother.build_aux_sparse(base, y, X, eff, offset_var=offset_var)
+        # centered sparse design: the off-support fill is -c_j (not 0), so the offset CF
+        # uses the baseline+support split (colmean) instead of zero-clumping -- no densify.
+        cbar = getattr(data, "column_center", None)
+        return smoother.build_aux_sparse(
+            base, y, X, eff, offset_var=offset_var, colmean=cbar
+        )
     eff = [(X, e.alpha, e.mu, e.var) for e in effects]
     return smoother.build_aux(base, y, eff, offset_var=offset_var)
 

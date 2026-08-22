@@ -362,15 +362,28 @@ def build_aux(base, y, effects, M=48, **kwargs):
 # --------------------------------------------------------------------------------------
 
 
-def _sparse_effect_moments(op, alpha, mu, var):
+def _sparse_effect_moments(op, alpha, mu, var, colmean=None):
     """Per-row mean and (alpha-weighted mixture) variance of one effect on a sparse
-    design (O(nnz), no dense fill). `op` is the BCOOOperator."""
+    design (O(nnz), no dense fill). `op` is the BCOOOperator.
+
+    If `colmean` (p,) is given the design is treated as CENTERED (`x_ic - colmean_c`)
+    without ever materializing the fill: the column-mean corrections are closed-form
+    (a matvec plus row-independent scalars), since `E[(x - c)^k]` expands into the
+    uncentered moments `op.matvec / op.matvec_sq` plus terms in `c`."""
+    m2 = mu**2 + var
     mean = op.matvec(alpha * mu)  # sum_c x_ic alpha_c mu_c
-    second = op.matvec_sq(alpha * (mu**2 + var))
+    second = op.matvec_sq(alpha * m2)
+    if colmean is not None:
+        c = colmean
+        mean = mean - jnp.dot(alpha * mu, c)
+        second = second - 2.0 * op.matvec(alpha * c * m2) + jnp.dot(alpha * c * c, m2)
     return mean, jnp.maximum(second - mean**2, 0.0)
 
 
-def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15, offset_var=0.0):
+def offset_cf_sparse(
+    X, effects, tau, n=None, entry_chunk=1 << 15, offset_var=0.0,
+    colmean=None, feat_chunk=1 << 13,
+):
     """Zero-mean offset CF on a sparse (BCOO) design via the zero-clumping identity
 
         phi_l,i(t) = 1 + sum_{c in supp(i)} alpha_lc (exp(i t x_ic mu_lc
@@ -380,33 +393,68 @@ def offset_cf_sparse(X, effects, tau, n=None, entry_chunk=1 << 15, offset_var=0.
     alpha_lc, so only the nnz support entries carry t-dependence. The support sum is a
     per-row `segment_sum` over the BCOO entries, chunked (`entry_chunk`) to bound peak
     memory at `O(entry_chunk * ntau)`. `effects` is a list of `(alpha, mu, var)` (each
-    (p,)); X is shared. Returns `(phi, s, V)` -- `phi` (n, ntau) centered."""
+    (p,)); X is shared. Returns `(phi, s, V)` -- `phi` (n, ntau) centered.
+
+    Centering (`colmean` (p,) given): the off-support value is no longer 0 but `-c_j`,
+    so the "1 +" collapse fails. Split the centered value into a row-independent baseline
+    (-c_j) plus an on-support jump and the factor recovers WITHOUT densifying:
+
+        phi_l,i(t) = G_l(t) + sum_{c in supp(i)} alpha_lc (h_ic(t) - g_c(t)),
+        G_l(t) = sum_c alpha_lc g_c(t),   g_c(t) = exp(-i t c_j mu_c - 1/2 t^2 c_j^2 var_c),
+        h_ic(t) = exp(i t (x_ic - c_j) mu_c - 1/2 t^2 (x_ic - c_j)^2 var_c).
+
+    `G_l` is a single row-independent length-ntau reduction over all p features (chunked by
+    `feat_chunk`, done once per effect); the support correction stays `O(nnz*ntau)`. The
+    uncentered branch is the special case `c = 0` (`g_c = G_l = 1`), left byte-for-byte
+    intact as the hot path. `phi(0) = 1` is preserved either way, so the psi-tamed residual
+    quadrature is unchanged."""
     tau = jnp.asarray(tau)
     ntau = tau.shape[0]
     op = BCOOOperator(X)
     idx = X.indices
     rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
     n = X.shape[0] if n is None else n
+    p = X.shape[1]
     nnz = vals.shape[0]
+    c_arr = None if colmean is None else jnp.asarray(colmean)
 
     s = jnp.zeros(n)
     V = jnp.zeros(n)
     phi = jnp.ones((n, ntau), dtype=jnp.complex128)
     for alpha, mu, var in effects:
         alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
-        mean, v = _sparse_effect_moments(op, alpha, mu, var)
+        mean, v = _sparse_effect_moments(op, alpha, mu, var, c_arr)
         s = s + mean
         V = V + v
+        # baseline G_l(t): 1 in the uncentered case; sum_c alpha_c g_c(t) when centered.
+        if c_arr is None:
+            G = 1.0
+        else:
+            G = jnp.zeros(ntau, dtype=jnp.complex128)
+            for j0 in range(0, p, feat_chunk):
+                j1 = min(j0 + feat_chunk, p)
+                uc = c_arr[j0:j1, None] * tau[None, :]  # (fchunk, ntau)
+                gc = jnp.exp(-1j * uc * mu[j0:j1, None] - 0.5 * uc**2 * var[j0:j1, None])
+                G = G + (alpha[j0:j1, None] * gc).sum(axis=0)
+            G = G[None, :]
         acc = jnp.zeros((n, ntau), dtype=jnp.complex128)
         for k0 in range(0, nnz, entry_chunk):
             k1 = min(k0 + entry_chunk, nnz)
             r, c, x = rows[k0:k1], cols[k0:k1], vals[k0:k1]
-            u = x[:, None] * tau[None, :]  # (chunk, ntau)
-            g = alpha[c][:, None] * (
-                jnp.exp(1j * u * mu[c][:, None] - 0.5 * u**2 * var[c][:, None]) - 1.0
-            )
+            if c_arr is None:
+                u = x[:, None] * tau[None, :]  # (chunk, ntau)
+                g = alpha[c][:, None] * (
+                    jnp.exp(1j * u * mu[c][:, None] - 0.5 * u**2 * var[c][:, None]) - 1.0
+                )
+            else:
+                xc = x - c_arr[c]  # centered support value x_ic - c_j
+                uh = xc[:, None] * tau[None, :]
+                h = jnp.exp(1j * uh * mu[c][:, None] - 0.5 * uh**2 * var[c][:, None])
+                ug = c_arr[c][:, None] * tau[None, :]
+                g_on = jnp.exp(-1j * ug * mu[c][:, None] - 0.5 * ug**2 * var[c][:, None])
+                g = alpha[c][:, None] * (h - g_on)
             acc = acc + segment_sum(g, r, num_segments=n)
-        phi = phi * (1.0 + acc)
+        phi = phi * (G + acc)
     ov = jnp.asarray(offset_var)
     V = V + ov  # extra zero-mean Gaussian offset component (e.g. intercept variance)
     phi = phi * jnp.exp(-0.5 * (ov[..., None] if ov.ndim else ov) * tau[None, :] ** 2)
@@ -430,10 +478,13 @@ def smoothed_nodes_sparse(
     max_ntau=1 << 15,
     entry_chunk=1 << 15,
     offset_var=0.0,
+    colmean=None,
 ):
     """Sparse (BCOO) analogue of `smoothed_nodes`: `effects` is a list of `(alpha, mu,
     var)` over the shared design `X`. Returns `(znodes, At0, At1, At2, hw, s, V)`.
-    `offset_var` folds one extra homogeneous zero-mean Gaussian (e.g. intercept var)."""
+    `offset_var` folds one extra homogeneous zero-mean Gaussian (e.g. intercept var).
+    `colmean` (p,), if given, treats `X` as centered (`x_ic - colmean_c`) via the
+    baseline+support split in `offset_cf_sparse` -- no densification."""
     if not isinstance(base, Bernoulli):
         raise TypeError(
             "cf_offset sparse path supports only the Bernoulli (logistic) base; "
@@ -441,15 +492,17 @@ def smoothed_nodes_sparse(
         )
     n = X.shape[0]
     op = BCOOOperator(X)
+    c_arr = None if colmean is None else jnp.asarray(colmean)
     V0 = jnp.zeros(n) + jnp.asarray(offset_var)
     for alpha, mu, var in effects:  # variance only, to size the grid
         V0 = V0 + _sparse_effect_moments(
-            op, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
+            op, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var), c_arr
         )[1]
     Tmax, ntau, hw = _grid_size(V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
     tau, wq, psi = _frequency_grid(Tmax, ntau)
     phi, s, V = offset_cf_sparse(
-        X, effects, tau, n=n, entry_chunk=entry_chunk, offset_var=offset_var
+        X, effects, tau, n=n, entry_chunk=entry_chunk, offset_var=offset_var,
+        colmean=colmean,
     )
     return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
 
@@ -503,13 +556,14 @@ class CharFnOffset(Smoother):
         )
 
     def build_aux_sparse(self, base, y, X, effects, ntau=None, Tmax=None,
-                         entry_chunk=1 << 15, offset_var=0.0):
+                         entry_chunk=1 << 15, offset_var=0.0, colmean=None):
         """Sparse (BCOO) build: `X` shared, `effects = [(alpha, mu, var)]`. Same aux.
-        `offset_var` folds an extra homogeneous zero-mean Gaussian (intercept var)."""
+        `offset_var` folds an extra homogeneous zero-mean Gaussian (intercept var).
+        `colmean` (p,), if given, treats `X` as centered via the baseline+support split."""
         return build_aux_sparse(
             base, y, X, effects, self.M, entry_chunk=entry_chunk, tol=self.tol,
             kappa=self.kappa, T=self.T, safety=self.safety, ntau=ntau, Tmax=Tmax,
-            offset_var=offset_var,
+            offset_var=offset_var, colmean=colmean,
         )
 
     def terms(self, base: ResponseModel, eta, aux):

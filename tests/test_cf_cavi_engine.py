@@ -217,14 +217,37 @@ def test_cf_cavi_guards():
     # cf now supports a profiled intercept (glm_vi_gh_profile_ser)
     st = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled", max_iter=5)
     assert st.family_state.kernel == "vi_gh" and st.family_state.intercept == "profiled"
-    # cf supports DENSE centering (orthogonalizes the intercept from the effects) but
-    # rejects SPARSE centering (its closed-form product densifies under centering).
+    # cf supports centering (orthogonalizes the intercept from the effects) on BOTH dense
+    # and sparse: the sparse CF fold recovers the -c_j split closed-form (baseline G_l(t)
+    # + support jump) instead of densifying, so center=True is honored, not rejected.
     fit_glm_susie(X, y, L=2, method="cf_cavi", center=True, max_iter=5)  # dense: runs
     import jax.numpy as jnp
     from jax.experimental import sparse
     Xs = sparse.BCOO.fromdense(jnp.asarray(X))
-    with pytest.raises(ValueError, match="cf"):
-        fit_glm_susie(Xs, y, L=2, method="cf_cavi", center=True, max_iter=3)
+    fit_glm_susie(Xs, y, L=2, method="cf_cavi", center=True, max_iter=5)  # sparse: runs
+
+
+@pytest.mark.slow
+def test_cf_cavi_sparse_centered_matches_dense():
+    """CENTERED sparse CF-CAVI (baseline+support split) equals the dense centered fit --
+    the split is exact, so sparse centering neither densifies nor changes the answer."""
+    import jax
+    from jax.experimental import sparse
+
+    rng = np.random.default_rng(7)
+    n, p = 300, 30
+    Xd = (rng.random((n, p)) < 0.3) * rng.standard_normal((n, p))
+    b = np.zeros(p)
+    b[[4, 19]] = [2.5, -2.2]
+    y = (rng.uniform(size=n) < _sigmoid(Xd @ b - 0.3)).astype(float)
+    Xs = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
+    st_d = fit_glm_susie(Xd, y, L=4, method="cf_cavi", max_iter=40, center=True)
+    st_s = fit_glm_susie(Xs, y, L=4, method="cf_cavi", max_iter=40, center=True)
+    assert st_d.converged and st_s.converged
+    assert np.allclose(np.asarray(st_d.pip), np.asarray(st_s.pip), atol=1e-8)
+    fm_d = np.asarray([e.feature_log_marginal for e in st_d.single_effects])
+    fm_s = np.asarray([e.feature_log_marginal for e in st_s.single_effects])
+    assert np.allclose(fm_d, fm_s, atol=1e-6)
 
 
 @pytest.mark.slow
