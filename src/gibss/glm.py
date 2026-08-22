@@ -753,6 +753,12 @@ def _effect_offset(fs, state):
     return base + state.total_message.mean
 
 
+# GH order for integrating a Gaussian POINT intercept q(b0)=N(m0, v0) in the self-normalized
+# fold (no free-form nodes of its own). 32 makes the fold match a direct N(m0, v0) integral
+# to ~1e-13 for the smooth logistic cumulant; it runs once, only when SCORING such a state.
+_B0_POINT_GH_ORDER = 32
+
+
 def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=True):
     """Self-normalized (`CompressSelfNorm`) offset aux: fold a list of effects -- and,
     when `include_intercept`, the shared intercept -- against their TRUE, non-Gaussian
@@ -784,12 +790,32 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
             )
     others = [e for e in others if e.b_nodes is not None]  # skip unfit effects
     # intercept as an additive non-Gaussian effect (zero-mean; mean is intercept_value).
+    # A shared intercept is folded whether it carries its own free-form quad nodes (Q1 CAVI)
+    # or is a Gaussian POINT q(b0)=N(m0, v0) with no nodes (a plug-in gIBSS state being
+    # scored): the point case synthesizes Gauss-Hermite nodes for N(m0, v0) below, so its
+    # spread is integrated (to GH accuracy) exactly like the free-form case and like the Q2
+    # offset_var / analytic-Poisson paths. Dropping it would lose the O(1)-in-n Jensen term
+    # (0.5 v0 sum_i A''(eta_i)) while the intercept KL is still charged -- a ~0.5-nat ELBO
+    # inflation. During fitting a shared intercept always has nodes (Q1 CAVI sets them), so
+    # the synthesized-node branch only runs when scoring a point-intercept state.
     have_icpt = (
         include_intercept
         and not isinstance(state.total_message, MeanMessage)
-        and fs.intercept_b_nodes is not None
+        and fs.intercept == "shared"
         and float(fs.intercept_var) > 0.0
     )
+    icpt_nodes = icpt_logw = None
+    if have_icpt:
+        if fs.intercept_b_nodes is not None:  # free-form q(b0): its own raw quad nodes
+            icpt_nodes = jnp.asarray(fs.intercept_b_nodes)
+            icpt_logw = jnp.asarray(fs.intercept_log_node_weight)
+        else:  # Gaussian point q(b0)=N(m0, v0): synthesize GH nodes (self-normalized fold,
+            # so the log-weight normalization constant drops out).
+            u, logw = _gh_rule(_B0_POINT_GH_ORDER)
+            icpt_nodes = float(fs.intercept_value) + math.sqrt(
+                2.0 * float(fs.intercept_var)
+            ) * jnp.asarray(u)
+            icpt_logw = jnp.asarray(logw)
 
     if isinstance(comp, PoissonSelfNormOffset):
         # Analytic Poisson fold: (y, logkappa) via the closed-form node-weighted MGF -- no
@@ -798,11 +824,7 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
         node_effects = [
             (jnp.asarray(e.b_nodes).T, jnp.asarray(e.log_node_weight).T) for e in others
         ]
-        icpt = (
-            (jnp.asarray(fs.intercept_b_nodes), jnp.asarray(fs.intercept_log_node_weight))
-            if have_icpt
-            else None
-        )
+        icpt = (icpt_nodes, icpt_logw) if have_icpt else None
         if is_bcoo(data.X):
             if getattr(data, "column_center", None) is not None:
                 raise NotImplementedError(
@@ -817,8 +839,8 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
         return comp.build_aux(base, y, jnp.asarray(data.X), node_effects, intercept=icpt)
 
     if have_icpt:
-        bc = jnp.asarray(fs.intercept_b_nodes) - float(fs.intercept_value)  # centered (order,)
-        lw0 = jnp.asarray(fs.intercept_log_node_weight)
+        bc = icpt_nodes - float(fs.intercept_value)  # centered (order,)
+        lw0 = icpt_logw
         iv = float(fs.intercept_var)
 
     if is_bcoo(data.X):

@@ -192,6 +192,44 @@ def test_q1_matches_bruteforce():
     assert bd.intercept_kl == pytest.approx(_b0_kl_gauss(st), abs=5e-3)
 
 
+def test_q1_point_intercept_matches_bruteforce():
+    # A plug-in gIBSS state is Q1-SHAPED (free-form effects) but its shared intercept is a
+    # Gaussian POINT q(b0)=N(m0, v0) with NO free-form nodes. compute_elbo's Q1 fold must
+    # still integrate b0's spread (synthesizing GH nodes for N(m0, v0)); dropping it inflates
+    # the ELL by the ~0.5-nat Jensen term while the intercept KL is still charged. The oracle
+    # enumerates the effects exactly and integrates N(m0, v0) by INDEPENDENT high-order GH.
+    X, y = _bern_data(0)
+    st = fit_glm_susie(X, y, L=2, **_fit_kw())  # default logistic = gIBSS in Q1
+    data = glm.prep_data(X, y, center=False)
+    bd = compute_elbo(data, st, return_breakdown=True)
+    assert bd.is_q1
+    fs = st.family_state
+    assert fs.intercept_b_nodes is None and float(fs.intercept_var) > 0.0  # point intercept
+    m0, v0 = _intercept(st)
+    u0, w0 = _gh(40)  # independent of the fold's own order (32)
+    b0_nodes = m0 + np.sqrt(2 * max(v0, 0.0)) * u0
+    b0_lw = np.log(w0)
+    ell = _q1_oracle_ell(X, y, b0_nodes, b0_lw, _node_effects(st), _logp_bern)
+    assert bd.expected_loglik == pytest.approx(ell, abs=1e-5)
+    assert bd.intercept_kl == pytest.approx(_b0_kl_gauss(st), abs=1e-9)
+
+
+def test_gibss_q1_does_not_beat_cavi():
+    # The invariant this guards: CAVI maximizes F, so ELBO(CAVI) >= ELBO(gIBSS) up to local
+    # optima. It broke when the Q1 fold dropped a point intercept's spread -- the plug-in
+    # gIBSS-Q1 ELBO was inflated ~0.5 nat and spuriously beat every CAVI fit. (test_family_
+    # ordering only covered the Q2 plug-in path, which folds b0 via offset_var.)
+    X, y = _bern_data(0)
+    data = glm.prep_data(X, y, center=False)
+    kw = _fit_kw(max_iter=500, tol=1e-12)
+    e_gibss_q1 = compute_elbo(data, fit_glm_susie(X, y, L=2, **kw))  # gIBSS in Q1
+    e_cavi_q1 = compute_elbo(data, fit_glm_susie(X, y, L=2, offset_integration="compress_selfnorm", **kw))
+    e_cavi_q2 = compute_elbo(data, fit_glm_susie(X, y, L=2, method="cf_cavi", **kw))
+    slack = 1e-3
+    assert e_cavi_q1 >= e_gibss_q1 - slack
+    assert e_cavi_q2 >= e_gibss_q1 - slack
+
+
 def test_l1_q2_matches_bruteforce():
     X, y = _bern_data(7, causal=(2,), vals=(2.0,))
     st = fit_glm_susie(X, y, L=1, method="cf_cavi", **_fit_kw())
