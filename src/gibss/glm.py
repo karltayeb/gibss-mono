@@ -292,7 +292,12 @@ def _build_offset_table(data, state, effects, offset_var):
         # effect-space inputs as CharFnOffset: the shared design + each effect's law.
         if is_bcoo(X):
             eff = [(e.alpha, e.mu, e.var) for e in effects]
-            return smoother.build_aux_sparse(base, y, X, eff, offset_var=offset_var)
+            # centered sparse: the off-support fill is -c_j, folded via the MGF
+            # baseline+support split (colmean) instead of zero-clumping -- no densify.
+            cbar = getattr(data, "column_center", None)
+            return smoother.build_aux_sparse(
+                base, y, X, eff, offset_var=offset_var, colmean=cbar
+            )
         eff = [(X, e.alpha, e.mu, e.var) for e in effects]
         return smoother.build_aux(base, y, eff, offset_var=offset_var)
 
@@ -831,16 +836,12 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
         ]
         icpt = (icpt_nodes, icpt_logw) if have_icpt else None
         if is_bcoo(data.X):
-            if getattr(data, "column_center", None) is not None:
-                raise NotImplementedError(
-                    "PoissonSelfNormOffset (analytic Q1 Poisson fold) does not support "
-                    "sparse (BCOO) implicit pre-centering: the node-MGF zero-clumping "
-                    "identity assumes an off-support entry contributes a constant, but "
-                    "under centering it becomes (-c_j) b. Pass center=False, use "
-                    "intercept='profiled' (shift-invariant), or the general "
-                    "CompressSelfNorm fold."
-                )
-            return comp.build_aux_sparse(base, y, data.X, node_effects, intercept=icpt)
+            # centered sparse: an off-support entry contributes the per-feature node MGF at
+            # -c_j (not a constant), folded via the baseline+support split (colmean).
+            cbar = getattr(data, "column_center", None)
+            return comp.build_aux_sparse(
+                base, y, data.X, node_effects, intercept=icpt, colmean=cbar
+            )
         return comp.build_aux(base, y, jnp.asarray(data.X), node_effects, intercept=icpt)
 
     if have_icpt:

@@ -337,44 +337,24 @@ def fit_glm_susie(
     # intercept from the effects, so the mean-field factorization q(b0) prod q(b_l) -- whose
     # premise IS posterior independence -- becomes accurate; always desirable where the fold
     # can consume it.
-    #   vi_gh (Q2): dense -> both builders read the eagerly-centered X. Sparse -> the
-    #     Compress peel has a centered fold (the -c_j off-support background split), and the
-    #     CF fold recovers the same split closed-form (baseline G_l(t) + support jump), so
-    #     both consume sparse centering. The Poisson MGF fold still densifies -> rejected.
-    #   compress_selfnorm (Q1, quad): dense + sparse (its self-normalized centered fold).
+    #   vi_gh (Q2): dense -> both builders read the eagerly-centered X. Sparse -> every Q2
+    #     fold consumes centering: the Compress peel has the -c_j off-support background
+    #     split, and the CF (Bernoulli) and MGF (Poisson) folds recover the same split
+    #     closed-form (baseline G_l + support jump), so none densify.
+    #   compress_selfnorm (Q1): dense + sparse. Bernoulli via the self-normalized centered
+    #     fold; Poisson via the node-MGF baseline+support split (log_kappa_q1_sparse).
     #   quad / linear (classic): dense eager; sparse via glm_center_ser / CenteredOperator.
     #   vi / jj: dense only (their per-entry variance/tilt drops the sparse off-support fill).
     # Default (center=None) is uncentered on sparse (layout-consistent), centered where free
     # on dense; an EXPLICIT center=True on an unsupported combo is an error, not a fallback.
     smoother = getattr(response, "smoother", None)
     if kernel == "vi_gh":
-        if center and is_bcoo(X) and isinstance(smoother, PoissonLogNormalOffset):
-            # The Poisson MGF fold is a CLOSED-FORM fold that exploits the exact zeros of
-            # the design (an off-support entry contributes a neutral MGF factor); under
-            # centering an off-support entry becomes -c_j (a per-feature background), so the
-            # zero-clumping breaks and the fold densifies. (The Bernoulli CF fold instead
-            # recovers the split closed-form via `colmean` -- baseline G_l(t) + support jump
-            # -- so it DOES pre-center sparse; only the Poisson MGF cannot.)
-            raise ValueError(
-                "offset_integration='cf' with a Poisson base cannot pre-center a sparse "
-                "(BCOO) design (the Poisson MGF fold densifies under centering); use "
-                "center=False, intercept='profiled' (shift-invariant), or densify X."
-            )
         if center is None:
             center = False  # default uncentered (layout-consistent); center=True honored
     elif isinstance(smoother, PoissonSelfNormOffset):
-        # analytic Q1 Poisson fold (quad): DENSE pre-centering only. The sparse (BCOO)
-        # node-MGF fold uses the zero-clumping identity (an off-support entry contributes a
-        # constant), which breaks under centering (the entry becomes -c_j b) -- the same
-        # densification as the CF/MGF Q2 folds. Dense centering is transparent (X is
-        # centered eagerly and every fold reads the same X).
-        if center and is_bcoo(X):
-            raise ValueError(
-                "offset_integration='compress_selfnorm' with a Poisson base cannot "
-                "pre-center a sparse (BCOO) design (the analytic node-MGF fold's "
-                "zero-clumping breaks under centering). Use center=False, "
-                "intercept='profiled' (shift-invariant), or densify X."
-            )
+        # analytic Q1 Poisson fold: the sparse (BCOO) node-MGF fold pre-centers via the
+        # baseline+support split (an off-support entry contributes the per-feature node MGF
+        # at -c_j, not a constant) -- so center=True is honored, like the Bernoulli Q1 fold.
         if center is None:
             center = False
     elif isinstance(smoother, Compress):  # compress_selfnorm (quad): dense + sparse center

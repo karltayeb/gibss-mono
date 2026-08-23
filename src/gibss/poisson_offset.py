@@ -94,7 +94,8 @@ def log_kappa_dense(effects, n, offset_var=0.0):
     return logk
 
 
-def log_kappa_sparse(X, effects, offset_var=0.0, entry_chunk=1 << 16):
+def log_kappa_sparse(X, effects, offset_var=0.0, entry_chunk=1 << 16,
+                     colmean=None, feat_chunk=1 << 13):
     """Per-row `logkappa` (n,) on a sparse (BCOO) design via the zero-clumping identity
 
         E[e^{o_li}] = 1 + sum_{c in supp(i)} alpha_lc (exp(x_ic mu_lc + 1/2 x_ic^2 var_lc) - 1)
@@ -102,25 +103,61 @@ def log_kappa_sparse(X, effects, offset_var=0.0, entry_chunk=1 << 16):
     (exact, using `sum_c alpha_lc = 1`: an off-support gene contributes the constant
     `alpha_lc`, so only the nnz entries carry `b`-dependence). The support sum is a per-row
     `segment_sum` over the BCOO entries, chunked to bound peak memory at `O(entry_chunk)`.
-    `effects` is a list of `(alpha, mu, var)` (each (p,)) over the shared design `X`."""
+    `effects` is a list of `(alpha, mu, var)` (each (p,)) over the shared design `X`.
+
+    Centering (`colmean` (p,) given): the off-support value is `-c_j` (not 0), so the
+    exp(...) is no longer 1 and the "1 +" collapse fails. Recover it EXACTLY -- the MGF
+    analogue of the CF baseline+support split -- by splitting the centered value into a
+    row-independent baseline (-c_j) plus an on-support jump:
+
+        E[e^{o_li}] = G_l + sum_{c in supp(i)} alpha_lc (h_ic - g_c),
+        G_l = sum_c alpha_lc g_c,  g_c = exp(-c_j mu_c + 1/2 c_j^2 var_c),
+        h_ic = exp((x_ic - c_j) mu_c + 1/2 (x_ic - c_j)^2 var_c).
+
+    `G_l` is one row-independent reduction over all p (chunked by `feat_chunk`, once per
+    effect); the support correction stays O(nnz). The uncentered branch (`c = 0`, `G_l = 1`)
+    is left intact as the hot path."""
     op = BCOOOperator(X)
     idx = X.indices
     rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
     n = X.shape[0]
+    p = X.shape[1]
     nnz = vals.shape[0]
+    c_arr = None if colmean is None else jnp.asarray(colmean)
 
     logk = jnp.zeros(n) + 0.5 * jnp.asarray(offset_var)
     for alpha, mu, var in effects:
         alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
-        mean = op.matvec(alpha * mu)  # (n,) = E[o_li]
+        if c_arr is None:
+            mean = op.matvec(alpha * mu)  # (n,) = E[o_li]
+            G = 1.0
+        else:
+            mean = op.matvec(alpha * mu) - jnp.dot(alpha * mu, c_arr)  # centered mean
+            G = jnp.zeros(())  # baseline sum_c alpha_c g_c over all p (chunked)
+            for j0 in range(0, p, feat_chunk):
+                j1 = min(j0 + feat_chunk, p)
+                cc = c_arr[j0:j1]
+                gc = jnp.exp(-cc * mu[j0:j1] + 0.5 * cc**2 * var[j0:j1])
+                G = G + jnp.sum(alpha[j0:j1] * gc)
         acc = jnp.zeros(n)
         for k0 in range(0, nnz, entry_chunk):
             k1 = min(k0 + entry_chunk, nnz)
             r, c, xv = rows[k0:k1], cols[k0:k1], vals[k0:k1]
-            g = alpha[c] * (jnp.exp(xv * mu[c] + 0.5 * xv**2 * var[c]) - 1.0)
+            if c_arr is None:
+                g = alpha[c] * (jnp.exp(xv * mu[c] + 0.5 * xv**2 * var[c]) - 1.0)
+            else:
+                xc = xv - c_arr[c]  # centered support value
+                h = jnp.exp(xc * mu[c] + 0.5 * xc**2 * var[c])
+                gon = jnp.exp(-c_arr[c] * mu[c] + 0.5 * c_arr[c] ** 2 * var[c])
+                g = alpha[c] * (h - gon)
             acc = acc + segment_sum(g, r, num_segments=n)
-        # log(1 + acc) = log E[e^{o_li}]; log1p keeps precision when acc is small.
-        logk = logk + (jnp.log1p(acc) - mean)
+        # log E[e^{o_li}] - mean. Uncentered: log1p(acc) keeps precision (G = 1). Centered:
+        # E = G + acc > 0 (a sum of positive MGF terms); a tiny floor guards fp cancellation.
+        if c_arr is None:
+            logE = jnp.log1p(acc)
+        else:
+            logE = jnp.log(jnp.maximum(G + acc, 1e-300))
+        logk = logk + (logE - mean)
     return logk
 
 
@@ -175,15 +212,27 @@ def log_kappa_q1_dense(X, effects, n, intercept=None):
     return logk
 
 
-def log_kappa_q1_sparse(X, effects, n, intercept=None, entry_chunk=1 << 16):
+def log_kappa_q1_sparse(X, effects, n, intercept=None, entry_chunk=1 << 16,
+                        colmean=None, feat_chunk=1 << 13):
     """Sparse (BCOO) analogue of `log_kappa_q1_dense` via the zero-clumping identity: an
     off-support feature (x_ic = 0) contributes its marginal node mass `pi_c = sum_m W_cm`,
     so `E[e^{psi}] = 1 + sum_{c in supp}(sum_m W_cm e^{x_ic b_cm} - pi_c)` (uses sum_c pi_c
-    = 1). `effects` is a list of `(b_nodes, logW)` each `(C, Q)`; `intercept` optional."""
+    = 1). `effects` is a list of `(b_nodes, logW)` each `(C, Q)`; `intercept` optional.
+
+    Centering (`colmean` (p,) given): the free-form (Q1) analogue of the Q2
+    baseline+support split. An off-support feature contributes `g_c = sum_m W_cm e^{-c_j
+    b_cm}` (its node MGF at `-c_j`), not `pi_c`, so
+
+        E[e^{psi}] = G_l + sum_{c in supp}(sum_m W_cm e^{(x_ic - c_j) b_cm} - g_c),
+        G_l = sum_c g_c   (row-independent, one reduction over all (C, Q), chunked).
+
+    Exact; the uncentered branch (`c = 0`, `g_c = pi_c`, `G_l = 1`) is left intact."""
     op = BCOOOperator(X)
     idx = X.indices
     rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
     nnz = vals.shape[0]
+    C = jnp.asarray(effects[0][0]).shape[0] if effects else 0
+    c_arr = None if colmean is None else jnp.asarray(colmean)
 
     logk = jnp.zeros(n)
     for b_nodes, logW in effects:
@@ -192,15 +241,35 @@ def log_kappa_q1_sparse(X, effects, n, intercept=None, entry_chunk=1 << 16):
         W = jax.nn.softmax(logw.reshape(-1)).reshape(logw.shape)  # (C, Q), joint
         pi = jnp.sum(W, axis=1)                              # (C,) marginal feature mass
         A = jnp.sum(W * b_nodes, axis=1)                     # (C,) per-feature E[b]
-        mean = op.matvec(A)                                 # (n,) off-support x=0 -> 0
+        if c_arr is None:
+            mean = op.matvec(A)                             # (n,) off-support x=0 -> 0
+            G = 1.0
+        else:
+            mean = op.matvec(A) - jnp.dot(A, c_arr)         # centered mean
+            G = jnp.zeros(())  # baseline G_l = sum_c g_c over all C (chunked)
+            for j0 in range(0, C, feat_chunk):
+                j1 = min(j0 + feat_chunk, C)
+                gc = jnp.sum(W[j0:j1] * jnp.exp(-c_arr[j0:j1, None] * b_nodes[j0:j1]),
+                             axis=1)  # (chunk,) node MGF at -c_j
+                G = G + jnp.sum(gc)
         acc = jnp.zeros(n)
         for k0 in range(0, nnz, entry_chunk):
             k1 = min(k0 + entry_chunk, nnz)
             r, c, xv = rows[k0:k1], cols[k0:k1], vals[k0:k1]
-            # sum_m W_cm e^{x b_cm} - pi_c per support entry
-            s = jnp.sum(W[c] * jnp.exp(xv[:, None] * b_nodes[c]), axis=1) - pi[c]
+            if c_arr is None:
+                # sum_m W_cm e^{x b_cm} - pi_c per support entry
+                s = jnp.sum(W[c] * jnp.exp(xv[:, None] * b_nodes[c]), axis=1) - pi[c]
+            else:
+                xc = xv - c_arr[c]  # centered support value
+                h = jnp.sum(W[c] * jnp.exp(xc[:, None] * b_nodes[c]), axis=1)
+                gon = jnp.sum(W[c] * jnp.exp(-c_arr[c][:, None] * b_nodes[c]), axis=1)
+                s = h - gon
             acc = acc + segment_sum(s, r, num_segments=n)
-        logk = logk + (jnp.log1p(acc) - mean)
+        if c_arr is None:
+            logE = jnp.log1p(acc)
+        else:
+            logE = jnp.log(jnp.maximum(G + acc, 1e-300))
+        logk = logk + (logE - mean)
     if intercept is not None:
         logk = logk + _log_node_mgf_intercept(intercept)
     return logk
@@ -232,11 +301,15 @@ class PoissonLogNormalOffset(Smoother):
         y = jnp.asarray(y)
         return y, log_kappa_dense(effects, y.shape[0], offset_var=offset_var)
 
-    def build_aux_sparse(self, base, y, X, effects, offset_var=0.0, entry_chunk=1 << 16):
-        """Sparse (BCOO) build: `X` shared, `effects = [(alpha, mu, var)]`. Same aux."""
+    def build_aux_sparse(self, base, y, X, effects, offset_var=0.0, entry_chunk=1 << 16,
+                         colmean=None):
+        """Sparse (BCOO) build: `X` shared, `effects = [(alpha, mu, var)]`. Same aux.
+        `colmean` (p,), if given, treats `X` as centered via the baseline+support split."""
         self.validate(base)
         y = jnp.asarray(y)
-        return y, log_kappa_sparse(X, effects, offset_var=offset_var, entry_chunk=entry_chunk)
+        return y, log_kappa_sparse(
+            X, effects, offset_var=offset_var, entry_chunk=entry_chunk, colmean=colmean
+        )
 
     def terms(self, base: ResponseModel, eta, aux):
         """Exact Poisson terms with the offset folded into the rate: `Atilde = e^{eta +
@@ -275,8 +348,9 @@ class PoissonSelfNormOffset(Smoother):
     `aux = (y, logkappa)`, both per-row `(n,)`: `logkappa` is row-only (the OTHER effects
     are shared across the candidate features of the effect being updated), so the `quad`
     kernel broadcasts it over the feature/node axes exactly like `y`. Sparse (BCOO) uses the
-    zero-clumping identity; it does NOT support implicit pre-centering (an off-support entry
-    stops contributing a constant under the `-c_j b` shift) -- the caller gates that.
+    zero-clumping identity; under implicit pre-centering an off-support entry contributes a
+    per-feature node MGF `g_c` at `-c_j` (not a constant), recovered by the baseline+support
+    split in `log_kappa_q1_sparse` (pass `colmean`) -- so it DOES pre-center sparse.
     """
 
     def validate(self, base):
@@ -297,13 +371,16 @@ class PoissonSelfNormOffset(Smoother):
         y = jnp.asarray(y)
         return y, log_kappa_q1_dense(X, effects, y.shape[0], intercept=intercept)
 
-    def build_aux_sparse(self, base, y, X, effects, intercept=None, entry_chunk=1 << 16):
+    def build_aux_sparse(self, base, y, X, effects, intercept=None, entry_chunk=1 << 16,
+                         colmean=None):
         """Sparse (BCOO) build via the zero-clumping identity (`log_kappa_q1_sparse`). Same
-        `aux = (y, logkappa)` contract. `X` shared, `effects = [(b_nodes, logW)]`."""
+        `aux = (y, logkappa)` contract. `X` shared, `effects = [(b_nodes, logW)]`.
+        `colmean` (p,), if given, treats `X` as centered via the baseline+support split."""
         self.validate(base)
         y = jnp.asarray(y)
         return y, log_kappa_q1_sparse(
-            X, effects, y.shape[0], intercept=intercept, entry_chunk=entry_chunk
+            X, effects, y.shape[0], intercept=intercept, entry_chunk=entry_chunk,
+            colmean=colmean,
         )
 
     def terms(self, base: ResponseModel, eta, aux):

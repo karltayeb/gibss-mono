@@ -33,6 +33,8 @@ from gibss.poisson_offset import (
     PoissonLogNormalOffset,
     PoissonSelfNormOffset,
     log_kappa_dense,
+    log_kappa_q1_dense,
+    log_kappa_q1_sparse,
     log_kappa_sparse,
 )
 from gibss.response import Bernoulli, CompressSelfNorm, Poisson, Smoothed
@@ -110,6 +112,55 @@ def test_poisson_log_kappa_sparse_matches_dense():
     # tiny entry_chunk must not change the result
     spar_chunked = np.asarray(log_kappa_sparse(Xb, effects, offset_var=0.2, entry_chunk=7))
     assert np.max(np.abs(spar - spar_chunked)) < 1e-12
+
+
+def test_poisson_log_kappa_sparse_centered_matches_dense():
+    """CENTERED sparse Q2 MGF fold (baseline+support split) == dense on the eagerly-centered
+    design, to machine precision -- sparse centering does not densify. Also tiny feat_chunk /
+    entry_chunk invariance."""
+    rng = np.random.default_rng(41)
+    n, p = 40, 15
+    Xd = (rng.uniform(size=(n, p)) < 0.2).astype(float)
+    Xd[Xd > 0] *= rng.uniform(0.5, 2.0, size=int(Xd.sum()))
+    colmean = Xd.mean(0)
+    Xc = Xd - colmean[None, :]
+    Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
+    effects = []
+    for _ in range(3):
+        a = rng.dirichlet(np.ones(p))
+        mu = 0.5 * rng.standard_normal(p)
+        var = rng.uniform(0.05, 0.4, p)
+        effects.append((a, mu, var))
+    dense = np.asarray(log_kappa_dense([(jnp.asarray(Xc), *e) for e in effects], n,
+                                       offset_var=0.2))
+    spar = np.asarray(log_kappa_sparse(Xb, effects, offset_var=0.2, colmean=colmean))
+    assert np.max(np.abs(dense - spar)) < 1e-9
+    chunked = np.asarray(log_kappa_sparse(Xb, effects, offset_var=0.2, colmean=colmean,
+                                          entry_chunk=7, feat_chunk=4))
+    assert np.max(np.abs(spar - chunked)) < 1e-12
+
+
+def test_poisson_log_kappa_q1_sparse_centered_matches_dense():
+    """CENTERED sparse Q1 node-MGF fold (baseline+support split) == dense on the centered
+    design, to machine precision."""
+    rng = np.random.default_rng(42)
+    n, p, Q = 40, 14, 6
+    Xd = (rng.uniform(size=(n, p)) < 0.22).astype(float)
+    Xd[Xd > 0] *= rng.uniform(0.5, 1.5, size=int(Xd.sum()))
+    colmean = Xd.mean(0)
+    Xc = jnp.asarray(Xd - colmean[None, :])
+    Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
+    effects = [(jnp.asarray(rng.standard_normal((p, Q)) * 0.5),
+                jnp.asarray(rng.standard_normal((p, Q)))) for _ in range(2)]
+    intercept = (jnp.asarray(rng.standard_normal(Q) * 0.3),
+                 jnp.asarray(rng.standard_normal(Q)))
+    dense = np.asarray(log_kappa_q1_dense(Xc, effects, n, intercept=intercept))
+    spar = np.asarray(log_kappa_q1_sparse(Xb, effects, n, intercept=intercept,
+                                          colmean=colmean))
+    assert np.max(np.abs(dense - spar)) < 1e-9
+    chunked = np.asarray(log_kappa_q1_sparse(Xb, effects, n, intercept=intercept,
+                                             colmean=colmean, entry_chunk=7, feat_chunk=4))
+    assert np.max(np.abs(spar - chunked)) < 1e-12
 
 
 def test_empty_effects_contribute_zero_logkappa():
@@ -491,14 +542,22 @@ def test_cf_poisson_requires_gaussian_vfam():
                       variational_family="unconstrained")
 
 
-def test_cf_poisson_sparse_centering_rejected():
+def test_cf_poisson_sparse_centering_matches_dense():
+    """CENTERED sparse Poisson CAVI-in-Q2 (MGF baseline+support split) == dense centered fit.
+    Sparse centering is now supported (was rejected) and adds no approximation."""
     rng = np.random.default_rng(0)
-    Xd = rng.standard_normal((60, 5))
-    Xd[np.abs(Xd) < 0.3] = 0.0
-    y = rng.poisson(np.exp(0.2 + Xd[:, 1])).astype(float)
+    Xd = (rng.uniform(size=(120, 8)) < 0.3).astype(float)
+    b = np.zeros(8); b[[2, 5]] = [1.2, -1.0]
+    y = rng.poisson(np.exp(0.2 + Xd @ b)).astype(float)
     Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
-    with pytest.raises(ValueError, match="Poisson MGF"):
-        fit_glm_susie(Xb, y, method="cf_cavi", family="poisson", center=True)
+    st_d = fit_glm_susie(jnp.asarray(Xd), y, L=3, method="cf_cavi", family="poisson",
+                         center=True, max_iter=30)
+    st_s = fit_glm_susie(Xb, y, L=3, method="cf_cavi", family="poisson",
+                         center=True, max_iter=30)
+    assert np.allclose(np.asarray(st_d.pip), np.asarray(st_s.pip), atol=1e-7)
+    fm_d = np.asarray([e.feature_log_marginal for e in st_d.single_effects])
+    fm_s = np.asarray([e.feature_log_marginal for e in st_s.single_effects])
+    assert np.allclose(fm_d, fm_s, atol=1e-5)
 
 
 def test_poisson_selfnorm_offset_rejects_non_poisson():
@@ -549,15 +608,18 @@ def test_compress_selfnorm_poisson_needs_unconstrained_vfam():
                       variational_family="gaussian")
 
 
-def test_compress_selfnorm_poisson_sparse_centering_rejected():
-    """The analytic node-MGF fold uses the sparse zero-clumping identity, which breaks under
-    implicit pre-centering (an off-support entry becomes -c_j b, not a constant); an explicit
-    center=True on a BCOO design is an error, not a silent uncentered fallback."""
-    rng = np.random.default_rng(0)
-    Xd = rng.standard_normal((60, 5))
-    Xd[np.abs(Xd) < 0.3] = 0.0
-    y = rng.poisson(np.exp(0.2 + Xd[:, 1])).astype(float)
+def test_compress_selfnorm_poisson_sparse_centering_matches_dense():
+    """CENTERED sparse Poisson CAVI-in-Q1 (node-MGF baseline+support split) == dense centered
+    fit. Sparse centering is now supported (was rejected) and adds no approximation."""
+    rng = np.random.default_rng(1)
+    Xd = (rng.uniform(size=(120, 8)) < 0.3).astype(float)
+    b = np.zeros(8); b[[2, 5]] = [1.2, -1.0]
+    y = rng.poisson(np.exp(0.2 + Xd @ b)).astype(float)
     Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
-    with pytest.raises(ValueError, match="pre-center|zero-clumping"):
-        fit_glm_susie(Xb, y, family="poisson",
-                      offset_integration="compress_selfnorm", center=True)
+    kw = dict(L=3, family="poisson", offset_integration="compress_selfnorm", max_iter=30)
+    st_d = fit_glm_susie(jnp.asarray(Xd), y, center=True, **kw)
+    st_s = fit_glm_susie(Xb, y, center=True, **kw)
+    assert np.allclose(np.asarray(st_d.pip), np.asarray(st_s.pip), atol=1e-7)
+    fm_d = np.asarray([e.feature_log_marginal for e in st_d.single_effects])
+    fm_s = np.asarray([e.feature_log_marginal for e in st_s.single_effects])
+    assert np.allclose(fm_d, fm_s, atol=1e-5)
