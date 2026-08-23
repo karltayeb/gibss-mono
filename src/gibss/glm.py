@@ -167,9 +167,12 @@ class GLMFamilyState:
     # exactly like `intercept_value`, and its per-row variance v_i folds into the effect
     # offset variance exactly like `intercept_var` -- so the plug-in modes DROP it and exact
     # Q2 CAVI INTEGRATES it, with no special-casing (that split is the whole point of the
-    # term). Fit once per sweep by `estimate_random_intercept_step` (before_sweep). Q2
-    # (variational_family='gaussian': cf_cavi / compress_cavi / plug-in) on a DENSE design
-    # only in this first cut; sparse (BCOO) and free-form Q1 raise NotImplementedError.
+    # term). Fit once per sweep by `estimate_random_intercept_step` (before_sweep). Since it
+    # never touches X, dense and sparse (BCOO) designs give bit-identical results (the per-row
+    # v_i just rides in the offset variance every builder already accepts as scalar-or-(n,)).
+    # Q2 (variational_family='gaussian': cf_cavi / compress_cavi / plug-in) and plug-in are
+    # supported; only the free-form Q1 ELBO is a follow-up (its self-normalized fold has no
+    # offset-variance seam -- fitting a Q1 state is fine, only compute_elbo on it raises).
     random_intercept: bool = False
     random_intercept_mean: object = None  # (n,) posterior means m_i (None = off / uninit)
     random_intercept_var: object = None  # (n,) posterior variances v_i
@@ -358,12 +361,13 @@ def _build_offset_table(data, state, effects, offset_var):
         if is_bcoo(X):
             eff = [(e.alpha, e.mu, e.var) for e in effects]
             init = None
-            if offset_var > 0.0:  # seed the fold with the intercept's N(0, v0)
+            if _ov_any_positive(offset_var):  # seed the fold with the zero-mean Gaussian
+                # (shared intercept v0 + random intercept per-row v_i); build_aux takes the
+                # per-component variance and the sparse folds broadcast a scalar/(n,) V0 init.
                 z1 = jnp.zeros((n, 1))
-                _, _, _, _, cll0, cg0, cw0 = smoother.build_aux(
-                    base, y, z1, jnp.full((n, 1), offset_var), z1
-                )
-                init = (-cll0, -cg0, cw0, offset_var)
+                ov = jnp.broadcast_to(jnp.asarray(offset_var, dtype=z1.dtype), (n,))
+                _, _, _, _, cll0, cg0, cw0 = smoother.build_aux(base, y, z1, ov[:, None], z1)
+                init = (-cll0, -cg0, cw0, ov)
             cbar = getattr(data, "column_center", None)
             if cbar is not None:
                 # centered sparse design: offset is (x_ij - c_j) b, so a zero entry is a
@@ -882,16 +886,11 @@ def estimate_random_intercept_step(data, state):
     """Update the per-row random intercept q(b0i)=N(m_i, v_i), then (optionally) EM-update
     sigma^2 = mean_i(m_i^2 + v_i). Runs once per sweep (before_sweep). No-op unless the random
     intercept is enabled. Routed like the shared intercept on `_cavi_mode`: the exact Q2 table
-    (Gaussian) vs the plug-in point. Free-form Q1 and sparse (BCOO) are not yet supported."""
+    (Gaussian) vs the plug-in point. Dense and sparse (BCOO) both work (it never touches X);
+    only free-form Q1 (compress_selfnorm) is unsupported -- it has no offset-variance seam."""
     fs = state.family_state
     if not getattr(fs, "random_intercept", False):
         return state
-    if is_bcoo(data.X):
-        raise NotImplementedError(
-            "random_intercept is implemented for DENSE designs in this first cut; the "
-            "sparse (BCOO) per-row offset-variance fold is a follow-up. Densify X, or drop "
-            "random_intercept."
-        )
     mode = _cavi_mode(fs)
     if mode == "q1":
         raise NotImplementedError(

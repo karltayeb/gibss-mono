@@ -186,14 +186,73 @@ def test_poisson_random_intercept_elbo():
     assert _feat_pip(st, causal) > 0.9
 
 
-def test_unsupported_combinations_raise():
-    # dense-only first cut: sparse (BCOO) is refused at the front door; a free-form Q1
-    # logistic fit runs but its ELBO is not yet available (needs per-row nodes in the fold).
+def test_sparse_matches_dense_bit_for_bit():
+    # the random intercept never touches X, so a sparse (BCOO) design gives bit-identical
+    # results to the same dense design (both uncentered): the per-row v_i just rides in the
+    # offset variance every builder accepts as scalar-or-(n,). Also checks the sparse-X ELBO.
     from jax.experimental import sparse as jsparse
+    rng = np.random.default_rng(11)
+    n, p = 350, 30
+    Xd = (rng.uniform(size=(n, p)) < 0.15).astype(float)  # genuinely sparse, gene-set-like
+    b0i = rng.standard_normal(n)
+    y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-(-0.4 + 2.0 * Xd[:, 7] + b0i)))).astype(float)
+    Xs = jsparse.BCOO.fromdense(Xd)
+    sd = fit_glm_susie(Xd, y, L=3, method="cf_cavi", random_intercept=True, center=False, max_iter=40)
+    ss = fit_glm_susie(Xs, y, L=3, method="cf_cavi", random_intercept=True, center=False, max_iter=40)
+    np.testing.assert_allclose(
+        np.asarray(sd.family_state.random_intercept_mean),
+        np.asarray(ss.family_state.random_intercept_mean), atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(sd.family_state.random_intercept_var),
+        np.asarray(ss.family_state.random_intercept_var), atol=1e-12)
+    np.testing.assert_allclose(np.asarray(sd.alpha), np.asarray(ss.alpha), atol=1e-12)
+    assert np.isfinite(compute_elbo(glm.prep_data(Xs, y, center=False), ss))
+
+
+@pytest.mark.parametrize("method", ["cf_cavi", "gibss_gaussian", "compress_cavi"])
+def test_sparse_random_intercept_methods(method):
+    # every Q2 / plug-in method fits on a sparse design with a random intercept and its ELBO
+    # is available (Bernoulli Q2). A per-row known variance also works on sparse.
+    from jax.experimental import sparse as jsparse
+    rng = np.random.default_rng(12)
+    n, p = 300, 25
+    Xd = (rng.uniform(size=(n, p)) < 0.2).astype(float)
+    b0i = rng.standard_normal(n)
+    y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-(-0.3 + 2.0 * Xd[:, 4] + b0i)))).astype(float)
+    Xs = jsparse.BCOO.fromdense(Xd)
+    st = fit_glm_susie(Xs, y, L=3, method=method, random_intercept=True, center=False, max_iter=30)
+    assert 4 in st.get_credible_sets()[0]
+    assert np.isfinite(compute_elbo(glm.prep_data(Xs, y, center=False), st))
+
+
+def test_sparse_poisson_random_intercept_matches_dense():
+    # cf on the Poisson base is the analytic log-normal MGF (PoissonLogNormalOffset), not a
+    # Compress table: the random intercept's per-row v_i folds into log_kappa_sparse as
+    # 0.5 v_i. Sparse == dense bit-for-bit (never touches X), and the analytic ELBO is finite.
+    from jax.experimental import sparse as jsparse
+    rng = np.random.default_rng(13)
+    n, p, causal = 400, 30, 6
+    Xd = (rng.uniform(size=(n, p)) < 0.2).astype(float)
+    b0i = rng.standard_normal(n) * 0.4
+    y = rng.poisson(np.exp(-0.3 + 1.0 * Xd[:, causal] + b0i)).astype(float)
+    Xs = jsparse.BCOO.fromdense(Xd)
+    sd = fit_glm_susie(Xd, y, L=3, family="poisson", method="cf_cavi",
+                       random_intercept=True, center=False, max_iter=40)
+    ss = fit_glm_susie(Xs, y, L=3, family="poisson", method="cf_cavi",
+                       random_intercept=True, center=False, max_iter=40)
+    np.testing.assert_allclose(np.asarray(sd.family_state.random_intercept_mean),
+                               np.asarray(ss.family_state.random_intercept_mean), atol=1e-9)
+    np.testing.assert_allclose(np.asarray(sd.family_state.random_intercept_var),
+                               np.asarray(ss.family_state.random_intercept_var), atol=1e-9)
+    np.testing.assert_allclose(np.asarray(sd.alpha), np.asarray(ss.alpha), atol=1e-9)
+    assert causal in ss.get_credible_sets()[0]
+    assert np.isfinite(compute_elbo(glm.prep_data(Xs, y, center=False), ss))
+
+
+def test_free_form_q1_elbo_unsupported():
+    # a free-form Q1 logistic fit runs (dense or sparse), but its ELBO is not yet available
+    # -- integrating a per-row Gaussian in the self-normalized node fold is a follow-up.
     X, y = _sim_logistic_ri(seed=8, n=200, p=15)
-    Xs = jsparse.BCOO.fromdense(X)
-    with pytest.raises(NotImplementedError, match="(?i)dense"):
-        fit_glm_susie(Xs, y, L=2, method="cf_cavi", random_intercept=True, max_iter=5)
     st = fit_glm_susie(X, y, L=2, method="logistic", random_intercept=True, max_iter=10)
     with pytest.raises(NotImplementedError, match="random intercept"):
         compute_elbo(glm.prep_data(X, y), st)

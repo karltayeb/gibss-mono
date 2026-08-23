@@ -337,12 +337,6 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
-    if random_intercept and is_bcoo(X):
-        raise NotImplementedError(
-            "random_intercept is implemented for DENSE designs in this first cut (the "
-            "per-row offset-variance fold on a sparse BCOO design is a follow-up). Densify "
-            "X, or drop random_intercept."
-        )
     if random_intercept:
         # random_intercept_variance is a scalar sigma^2 (homogeneous, optionally EM-estimated)
         # OR a length-n vector of KNOWN per-row prior variances var(b0i)=sigma^2_i.
