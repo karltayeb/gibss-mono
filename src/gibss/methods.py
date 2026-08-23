@@ -258,6 +258,10 @@ def fit_glm_susie(
     prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
     max_prior_variance=None,  # hard ceiling on the estimated prior variance (None = no cap)
     estimate_intercept=True,
+    random_intercept=False,  # add an iid per-row random intercept b0i ~ N(0, sigma^2_ri)
+    random_intercept_variance=1.0,  # sigma^2_ri (fixed value, unless estimated below)
+    estimate_random_intercept_variance=False,  # EBNM M-step sigma^2=mean_i(m_i^2+v_i); off by
+    # default (sigma^2 is weakly identified for an observation-level random effect -- fix it)
     max_iter=100,
     tol=1e-4,
     max_L=None,  # L="auto": cap on the greedy search (default min(20, n_features))
@@ -333,6 +337,13 @@ def fit_glm_susie(
 
     response, kernel = _resolve(cfg)
 
+    if random_intercept and is_bcoo(X):
+        raise NotImplementedError(
+            "random_intercept is implemented for DENSE designs in this first cut (the "
+            "per-row offset-variance fold on a sparse BCOO design is a follow-up). Densify "
+            "X, or drop random_intercept."
+        )
+
     # Pre-centering support depends on kernel AND builder. Centering orthogonalizes the
     # intercept from the effects, so the mean-field factorization q(b0) prod q(b_l) -- whose
     # premise IS posterior independence -- becomes accurate; always desirable where the fold
@@ -393,6 +404,9 @@ def fit_glm_susie(
             background=cfg["background"],
             glm_offset=offset,
             estimate_intercept=estimate_intercept,
+            random_intercept=random_intercept,
+            random_intercept_prior_variance=random_intercept_variance,
+            estimate_random_intercept_variance=estimate_random_intercept_variance,
             estimate_prior_variance=estimate_prior_variance,
             prior_variance_scale=prior_variance_scale,
             max_prior_variance=max_prior_variance,

@@ -553,12 +553,30 @@ def compute_alpha_skl(state: GIBSSState, old_state: GIBSSState) -> float:
     return float(total_skl)
 
 
+def random_intercept_skl(state: GIBSSState, old_state: GIBSSState) -> float:
+    """Mean per-row symmetric-KL of the random-intercept Gaussian factor q(b0i)=N(m_i, v_i)
+    between two sweeps, so convergence accounts for the random intercept alongside the
+    effects. 0 when the random intercept is off (getattr-guarded: non-GLM family states and
+    disabled states contribute nothing). Its prior variance sigma^2 is weakly identified for
+    an observation-level random effect, so this factor typically converges slower than the
+    PIPs -- fix sigma^2 (estimate_random_intercept_variance=False) when its exact value
+    matters."""
+    fs, ofs = state.family_state, old_state.family_state
+    if not getattr(fs, "random_intercept", False):
+        return 0.0
+    m, om = getattr(fs, "random_intercept_mean", None), getattr(ofs, "random_intercept_mean", None)
+    if m is None or om is None:
+        return 0.0
+    v, ov = jnp.asarray(fs.random_intercept_var), jnp.asarray(ofs.random_intercept_var)
+    return float(jnp.mean(gaussian_skl(jnp.asarray(m), v, jnp.asarray(om), ov)))
+
+
 def check_skl_convergence_step(
     data: Any, prev_state: GIBSSState, state: GIBSSState
 ) -> GIBSSState:
     """check_convergence: full distributional SKL between the sweep's start and end."""
     del data
-    skl = compute_total_skl(state, prev_state)
+    skl = compute_total_skl(state, prev_state) + random_intercept_skl(state, prev_state)
 
     if hasattr(state.family_state, "skl_history"):
         new_fs = replace(
@@ -575,9 +593,10 @@ def check_skl_convergence_step(
 def check_alpha_skl_convergence_step(
     data: Any, prev_state: GIBSSState, state: GIBSSState
 ) -> GIBSSState:
-    """check_convergence: categorical SKL on alpha between the sweep's start and end."""
+    """check_convergence: categorical SKL on alpha between the sweep's start and end (plus the
+    random-intercept factor's SKL when it is enabled)."""
     del data
-    skl = compute_alpha_skl(state, prev_state)
+    skl = compute_alpha_skl(state, prev_state) + random_intercept_skl(state, prev_state)
 
     if hasattr(state.family_state, "skl_history"):
         new_fs = replace(

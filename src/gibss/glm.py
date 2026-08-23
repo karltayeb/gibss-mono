@@ -65,6 +65,7 @@ __all__ = [
     "initialize_state_mean_message",
     "update_effect_index_step",
     "estimate_intercept_step",
+    "estimate_random_intercept_step",
     "update_row_param_step",
     "default_schedule",
 ]
@@ -159,6 +160,25 @@ class GLMFamilyState:
     # additive non-Gaussian effect -- the exact analogue of the Gaussian N(0, iv) seed.
     intercept_b_nodes: object = None
     intercept_log_node_weight: object = None
+    # random_intercept: an iid per-row additive effect b0i ~ N(0, sigma^2_ri) with a
+    # mean-field Gaussian factor q(b0i) = N(m_i, v_i) -- the shared intercept generalized
+    # from a scalar to a per-row VECTOR (an observation-level random effect: logit-normal /
+    # Poisson-lognormal overdispersion). Off by default. When on, its mean m_i rides in eta
+    # exactly like `intercept_value`, and its per-row variance v_i folds into the effect
+    # offset variance exactly like `intercept_var` -- so the plug-in modes DROP it and exact
+    # Q2 CAVI INTEGRATES it, with no special-casing (that split is the whole point of the
+    # term). Fit once per sweep by `estimate_random_intercept_step` (before_sweep). Q2
+    # (variational_family='gaussian': cf_cavi / compress_cavi / plug-in) on a DENSE design
+    # only in this first cut; sparse (BCOO) and free-form Q1 raise NotImplementedError.
+    random_intercept: bool = False
+    random_intercept_mean: object = None  # (n,) posterior means m_i (None = off / uninit)
+    random_intercept_var: object = None  # (n,) posterior variances v_i
+    random_intercept_prior_variance: float = 1.0  # sigma^2_ri, the prior N(0, sigma^2_ri)
+    random_intercept_kl: float = 0.0  # sum_i KL(N(m_i, v_i) || N(0, sigma^2_ri))
+    # EBNM (heteroskedastic normal-means) M-step sigma^2 = mean_i(m_i^2 + v_i). OFF by
+    # default: sigma^2 is weakly identified for an observation-level random effect (a flat
+    # EBNM marginal likelihood), so it is a fixed knob unless the caller opts into estimating.
+    estimate_random_intercept_variance: bool = False
 
     def __post_init__(self):
         legacy = {"profile": "quad", "vi_profile": "vi", "linear_profile": "linear"}
@@ -216,18 +236,38 @@ class GLMFamilyState:
             )
 
 
-def _offset_var(state, include_intercept_var=True):
+def _ri_mean(fs):
+    """The random intercept's per-row posterior mean m_i in eta, or scalar 0.0 when the
+    random intercept is off. Guarded via getattr so non-GLM family states (twogroup / cox /
+    linear, which call `_effect_offset`) fall through to 0.0."""
+    m = getattr(fs, "random_intercept_mean", None)
+    return 0.0 if m is None else jnp.asarray(m)
+
+
+def _ri_var(state, include=True):
+    """The random intercept's per-row posterior variance v_i folded into the effect offset
+    variance. 0.0 when the random intercept is off, in mean-only (MeanMessage) mode, or when
+    excluded (mean-field: updating the random intercept's own factor)."""
+    if not include or isinstance(state.total_message, MeanMessage):
+        return 0.0
+    v = getattr(state.family_state, "random_intercept_var", None)
+    return 0.0 if v is None else jnp.asarray(v)
+
+
+def _offset_var(state, include_intercept_var=True, include_ri_var=True):
     """Per-row variance of the random offset: the message variance plus the shared
-    intercept's variance (a constant; excluded under MeanMessage = mean-only mode,
-    and when updating the intercept itself -- mean-field, own factor excluded)."""
+    intercept's variance (a constant) plus the random intercept's per-row variance. Each is
+    excluded under MeanMessage (mean-only mode), and its own factor is excluded when that
+    factor is the one being updated (mean-field)."""
     fs = state.family_state
     ov = jnp.asarray(state.total_message.var)
     if include_intercept_var and not isinstance(state.total_message, MeanMessage):
         ov = ov + fs.intercept_var
+    ov = ov + _ri_var(state, include_ri_var)
     return ov
 
 
-def _aux(data, state, include_intercept_var=True):
+def _aux(data, state, include_intercept_var=True, include_ri_var=True):
     """Kernel aux: y; a Smoothed response adds the offset variance (and, for
     row-parameterized schemes under the quadrature/profile kernels, the per-row
     parameter tuned by update_row_param_step -- the jj kernel builds its own
@@ -236,7 +276,7 @@ def _aux(data, state, include_intercept_var=True):
     fs = state.family_state
     if not isinstance(fs.response, Smoothed):
         return y
-    ov = _offset_var(state, include_intercept_var)
+    ov = _offset_var(state, include_intercept_var, include_ri_var)
     smoother = fs.response.smoother
     if smoother.takes_row_param and fs.kernel != "jj":
         return y, ov, jnp.asarray(fs.row_param)
@@ -265,6 +305,15 @@ def _gh_expand(effect, order):
     b_nodes = mu[:, None] + jnp.sqrt(2.0 * jnp.maximum(var, 0.0))[:, None] * xgh[None, :]
     logW = jnp.log(alpha)[:, None] + logwgh[None, :]  # softmax normalizes the GH weights
     return b_nodes, logW
+
+
+def _ov_any_positive(offset_var):
+    """Is any entry of a scalar-or-(n,) offset variance positive? A scalar stays host-side
+    (no device sync); an array forces one host sync (only in the Compress aux build, off the
+    hot path). Decides whether to seed the offset fold with the zero-mean Gaussian carrying
+    the shared intercept's v0 and/or the random intercept's per-row v_i."""
+    ov = jnp.asarray(offset_var)
+    return float(ov) > 0.0 if ov.ndim == 0 else bool(jnp.any(ov > 0.0))
 
 
 def _build_offset_table(data, state, effects, offset_var):
@@ -331,9 +380,10 @@ def _build_offset_table(data, state, effects, offset_var):
                  jnp.broadcast_to(jnp.log(jnp.asarray(e.alpha))[None, :], Xd.shape))
                 for e in effects
             ]
-            if offset_var > 0.0:  # intercept as a zero-mean single-Gaussian effect
+            if _ov_any_positive(offset_var):  # zero-mean Gaussian offset: icpt v0 + ri v_i
                 zc = jnp.zeros((n, 1))
-                eff.append((zc, jnp.full((n, 1), offset_var), zc))
+                ov = jnp.broadcast_to(jnp.asarray(offset_var, dtype=Xd.dtype), (n,))
+                eff.append((zc, ov[:, None], zc))
             aux = smoother.build_aux_sequential(base, y, eff)
         y_, _obar, _center, hw, cll, cg, cw = aux
         z = jnp.zeros_like(hw)  # re-center obar/center -> 0 (mean lives in eta)
@@ -357,13 +407,17 @@ def _offset_table_aux(data, state, l):
     intercept's Gaussian factor N(0, v0). The offset MEAN lives in eta (the caller's
     `offset` = LOO message mean + intercept m0)."""
     others = [e for j, e in enumerate(state.single_effects) if j != l]
-    return _build_offset_table(data, state, others, _intercept_ov(state))
+    # offset_var: the shared intercept's N(0, v0) PLUS the random intercept's per-row v_i
+    # (both are homogeneous zero-mean Gaussian offsets to fold; the effect means ride in eta).
+    return _build_offset_table(data, state, others, _intercept_ov(state) + _ri_var(state))
 
 
 def _intercept_offset_aux(data, state):
     """Intercept vi_gh aux: fold ALL L effects (the intercept is a unit-ones-column
-    effect, so its offset is every b_l; it excludes ITSELF -> offset_var=0)."""
-    return _build_offset_table(data, state, list(state.single_effects), 0.0)
+    effect, so its offset is every b_l; it excludes ITSELF). The random intercept, being a
+    SEPARATE factor, is part of the shared intercept's offset -> its per-row v_i rides in
+    offset_var (its mean rides in eta via `_intercept_gaussian`'s total_mean)."""
+    return _build_offset_table(data, state, list(state.single_effects), _ri_var(state))
 
 
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
@@ -533,6 +587,15 @@ def _freeze_null_intercept(data, state):
     return replace(state, family_state=replace(state.family_state, intercept_var=v0))
 
 
+def _init_random_intercept(fs, n):
+    """Seed the random intercept's per-row Gaussian factor to q = (mean 0, variance 0) -- the
+    prior mean with no spread yet; the first `estimate_random_intercept_step` (before_sweep)
+    fills it in. No-op if the random intercept is off or already seeded."""
+    if not getattr(fs, "random_intercept", False) or fs.random_intercept_mean is not None:
+        return fs
+    return replace(fs, random_intercept_mean=jnp.zeros(n), random_intercept_var=jnp.zeros(n))
+
+
 def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_state_kwargs=None,
                      prior_variance=1.0):
     from .linear import _empty_effect
@@ -542,7 +605,7 @@ def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_st
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=Message(jnp.zeros(n), jnp.zeros(n)),
-        family_state=GLMFamilyState(**kw),
+        family_state=_init_random_intercept(GLMFamilyState(**kw), n),
     )
     return _freeze_null_intercept(data, state)
 
@@ -563,7 +626,7 @@ def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=MeanMessage(jnp.zeros(n)),
-        family_state=GLMFamilyState(**kw),
+        family_state=_init_random_intercept(GLMFamilyState(**kw), n),
     )
     return _freeze_null_intercept(data, state)
 
@@ -579,7 +642,8 @@ def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     inv_tau = 1.0 / fs.intercept_prior_variance  # diffuse Gaussian prior N(0, tau) on b0
     response = fs.response
     aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
-    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset  # offset mean s
+    # offset mean s: effects' mean + glm_offset + the random intercept mean (m_i rides in eta)
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
     nodes_np, logw_np = _gh_rule(order)
     nodes = jnp.asarray(nodes_np)
     wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
@@ -632,7 +696,7 @@ def _intercept_point(data, state):
         aux = jnp.asarray(data.y)
     else:
         aux = _aux(data, state, include_intercept_var=False)
-    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
 
     def terms_at(b0):
         eta = total_mean + b0
@@ -676,7 +740,7 @@ def _intercept_freeform(data, state, order=15):
     n = data.X.shape[0]
     # effects' MEAN rides in eta (the fold is re-centered to obar=0), matching
     # `_selfnorm_fold_aux`; b0 is integrated against the effects-integrated cumulant.
-    offset = jnp.asarray(state.total_message.mean) + fs.glm_offset  # effects only
+    offset = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)  # effects + ri
     ones = DenseOperator(jnp.ones((n, 1)))
     fold_aux = _selfnorm_fold_aux(
         data, state, fs.response.smoother, base, jnp.asarray(data.y), n,
@@ -734,6 +798,125 @@ def estimate_intercept_step(data, state):
     return replace(state, family_state=replace(fs, **upd))
 
 
+def _random_intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
+    """Random-intercept update -- exact CAVI in Q2 (offset table). Update q(b0i)=N(m_i, v_i)
+    for every row i independently: the per-row analogue of `_intercept_gaussian` with the
+    final sum over rows removed. The offset is ALL L effects (folded into the cumulant table,
+    obar=0) plus the shared intercept (mean in eta, variance in the table's offset_var), and
+    each b0i is integrated by GH over its own N(m_i, v_i) against the per-row prior
+    N(0, sigma^2). The random intercept's OWN v_i is excluded from the table (mean-field).
+    Returns (m, v), each (n,)."""
+    fs = state.family_state
+    s2 = fs.random_intercept_prior_variance
+    inv_s2 = 1.0 / s2
+    response = fs.response
+    aux = _build_offset_table(data, state, list(state.single_effects), _intercept_ov(state))
+    # offset mean in eta: effects' mean + glm_offset + the SHARED intercept (own ri mean out)
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + fs.intercept_value
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+    aux_o = jax.tree_util.tree_map(lambda a: a[None, ...], aux)  # open GH-node axis
+
+    def smoothed(m, v):
+        sd = jnp.sqrt(2.0 * jnp.maximum(v, 0.0))
+        shft = (total_mean + m)[None, :] + sd[None, :] * nodes[:, None]  # (order, n)
+        _, g, w = response.terms(shft, aux_o)
+        W = wts[:, None]
+        return jnp.sum(W * g, 0), jnp.sum(W * w, 0)  # (n,), (n,)
+
+    def body(s):
+        m, v, _, it = s
+        g, w = smoothed(m, v)
+        prec = jnp.maximum(w + inv_s2, 1e-8)
+        step = jnp.clip((g - inv_s2 * m) / prec, -4.0, 4.0)
+        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+
+    n = jnp.asarray(data.y).shape[0]
+    m0 = _ri_mean(fs)
+    m0 = jnp.zeros(n) if jnp.ndim(m0) == 0 else jnp.asarray(m0)
+    v0 = fs.random_intercept_var
+    v0 = jnp.zeros(n) if v0 is None else jnp.asarray(v0)
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol), body, (m0, v0, jnp.inf, 0)
+    )
+    return m, v
+
+
+def _random_intercept_point(data, state, n_iter=50, tol=1e-8):
+    """Random-intercept update -- plug-in / point (non-table modes). Per-row Laplace of
+    q(b0i)=N(m_i, v_i) against the BASE likelihood at the plugged-in MEAN offset (all effects'
+    mean + shared intercept + glm_offset): the other factors' spread is NOT integrated -- the
+    same plug-in semantics under which the effects drop the offset variance. v_i is the
+    per-row Laplace variance 1/(w_i + 1/sigma^2). Returns (m, v), each (n,)."""
+    fs = state.family_state
+    s2 = fs.random_intercept_prior_variance
+    inv_s2 = 1.0 / s2
+    base = fs.response.base if isinstance(fs.response, Smoothed) else fs.response
+    y = jnp.asarray(data.y)
+    offset = jnp.asarray(state.total_message.mean) + fs.glm_offset + fs.intercept_value
+
+    def body(s):
+        m, _, it = s
+        _, g, w = base.terms(offset + m, y)
+        prec = jnp.maximum(w + inv_s2, 1e-8)
+        step = jnp.clip((g - inv_s2 * m) / prec, -4.0, 4.0)
+        return m + step, jnp.max(jnp.abs(step)), it + 1
+
+    n = y.shape[0]
+    m0 = _ri_mean(fs)
+    m0 = jnp.zeros(n) if jnp.ndim(m0) == 0 else jnp.asarray(m0)
+    m, _, _ = jax.lax.while_loop(
+        lambda s: (s[2] < n_iter) & (s[1] > tol), body, (m0, jnp.inf, 0)
+    )
+    _, _, w = base.terms(offset + m, y)
+    v = 1.0 / jnp.maximum(w + inv_s2, 1e-8)
+    return m, v
+
+
+def estimate_random_intercept_step(data, state):
+    """Update the per-row random intercept q(b0i)=N(m_i, v_i), then (optionally) EM-update
+    sigma^2 = mean_i(m_i^2 + v_i). Runs once per sweep (before_sweep). No-op unless the random
+    intercept is enabled. Routed like the shared intercept on `_cavi_mode`: the exact Q2 table
+    (Gaussian) vs the plug-in point. Free-form Q1 and sparse (BCOO) are not yet supported."""
+    fs = state.family_state
+    if not getattr(fs, "random_intercept", False):
+        return state
+    if is_bcoo(data.X):
+        raise NotImplementedError(
+            "random_intercept is implemented for DENSE designs in this first cut; the "
+            "sparse (BCOO) per-row offset-variance fold is a follow-up. Densify X, or drop "
+            "random_intercept."
+        )
+    mode = _cavi_mode(fs)
+    if mode == "q1":
+        raise NotImplementedError(
+            "random_intercept is implemented for CAVI in Q2 (variational_family='gaussian': "
+            "cf_cavi / compress_cavi / plug-in) and the plug-in paths, not for free-form "
+            "Q1 (offset_integration='compress_selfnorm'). Folding a per-row Gaussian into "
+            "the self-normalized node fold is a follow-up."
+        )
+    if mode == "q2":
+        m, v = _random_intercept_gaussian(data, state, order=fs.quadrature_order)
+    else:  # plugin / q2_plugin: point offset, no offset-variance integration
+        m, v = _random_intercept_point(data, state)
+    s2 = fs.random_intercept_prior_variance
+    if fs.estimate_random_intercept_variance:
+        s2 = float(jnp.mean(m**2 + v))
+    v = jnp.maximum(v, 1e-12)
+    kl = float(jnp.sum(0.5 * (v / s2 + m**2 / s2 - 1.0 + jnp.log(s2 / v))))
+    return replace(
+        state,
+        family_state=replace(
+            fs,
+            random_intercept_mean=m,
+            random_intercept_var=v,
+            random_intercept_prior_variance=s2,
+            random_intercept_kl=kl,
+        ),
+    )
+
+
 def update_row_param_step(data, state):
     """Refresh the smoother's per-row engine-tuned parameter from the FULL message
     (all effects) + intercept, before each effect update. JJFixed: the globaljj tilt
@@ -758,9 +941,10 @@ def update_row_param_step(data, state):
 
 def _effect_offset(fs, state):
     """The fixed offset an effect update sees: LOO message mean + glm_offset, plus
-    the shared intercept on the non-profiled kernels."""
+    the shared intercept on the non-profiled kernels, plus the random intercept mean m_i
+    (a per-row offset, always in eta when the random intercept is on)."""
     base = fs.glm_offset if fs.intercept == "profiled" else fs.glm_offset + fs.intercept_value
-    return base + state.total_message.mean
+    return base + _ri_mean(fs) + state.total_message.mean
 
 
 # GH order for integrating a Gaussian POINT intercept q(b0)=N(m0, v0) in the self-normalized
@@ -920,6 +1104,9 @@ def update_effect_index_step(data, l, state):
 
 def default_schedule() -> Schedule:
     return Schedule(
+        # the random intercept is a block coordinate updated once per sweep (a no-op unless
+        # enabled); the shared intercept is refit before each effect as usual.
+        before_sweep=(estimate_random_intercept_step,),
         before_effect_update=(update_row_param_step, estimate_intercept_step),
         effect_update=(
             subtract_message_index_step,

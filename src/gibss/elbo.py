@@ -107,15 +107,20 @@ def _predictor_mean(data, state):
     fs = state.family_state
     eta = jnp.asarray(state.total_message.mean)
     eta = eta + jnp.asarray(fs.glm_offset) + float(fs.intercept_value)
+    ri_mean = getattr(fs, "random_intercept_mean", None)
+    if getattr(fs, "random_intercept", False) and ri_mean is not None:
+        eta = eta + jnp.asarray(ri_mean)  # per-row random intercept mean m_i
     return eta
 
 
-def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var):
+def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var, ri_var):
     r"""Analytic per-row expected log-likelihood `y_i E[eta_i] - E[e^{eta_i}]` for a Poisson
     base -- no quadrature. Because `A = exp`, `E[e^{eta_i}] = e^{E[eta_i] + logkappa_i}` with
-    `logkappa` the zero-mean offset log-MGF over ALL effects (+ the shared intercept spread),
-    computed by the closed-form Gaussian-mixture MGF in Q2, or the exact node-weighted sum
-    over the free-form quadrature law in Q1. `eta` is `E[eta]` (the predictor mean)."""
+    `logkappa` the zero-mean offset log-MGF over ALL effects (+ the homogeneous zero-mean
+    Gaussians' spread `offset_var`: the shared intercept's v0 plus the random intercept's per-
+    row v_i), computed by the closed-form Gaussian-mixture MGF in Q2, or the exact node-
+    weighted sum over the free-form quadrature law in Q1. `eta` is `E[eta]` (the predictor
+    mean)."""
     fs = state.family_state
     X = data.X
     effects = list(state.single_effects)
@@ -140,14 +145,19 @@ def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var):
         # is still charged -- the same fix the Q2 path gets for free via offset_var.
         if integrate_b0 and fs.intercept_b_nodes is None:
             logk = logk + 0.5 * jnp.asarray(intercept_var)
+        # the random intercept is a per-row zero-mean Gaussian: its log-MGF term 0.5 v_i is
+        # ALWAYS added (unlike the shared intercept's, it is never carried by free-form nodes).
+        logk = logk + 0.5 * jnp.asarray(ri_var)
     else:
-        # Gaussian Q2: the intercept's N(0, v0) spread folds via offset_var (0 if plugged in).
+        # Gaussian Q2: the zero-mean Gaussians' spread (shared intercept v0 + random intercept
+        # v_i) folds via offset_var (0 if plugged in).
+        offset_var = intercept_var + ri_var
         if is_bcoo(X):
             eff = [(e.alpha, e.mu, e.var) for e in effects]
-            logk = log_kappa_sparse(X, eff, offset_var=intercept_var)
+            logk = log_kappa_sparse(X, eff, offset_var=offset_var)
         else:
             eff = [(X, e.alpha, e.mu, e.var) for e in effects]
-            logk = log_kappa_dense(eff, jnp.asarray(data.y).shape[0], offset_var=intercept_var)
+            logk = log_kappa_dense(eff, jnp.asarray(data.y).shape[0], offset_var=offset_var)
     y = jnp.asarray(data.y)
     return y * eta - jnp.exp(eta + logk)
 
@@ -208,12 +218,32 @@ def compute_elbo(
     intercept_var = float(getattr(fs, "intercept_var", 0.0)) if integrate_b0 else 0.0
     intercept_kl = float(getattr(fs, "intercept_kl", 0.0)) if integrate_b0 else 0.0
 
+    # The random intercept is another zero-mean Gaussian offset (per-row v_i): its mean is
+    # already in eta (`_predictor_mean`), its variance folds into the offset table alongside
+    # the shared intercept's, and its KL is subtracted like any factor's.
+    ri_on = getattr(fs, "random_intercept", False)
+    _ri_var = getattr(fs, "random_intercept_var", None)
+    ri_var = jnp.asarray(_ri_var) if (ri_on and _ri_var is not None) else 0.0
+    ri_kl = float(getattr(fs, "random_intercept_kl", 0.0)) if ri_on else 0.0
+    offset_var = intercept_var + ri_var  # homogeneous zero-mean Gaussians folded into the table
+
     is_q1 = effects[0].b_nodes is not None
+    if ri_on and is_q1 and not isinstance(base, Poisson):
+        # A per-row random-intercept N(0, v_i) folds into the offset table for free (Q2) and
+        # into the analytic Poisson log-MGF (0.5 v_i), but the general free-form Q1 fold has no
+        # offset-variance seam -- integrating it there needs per-row synthesized nodes in the
+        # self-normalized fold, a follow-up. Fit still works; only its ELBO is unavailable.
+        raise NotImplementedError(
+            "compute_elbo with a random intercept is supported for Gaussian effects (Q2) and "
+            "for the Poisson base; a free-form Q1 fit (e.g. method='logistic') with a random "
+            "intercept has no ELBO yet. Score the Gaussian-effect fit (cf_cavi / compress_cavi "
+            "/ gibss_gaussian) instead, or use family='poisson'."
+        )
     if isinstance(base, Poisson):
         # Poisson is analytic: A = exp turns the offset integral into a moment-generating
         # function -- a closed-form Gaussian-mixture MGF (Q2) or an exact node-weighted sum
         # over the free-form quadrature law (Q1). No Chebyshev/GH peel, so no order/M error.
-        ll = _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var)
+        ll = _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var, ri_var)
     elif is_q1:
         # free-form Q1: fold every effect against its TRUE node posterior; when the intercept
         # is shared its free-form q(b0) folds too (include_intercept), else it rides in eta.
@@ -232,13 +262,13 @@ def compute_elbo(
             state,
             family_state=replace(fs, response=Smoothed(base, smoother)),
         )
-        aux = _build_offset_table(data, scored, effects, intercept_var)
+        aux = _build_offset_table(data, scored, effects, offset_var)
         ll = smoother.terms(base, eta, aux)[0]
 
     base_measure = _base_measure(base, y) if include_base_measure else 0.0
     expected_loglik = float(jnp.sum(ll)) + base_measure
     kl = float(sum(float(e.kl) for e in effects))
-    elbo = expected_loglik - kl - intercept_kl
+    elbo = expected_loglik - kl - intercept_kl - ri_kl
 
     if return_breakdown:
         return ELBOBreakdown(
