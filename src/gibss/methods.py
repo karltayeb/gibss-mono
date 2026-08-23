@@ -343,6 +343,30 @@ def fit_glm_susie(
             "per-row offset-variance fold on a sparse BCOO design is a follow-up). Densify "
             "X, or drop random_intercept."
         )
+    if random_intercept:
+        # random_intercept_variance is a scalar sigma^2 (homogeneous, optionally EM-estimated)
+        # OR a length-n vector of KNOWN per-row prior variances var(b0i)=sigma^2_i.
+        import numpy as _np
+        _riv = _np.asarray(random_intercept_variance, dtype=float)
+        if _riv.ndim == 1:
+            if _riv.shape[0] != X.shape[0]:
+                raise ValueError(
+                    f"random_intercept_variance as a per-row vector must have length "
+                    f"n={X.shape[0]} (got {_riv.shape[0]}); it is the known prior "
+                    f"var(b0i)=sigma^2_i."
+                )
+            if estimate_random_intercept_variance:
+                raise ValueError(
+                    "a per-row random_intercept_variance vector is a KNOWN heteroskedastic "
+                    "prior; set estimate_random_intercept_variance=False (a per-row variance "
+                    "is not estimable from one observation per row)."
+                )
+            random_intercept_variance = _riv
+        elif _riv.ndim != 0:
+            raise ValueError(
+                "random_intercept_variance must be a scalar or a length-n vector; got shape "
+                f"{_riv.shape}."
+            )
 
     # Pre-centering support depends on kernel AND builder. Centering orthogonalizes the
     # intercept from the effects, so the mean-field factorization q(b0) prod q(b_l) -- whose

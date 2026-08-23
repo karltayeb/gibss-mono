@@ -128,6 +128,38 @@ def test_gaussian_q_matches_brute_posterior():
     assert np.median(v_fit / gv) == pytest.approx(1.0, abs=0.05)
 
 
+def test_known_per_row_prior_variance():
+    # var(b0i) = sigma^2_i, a KNOWN per-row (heteroskedastic) prior: passed as a length-n
+    # vector, fixed (not estimated). Tight-prior rows (small sigma^2_i) are shrunk harder, so
+    # their posterior variance v_i is smaller than the loose-prior rows'.
+    X, y = _sim_logistic_ri(seed=9, n=400)
+    n = X.shape[0]
+    tight = np.arange(n) < n // 2
+    s2 = np.where(tight, 0.02, 4.0)  # known per-row prior variances
+    st = fit_glm_susie(X, y, L=3, method="cf_cavi", random_intercept=True,
+                       random_intercept_variance=s2, max_iter=40)
+    fs = st.family_state
+    np.testing.assert_allclose(np.asarray(fs.random_intercept_prior_variance), s2)
+    v = np.asarray(fs.random_intercept_var)
+    assert v[tight].mean() < 0.05          # v_i ~ 1/(w_i + 1/sigma^2_i), tiny sigma^2 -> tiny v
+    assert v[~tight].mean() > 5 * v[tight].mean()
+    assert np.isfinite(fs.random_intercept_kl)
+    assert 5 in st.get_credible_sets()[0]
+
+
+def test_known_per_row_prior_variance_guards():
+    # a per-row vector cannot be EM-estimated, and must have length n.
+    X, y = _sim_logistic_ri(seed=10, n=300)
+    good = np.full(X.shape[0], 0.5)
+    with pytest.raises(ValueError, match="not estimable"):
+        fit_glm_susie(X, y, L=2, method="cf_cavi", random_intercept=True,
+                      random_intercept_variance=good,
+                      estimate_random_intercept_variance=True, max_iter=3)
+    with pytest.raises(ValueError, match="length"):
+        fit_glm_susie(X, y, L=2, method="cf_cavi", random_intercept=True,
+                      random_intercept_variance=np.full(X.shape[0] - 1, 0.5), max_iter=3)
+
+
 def test_off_is_inert():
     # a random_intercept=False fit is unchanged: no factor on the state and identical PIPs
     # to the same fit constructed without the argument.

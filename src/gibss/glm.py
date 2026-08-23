@@ -173,7 +173,11 @@ class GLMFamilyState:
     random_intercept: bool = False
     random_intercept_mean: object = None  # (n,) posterior means m_i (None = off / uninit)
     random_intercept_var: object = None  # (n,) posterior variances v_i
-    random_intercept_prior_variance: float = 1.0  # sigma^2_ri, the prior N(0, sigma^2_ri)
+    # sigma^2_ri: the prior variance of b0i ~ N(0, sigma^2_ri). A SCALAR (homogeneous, the
+    # EBNM/estimable case) OR a per-row (n,) vector of KNOWN variances var(b0i)=sigma^2_i (a
+    # heteroskedastic prior; not estimable from one observation per row, so it must stay
+    # fixed). Broadcasts through the per-row Newton and the KL either way.
+    random_intercept_prior_variance: object = 1.0
     random_intercept_kl: float = 0.0  # sum_i KL(N(m_i, v_i) || N(0, sigma^2_ri))
     # EBNM (heteroskedastic normal-means) M-step sigma^2 = mean_i(m_i^2 + v_i). OFF by
     # default: sigma^2 is weakly identified for an observation-level random effect (a flat
@@ -807,7 +811,7 @@ def _random_intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     N(0, sigma^2). The random intercept's OWN v_i is excluded from the table (mean-field).
     Returns (m, v), each (n,)."""
     fs = state.family_state
-    s2 = fs.random_intercept_prior_variance
+    s2 = jnp.asarray(fs.random_intercept_prior_variance)  # scalar or per-row (n,)
     inv_s2 = 1.0 / s2
     response = fs.response
     aux = _build_offset_table(data, state, list(state.single_effects), _intercept_ov(state))
@@ -850,7 +854,7 @@ def _random_intercept_point(data, state, n_iter=50, tol=1e-8):
     same plug-in semantics under which the effects drop the offset variance. v_i is the
     per-row Laplace variance 1/(w_i + 1/sigma^2). Returns (m, v), each (n,)."""
     fs = state.family_state
-    s2 = fs.random_intercept_prior_variance
+    s2 = jnp.asarray(fs.random_intercept_prior_variance)  # scalar or per-row (n,)
     inv_s2 = 1.0 / s2
     base = fs.response.base if isinstance(fs.response, Smoothed) else fs.response
     y = jnp.asarray(data.y)
@@ -902,9 +906,17 @@ def estimate_random_intercept_step(data, state):
         m, v = _random_intercept_point(data, state)
     s2 = fs.random_intercept_prior_variance
     if fs.estimate_random_intercept_variance:
-        s2 = float(jnp.mean(m**2 + v))
+        if jnp.ndim(s2) != 0:
+            raise ValueError(
+                "estimate_random_intercept_variance=True estimates a single scalar sigma^2, "
+                "but random_intercept_variance is a per-row vector (a KNOWN heteroskedastic "
+                "prior var(b0i)=sigma^2_i). A per-row variance has one observation each and is "
+                "not estimable -- keep estimate_random_intercept_variance=False with it."
+            )
+        s2 = float(jnp.mean(m**2 + v))  # EBNM (normal-means) M-step
     v = jnp.maximum(v, 1e-12)
-    kl = float(jnp.sum(0.5 * (v / s2 + m**2 / s2 - 1.0 + jnp.log(s2 / v))))
+    s2a = jnp.asarray(s2)  # scalar or per-row (n,); the KL sums the per-row factors either way
+    kl = float(jnp.sum(0.5 * (v / s2a + m**2 / s2a - 1.0 + jnp.log(s2a / v))))
     return replace(
         state,
         family_state=replace(
