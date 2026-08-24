@@ -1,3 +1,9 @@
+"""Gene-set-enrichment summaries of a fitted GIBSS model: credible sets rendered as gene
+sets, with set names, sizes, gene-list overlap, and cross-component redundancy. This module
+is GSEA-specific. The general, domain-agnostic per-effect summary (credible set, ser_log_bf,
+effect size, prior variance, purity) lives in `gibss.summary.summarize_fit`.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
