@@ -47,6 +47,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
+from .cf_offset import CharFnOffset
 from .linear import is_bcoo
 from .poisson_offset import (
     log_kappa_dense,
@@ -278,5 +279,148 @@ def compute_elbo(
             intercept_kl=intercept_kl,
             base_measure=base_measure,
             is_q1=is_q1,
+        )
+    return elbo
+
+
+def _q2_gaussian_pieces(data, state):
+    """Shared prologue for the Gaussian-state (Q2) ELBO variants below. Validates that every
+    effect is a Gaussian factor (`b_nodes is None` -- a free-form Q1 effect is rejected), and
+    returns `(base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects)`: the base
+    response, the predictor mean `E[eta]` (with the shared/random intercept MEANS folded in),
+    the two homogeneous zero-mean Gaussian variances and KLs (shared intercept `v0`, random
+    intercept per-row `v_i`), the summed effect KL, and the effects list."""
+    fs = state.family_state
+    base = fs.response.base if isinstance(fs.response, Smoothed) else fs.response
+    effects = list(state.single_effects)
+    if not effects:
+        raise ValueError("state has no single effects to score.")
+    if any(e.b_nodes is not None for e in effects):
+        raise ValueError(
+            "a Q2-compatible state is required (Gaussian effect factors, b_nodes is None); a "
+            "free-form Q1 effect has no closed-form transform here -- score it with "
+            "compute_elbo."
+        )
+    eta = _predictor_mean(data, state)
+    integrate_b0 = fs.intercept == "shared"
+    intercept_var = float(getattr(fs, "intercept_var", 0.0)) if integrate_b0 else 0.0
+    intercept_kl = float(getattr(fs, "intercept_kl", 0.0)) if integrate_b0 else 0.0
+    ri_on = getattr(fs, "random_intercept", False)
+    _ri_var = getattr(fs, "random_intercept_var", None)
+    ri_var = jnp.asarray(_ri_var) if (ri_on and _ri_var is not None) else 0.0
+    ri_kl = float(getattr(fs, "random_intercept_kl", 0.0)) if ri_on else 0.0
+    kl = float(sum(float(e.kl) for e in effects))
+    return base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects
+
+
+def compute_elbo_gaussian(
+    data, state, *, M: int = 64, include_base_measure: bool = True,
+    return_breakdown: bool = False,
+):
+    r"""Exact Q2 ELBO of a Gaussian-effect state via the characteristic-function integrator --
+    the fast, Q2-only path where `compute_elbo` canonicalizes to Compress. Computes the SAME
+    quantity `F(q) = E_q[log p(y|eta)] - KL` (agreeing with `compute_elbo` up to quadrature),
+    but folds the offset with the exact CF product instead of the Compress quadrature peel.
+
+    Requires a Q2-compatible state: every effect must be a Gaussian factor `N(mu, var)`
+    (`b_nodes is None`); a free-form Q1 effect has no closed-form characteristic function and
+    is rejected. Base dispatch follows the model's "cf" family: the Bernoulli (logistic) base
+    uses the exact CF product (`CharFnOffset`); the Poisson (log-link) base uses the analytic
+    log-normal MGF (the CF at t = -i), identical to `compute_elbo`. Other bases (e.g. Gaussian,
+    whose offset integral is closed-form) are not a CF case -- use `compute_elbo`.
+
+    The shared intercept and the random intercept fold in exactly as in `compute_elbo`: their
+    means ride in `E[eta]`, their variances into the CF `offset_var`, and their KLs are
+    subtracted. `M` sets the CF residual degree; the frequency grid auto-sizes to the offset
+    support, so a very large offset variance can make CF expensive (or exceed its grid cap)
+    where Compress would not -- `compute_elbo` is the robust fallback there.
+
+    Returns the ELBO as a float, or an `ELBOBreakdown` (`is_q1=False`).
+    """
+    from .glm import _build_offset_table  # circular-import guard (glm imports response/engine)
+
+    base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects = _q2_gaussian_pieces(
+        data, state
+    )
+    y = jnp.asarray(data.y)
+    fs = state.family_state
+    if isinstance(base, Poisson):
+        # analytic log-normal MGF (the CF at t = -i): identical to compute_elbo's Poisson path.
+        ll = _poisson_expected_ll(
+            data, state, eta, False, fs.intercept == "shared", intercept_var, ri_var
+        )
+    elif isinstance(base, Bernoulli):
+        # exact CF product over the effects' Gaussian mixtures + the homogeneous zero-mean
+        # Gaussians (intercept v0 + random intercept v_i) via offset_var; scored at E[eta].
+        smoother = CharFnOffset(M=M)
+        scored = replace(
+            state,
+            family_state=replace(fs, response=Smoothed(base, smoother), kernel="vi_gh"),
+        )
+        aux = _build_offset_table(data, scored, effects, intercept_var + ri_var)
+        ll = smoother.terms(base, eta, aux)[0]
+    else:
+        raise TypeError(
+            "compute_elbo_gaussian scores the Bernoulli base (CF) and the Poisson base "
+            f"(analytic MGF); got {type(base).__name__}. Use compute_elbo."
+        )
+
+    base_measure = _base_measure(base, y) if include_base_measure else 0.0
+    expected_loglik = float(jnp.sum(ll)) + base_measure
+    elbo = expected_loglik - kl - intercept_kl - ri_kl
+    if return_breakdown:
+        return ELBOBreakdown(
+            elbo=elbo, expected_loglik=expected_loglik, kl=kl,
+            intercept_kl=intercept_kl, base_measure=base_measure, is_q1=False,
+        )
+    return elbo
+
+
+def compute_elbo_jj(
+    data, state, *, include_base_measure: bool = True, return_breakdown: bool = False,
+):
+    r"""Jaakkola-Jordan lower bound to the Q2 ELBO of a Gaussian-effect state, with the
+    per-row tilts fit optimally on the fly. Logistic base only (the JJ bound is
+    logistic-specific).
+
+    The JJ bound `log(1+e^eta) <= log(1+e^xi) + (eta-xi)/2 + lambda(xi)(eta^2 - xi^2)` has a
+    per-row variational parameter `xi_i`; maximizing over it gives `xi_i^2 = E_q[eta_i^2] =
+    E[eta_i]^2 + Var[eta_i]` (globaljj's tilt), at which the quadratic term vanishes, so
+
+        E_q[log p(y_i|eta_i)] >= y_i E[eta_i] - softplus(xi_i) - (E[eta_i] - xi_i)/2.
+
+    `Var[eta_i]` is the full predictor variance: the effects' aggregate message variance plus
+    the shared intercept's `v0` and the random intercept's `v_i`. The JJ ELBO subtracts the
+    same per-effect / intercept / random-intercept KLs as `compute_elbo`.
+
+    Because the JJ bound is a LOWER bound to the exact log-likelihood, this is `<=` the exact
+    ELBO of the SAME `q` (`compute_elbo` / `compute_elbo_gaussian`) -- it is the objective
+    globaljj maximizes, evaluated on whatever Gaussian posterior you pass. Only the first two
+    moments of `eta` are used, so any Q2-compatible state works; the effects must be Gaussian
+    (b_nodes is None) for the moment reads to be the whole story.
+
+    Returns the ELBO as a float, or an `ELBOBreakdown` (`is_q1=False`).
+    """
+    base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects = _q2_gaussian_pieces(
+        data, state
+    )
+    if not isinstance(base, Bernoulli):
+        raise TypeError(
+            "compute_elbo_jj is defined for the Bernoulli (logistic) base only (the JJ bound "
+            f"is logistic-specific); got {type(base).__name__}."
+        )
+    y = jnp.asarray(data.y)
+    # full predictor variance Var[eta_i] = sum-of-effect vars + shared intercept v0 + ri v_i.
+    v_eta = jnp.asarray(state.total_message.var) + intercept_var + jnp.asarray(ri_var)
+    xi = jnp.sqrt(jnp.maximum(eta**2 + v_eta, 0.0))  # optimal tilt xi_i^2 = E[eta_i^2]
+    # JJ lower bound at the optimal tilt (the quadratic term lambda(xi)(E[eta^2]-xi^2) is 0).
+    jj_ll = y * eta - jax.nn.softplus(xi) - 0.5 * (eta - xi)
+    base_measure = _base_measure(base, y) if include_base_measure else 0.0  # 0 for Bernoulli
+    expected_loglik = float(jnp.sum(jj_ll)) + base_measure
+    elbo = expected_loglik - kl - intercept_kl - ri_kl
+    if return_breakdown:
+        return ELBOBreakdown(
+            elbo=elbo, expected_loglik=expected_loglik, kl=kl,
+            intercept_kl=intercept_kl, base_measure=base_measure, is_q1=False,
         )
     return elbo
