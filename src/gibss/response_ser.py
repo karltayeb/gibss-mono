@@ -21,7 +21,13 @@ import jax.numpy as jnp
 from .engine import BaseSERState
 from .operators import DesignOperator
 from .response import GH, Bernoulli, JJFixed, ResponseModel, Smoothed
-from ._numerics import _cheb_fit_matrix, _clenshaw, _gh_rule, _normal_logpdf
+from ._numerics import (
+    _cheb_fit_matrix,
+    _clenshaw,
+    _clenshaw_batched,
+    _gh_rule,
+    _normal_logpdf,
+)
 
 __all__ = [
     "glm_ser",
@@ -480,6 +486,154 @@ def glm_jj_ser(
     return m, v, elbo_rel - kl, kl
 
 
+
+
+def _clenshaw2d(coeffs, ta, tb):
+    """Evaluate the 2-D Chebyshev sum `sum_{j,k} coeffs[j,k] T_j(ta) T_k(tb)` at points
+    `(ta, tb)` (each (p,)); `coeffs` is (D+1, D+1). Inner Clenshaw over the k (tb) axis, then
+    the j (ta) axis."""
+    cj = _clenshaw_batched(coeffs[None, :, :], tb[:, None])  # (p, D+1): contract k at tb
+    return _clenshaw_batched(cj, ta)  # (p,): contract j at ta
+
+
+def _jj_center_background(response, offset, y, ov, a, bvar, shift_eta, mode, degree):
+    """All-rows off-support sums `(W, G, L) = sum_i terms(eta_i, (y_i, ov_i, xi_ij))` for the
+    sparse-centered JJ fold. The fill puts the tilt at `xi_ij = sqrt((offset_i - a_j)^2 +
+    bvar_j + ov_i)`, with TWO per-feature params: the mean shift `a_j = c_j m_j` and the
+    variance add `bvar_j = c_j^2 v_j`. `eta_i = offset_i - a_j` when `shift_eta` (the evidence,
+    at the posterior-mean predictor), else `offset_i` (the update, at b = 0). `a, bvar` (p,).
+
+    `mode="exact"` forms the (n, p) grid (validation / small p); "chebyshev" fits a 2-D
+    surrogate over the (a, bvar) box on a (degree+1)^2 CGL grid -- O(n D^2) fit + O(D^2 p)
+    eval, the sparse win, since only the O(nnz) support entries are corrected downstream."""
+    offset = jnp.asarray(offset)
+    y = jnp.asarray(y)
+    ov = jnp.asarray(ov)
+    a = jnp.asarray(a)
+    bvar = jnp.asarray(bvar)
+
+    def eval_sums(a_g, b_g):
+        # a_g, b_g broadcast against offset[:, None...]; returns (W, G, L) summed over rows.
+        em = offset.reshape((-1,) + (1,) * (a_g.ndim)) - a_g[None, ...]
+        ov_b = ov.reshape((-1,) + (1,) * a_g.ndim) if ov.ndim else ov
+        xi = jnp.sqrt(jnp.maximum(em**2 + b_g[None, ...] + ov_b, 1e-12))
+        eta = em if shift_eta else jnp.broadcast_to(
+            offset.reshape((-1,) + (1,) * a_g.ndim), xi.shape
+        )
+        yb = y.reshape((-1,) + (1,) * a_g.ndim)
+        ll, g, w = response.terms(eta, (yb, ov_b, xi))
+        return jnp.sum(w, 0), jnp.sum(g, 0), jnp.sum(ll, 0)
+
+    if mode == "exact":
+        return eval_sums(a, bvar)  # (p,) each, via (n, p) grid
+
+    xnodes_np, P_np = _cheb_fit_matrix(degree)
+    xnodes, P = jnp.asarray(xnodes_np), jnp.asarray(P_np)
+    a_lo, a_hi = jnp.min(a) - 0.5, jnp.max(a) + 0.5
+    b_lo, b_hi = jnp.maximum(jnp.min(bvar) - 0.5, 0.0), jnp.max(bvar) + 0.5
+    a_nodes = 0.5 * (a_hi + a_lo) + 0.5 * (a_hi - a_lo) * xnodes  # (D+1,)
+    b_nodes = 0.5 * (b_hi + b_lo) + 0.5 * (b_hi - b_lo) * xnodes  # (D+1,)
+    grid_a = jnp.broadcast_to(a_nodes[:, None], (degree + 1, degree + 1))  # (D+1, D+1)
+    grid_b = jnp.broadcast_to(b_nodes[None, :], (degree + 1, degree + 1))
+    Wg, Gg, Lg = eval_sums(grid_a, grid_b)  # (D+1, D+1) node grids
+    cW, cG, cL = P @ Wg @ P.T, P @ Gg @ P.T, P @ Lg @ P.T
+    ta = (2.0 * a - (a_hi + a_lo)) / (a_hi - a_lo)  # (p,) -> [-1, 1]
+    tb = (2.0 * bvar - (b_hi + b_lo)) / (b_hi - b_lo)
+    return _clenshaw2d(cW, ta, tb), _clenshaw2d(cG, ta, tb), _clenshaw2d(cL, ta, tb)
+
+
+@partial(jax.jit, static_argnames=("response", "n_iter", "background", "degree"))
+def glm_jj_center_ser(
+    op,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Smoothed(Bernoulli(), JJFixed()),
+    n_iter: int = 100,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 16,
+):
+    """Sparse-CENTERED conjugate JJ SER: localjj on `eta = offset + (x_ij - c_j) b`, the
+    centered analogue of `glm_jj_ser`. A zero design entry is not a point mass at o=0 but the
+    fill `-c_j`, and the JJ tilt there is `xi^2 = (offset - c_j m)^2 + c_j^2 v + ov` -- TWO
+    per-feature params (mean shift `c_j m`, variance add `c_j^2 v`). So the all-rows
+    off-support background is a 2-D Chebyshev surrogate in `(a=c m, bvar=c^2 v)`
+    (`_jj_center_background`), corrected on the O(nnz) support entries, exactly as
+    `glm_center_ser` splits the quad kernel with the 1-D `_background`. `center` is c (p,),
+    GIVEN. The evidence is the JJ ELBO (a certified lower bound), integrated exactly. Returns
+    (m, v, log_bf, coefficient_kl); shared intercept only."""
+    if not (isinstance(response, Smoothed) and isinstance(response.smoother, JJFixed)):
+        raise TypeError(
+            "glm_jj_center_ser needs a fixed-tilt quadratic-bound response "
+            f"(Smoothed(Bernoulli(), JJFixed())); got {response!r}."
+        )
+    y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
+    y = jnp.asarray(y)
+    offset = jnp.asarray(offset)
+    ov = jnp.asarray(ov)
+    c = jnp.asarray(center)
+    x = op.entry_x
+    y_e = op.broadcast_rows(y)
+    off_e = op.broadcast_rows(offset)
+    ov_e = op.broadcast_rows(ov) if ov.ndim else ov
+    c_e = op.broadcast_cols(c)
+    xc_e = x - c_e  # (x_ij - c_j) at support entries
+    inv_pv = 1.0 / prior_variance
+
+    def update_moments(m, v):
+        # score M1 and curvature M2 per feature at eta = offset (b = 0), tilt from (m, v).
+        # w = 2 lambda(xi) depends only on the tilt, so M2 is also the evidence curvature.
+        m_e, v_e = op.broadcast_cols(m), op.broadcast_cols(v)
+        a, bvar = c * m, c**2 * v  # 2-D background params (p,)
+        em_s = off_e + xc_e * m_e  # eta_mean (support) -- only its square feeds the tilt
+        xi_s = jnp.sqrt(jnp.maximum(em_s**2 + xc_e**2 * v_e + ov_e, 1e-12))
+        em_b = off_e - c_e * m_e  # fill eta_mean at support rows (the correction)
+        xi_b = jnp.sqrt(jnp.maximum(em_b**2 + c_e**2 * v_e + ov_e, 1e-12))
+        _, g_s, w_s = response.terms(off_e, (y_e, ov_e, xi_s))
+        _, g_b, w_b = response.terms(off_e, (y_e, ov_e, xi_b))
+        BGw, BGg, _ = _jj_center_background(
+            response, offset, y, ov, a, bvar, False, background, degree
+        )
+        M1 = op.local_moment(0, xc_e * g_s) - c * (BGg - op.local_moment(0, g_b))
+        M2 = op.local_moment(0, xc_e**2 * w_s) + c**2 * (BGw - op.local_moment(0, w_b))
+        return M1, M2
+
+    def body(state):
+        m, v, _, it = state
+        M1, M2 = update_moments(m, v)
+        v_new = 1.0 / (inv_pv + M2)
+        m_new = v_new * M1
+        return m_new, v_new, jnp.max(jnp.abs(m_new - m)), it + 1
+
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol),
+        body,
+        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    )
+    m = jnp.where(jnp.isfinite(m), m, 0.0)
+    v = jnp.where(jnp.isfinite(v), v, prior_variance)
+
+    # evidence: E_q[ll] = ll(E eta) - (tau/2)(x-c)^2 v (quadratic bound), all rows. ll at the
+    # posterior mean eta_mean = offset + (x-c) m (fill: offset - c m, shift_eta=True); the b=0
+    # null (xi0^2 = offset^2 + ov) is feature-independent, so its all-rows sum is one scalar.
+    _, M2 = update_moments(m, v)
+    m_e, v_e = op.broadcast_cols(m), op.broadcast_cols(v)
+    a, bvar = c * m, c**2 * v
+    em_s = off_e + xc_e * m_e
+    xi_s = jnp.sqrt(jnp.maximum(em_s**2 + xc_e**2 * v_e + ov_e, 1e-12))
+    em_b = off_e - c_e * m_e
+    xi_b = jnp.sqrt(jnp.maximum(em_b**2 + c_e**2 * v_e + ov_e, 1e-12))
+    ll_s = response.terms(em_s, (y_e, ov_e, xi_s))[0]
+    ll_b = response.terms(em_b, (y_e, ov_e, xi_b))[0]
+    _, _, BGl = _jj_center_background(response, offset, y, ov, a, bvar, True, background, degree)
+    L = BGl + op.local_moment(0, ll_s - ll_b)  # sum over ALL rows of ll at eta_mean (per j)
+    xi0 = jnp.sqrt(jnp.maximum(offset**2 + ov, 1e-12))
+    L0 = jnp.sum(response.terms(offset, (y, ov, xi0))[0])
+    elbo_rel = (L - L0) - 0.5 * v * M2
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    return m, v, elbo_rel - kl, kl
 
 
 def _require_quadratic(kernel_name, response):

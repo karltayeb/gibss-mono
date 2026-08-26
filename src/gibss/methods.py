@@ -390,7 +390,7 @@ def fit_glm_susie(
         if center is None:
             center = False
     else:
-        center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear")
+        center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear", "jj")
         if center is None:
             center = center_supported
         elif center and not center_supported:

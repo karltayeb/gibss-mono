@@ -186,14 +186,18 @@ def test_linear_kernel_sparse_centered_matches_dense():
 
 
 def test_explicit_center_true_unsupported_sparse_raises():
-    # an EXPLICIT center=True on a sparse + non-quad kernel is a clear front-door error,
-    # not a deep NotImplementedError from the dispatch.
+    # kernel='vi' still lacks a sparse centered fold (jj got the 2-D background; vi's
+    # per-entry variance needs the same and is pending), so an EXPLICIT center=True there is
+    # a clear front-door error, not a deep NotImplementedError from the dispatch.
     import jax
     from jax.experimental import sparse
     X, y = _data("logistic")
     Xs = sparse.BCOO.fromdense(jax.numpy.asarray(X))
     with pytest.raises(ValueError, match="center=True is not supported"):
-        fit_glm_susie(Xs, y, method="localjj", center=True, max_iter=5)
+        fit_glm_susie(
+            Xs, y, variational_family="gaussian", offset_integration="gh",
+            center=True, max_iter=5,
+        )
 
 
 def test_center_and_adaptive_background_front_door():

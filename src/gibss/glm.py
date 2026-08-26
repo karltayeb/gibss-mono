@@ -44,6 +44,7 @@ from .response_ser import (
     _profile_null,
     build_ser_state,
     glm_center_ser_nodes,
+    glm_jj_center_ser,
     glm_jj_ser,
     glm_linear_profile_ser,
     glm_linear_ser,
@@ -465,18 +466,28 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
                 order=order, background=bg,
             )
             return mu, var, log_bf, coefficient_kl, None
+        if fs.kernel == "jj":
+            # conjugate localjj on a centered sparse column: the per-entry tilt puts a SECOND
+            # per-feature param off-support (variance c_j^2 v alongside the mean shift c_j m),
+            # so the -c_j fill background is a 2-D Chebyshev surrogate in (c m, c^2 v) +
+            # the O(nnz) support correction (glm_jj_center_ser).
+            bg = "chebyshev" if fs.background == "exact" else fs.background
+            mu, var, log_bf, coefficient_kl = glm_jj_center_ser(
+                op, aux, offset, center, prior_variance, fs.response, background=bg,
+            )
+            return mu, var, log_bf, coefficient_kl, None
         if fs.kernel == "linear":
             # quadratic response: w is constant, so centering is EXACT and row-wise --
             # a CenteredOperator's rank-1 rmatvec/moment(2) corrections carry it (O(nnz)
             # on BCOO, no background). Wrap the op and fall through to the linear branch.
             op = CenteredOperator.from_offsets(op, center)
-        else:  # vi, jj: the entry-space per-entry variance/tilt (x^2 v) becomes a SECOND
-            # per-feature parameter under centering (c_j^2 v_j), which the 1-D background
-            # can't express -- a 2-D surrogate is a follow-up.
+        else:  # vi: the entry-space per-entry variance (x^2 v) becomes a SECOND per-feature
+            # parameter under centering (c_j^2 v_j) that the 1-D background can't express -- a
+            # 2-D surrogate is a follow-up (done for 'jj' above; 'vi' pending).
             raise NotImplementedError(
-                "sparse (BCOO) pre-centering is implemented for kernel='quad', 'vi_gh' "
-                f"and 'linear'; kernel={fs.kernel!r} would silently fit the UNCENTERED "
-                "model (its per-entry variance/tilt adds a second per-feature parameter). "
+                "sparse (BCOO) pre-centering is implemented for kernel='quad', 'vi_gh', "
+                f"'jj' and 'linear'; kernel={fs.kernel!r} would silently fit the UNCENTERED "
+                "model (its per-entry variance adds a second per-feature parameter). "
                 "Pass center=False, or use intercept='profiled' (invariant to shifts)."
             )
     nodes = None  # (b_nodes, log_node_weight) for the plain quad/shared kernel, else None
