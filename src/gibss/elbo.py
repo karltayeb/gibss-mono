@@ -283,13 +283,22 @@ def compute_elbo(
     return elbo
 
 
-def _q2_gaussian_pieces(data, state):
+def _q2_gaussian_pieces(data, state, *, score_intercept=None):
     """Shared prologue for the Gaussian-state (Q2) ELBO variants below. Validates that every
     effect is a Gaussian factor (`b_nodes is None` -- a free-form Q1 effect is rejected), and
     returns `(base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects)`: the base
     response, the predictor mean `E[eta]` (with the shared/random intercept MEANS folded in),
     the two homogeneous zero-mean Gaussian variances and KLs (shared intercept `v0`, random
-    intercept per-row `v_i`), the summed effect KL, and the effects list."""
+    intercept per-row `v_i`), the summed effect KL, and the effects list.
+
+    `score_intercept` overrides how the intercept is scored, independent of how it was fit:
+    None follows the state's own `fs.intercept`; "shared" folds it as a Gaussian factor
+    N(m0, v0) (its variance into the offset, its KL subtracted) even for a "null"/score fit,
+    giving the apples-to-apples full-Q2 ELBO; "null"/"profiled" plugs it in at m0 (no
+    variance, no KL). This is a SCORING choice only -- it never touches q(b_1..b_L). The
+    intercept KL is recomputed from the posterior (m0, v0, tau), not read from the stored
+    field (which reflects the fitting mode and is 0 for a null fit); this is exact for a
+    shared Q2 fit, so it does not change those ELBOs."""
     fs = state.family_state
     base = fs.response.base if isinstance(fs.response, Smoothed) else fs.response
     effects = list(state.single_effects)
@@ -301,10 +310,17 @@ def _q2_gaussian_pieces(data, state):
             "free-form Q1 effect has no closed-form transform here -- score it with "
             "compute_elbo."
         )
-    eta = _predictor_mean(data, state)
-    integrate_b0 = fs.intercept == "shared"
+    eta = _predictor_mean(data, state)  # always folds the intercept MEAN m0 (a plug-in)
+    mode = score_intercept if score_intercept is not None else fs.intercept
+    integrate_b0 = mode == "shared"
     intercept_var = float(getattr(fs, "intercept_var", 0.0)) if integrate_b0 else 0.0
-    intercept_kl = float(getattr(fs, "intercept_kl", 0.0)) if integrate_b0 else 0.0
+    if integrate_b0:
+        m0 = float(getattr(fs, "intercept_value", 0.0))
+        tau = float(getattr(fs, "intercept_prior_variance", 1e6))
+        v0 = max(intercept_var, 1e-300)
+        intercept_kl = float(0.5 * (v0 / tau + m0 * m0 / tau - 1.0 + jnp.log(tau / v0)))
+    else:
+        intercept_kl = 0.0
     ri_on = getattr(fs, "random_intercept", False)
     _ri_var = getattr(fs, "random_intercept_var", None)
     ri_var = jnp.asarray(_ri_var) if (ri_on and _ri_var is not None) else 0.0
@@ -315,7 +331,7 @@ def _q2_gaussian_pieces(data, state):
 
 def compute_elbo_gaussian(
     data, state, *, M: int = 64, include_base_measure: bool = True,
-    return_breakdown: bool = False,
+    return_breakdown: bool = False, score_intercept=None,
 ):
     r"""Exact Q2 ELBO of a Gaussian-effect state via the characteristic-function integrator --
     the fast, Q2-only path where `compute_elbo` canonicalizes to Compress. Computes the SAME
@@ -331,7 +347,10 @@ def compute_elbo_gaussian(
 
     The shared intercept and the random intercept fold in exactly as in `compute_elbo`: their
     means ride in `E[eta]`, their variances into the CF `offset_var`, and their KLs are
-    subtracted. `M` sets the CF residual degree; the frequency grid auto-sizes to the offset
+    subtracted. `score_intercept` overrides how the shared intercept is scored regardless of
+    how it was fit (None = follow the state; "shared" folds it as a Gaussian factor even for a
+    "null"/score fit -- the common full-Q2 yardstick; "null" plugs it in). It is scoring-only
+    and never touches q. `M` sets the CF residual degree; the frequency grid auto-sizes to the offset
     support, so a very large offset variance can make CF expensive (or exceed its grid cap)
     where Compress would not -- `compute_elbo` is the robust fallback there.
 
@@ -340,7 +359,7 @@ def compute_elbo_gaussian(
     from .glm import _build_offset_table  # circular-import guard (glm imports response/engine)
 
     base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects = _q2_gaussian_pieces(
-        data, state
+        data, state, score_intercept=score_intercept
     )
     y = jnp.asarray(data.y)
     fs = state.family_state
@@ -378,10 +397,12 @@ def compute_elbo_gaussian(
 
 def compute_elbo_jj(
     data, state, *, include_base_measure: bool = True, return_breakdown: bool = False,
+    score_intercept=None,
 ):
     r"""Jaakkola-Jordan lower bound to the Q2 ELBO of a Gaussian-effect state, with the
     per-row tilts fit optimally on the fly. Logistic base only (the JJ bound is
-    logistic-specific).
+    logistic-specific). `score_intercept` overrides how the shared intercept is scored (see
+    `compute_elbo_gaussian`); scoring-only, never touches q.
 
     The JJ bound `log(1+e^eta) <= log(1+e^xi) + (eta-xi)/2 + lambda(xi)(eta^2 - xi^2)` has a
     per-row variational parameter `xi_i`; maximizing over it gives `xi_i^2 = E_q[eta_i^2] =
@@ -402,7 +423,7 @@ def compute_elbo_jj(
     Returns the ELBO as a float, or an `ELBOBreakdown` (`is_q1=False`).
     """
     base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects = _q2_gaussian_pieces(
-        data, state
+        data, state, score_intercept=score_intercept
     )
     if not isinstance(base, Bernoulli):
         raise TypeError(

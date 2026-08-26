@@ -137,3 +137,54 @@ def test_variants_with_random_intercept():
                        random_intercept_variance=0.5, max_iter=50)
     assert compute_elbo_gaussian(d, st) == pytest.approx(compute_elbo(d, st), abs=1e-6)
     assert compute_elbo_jj(d, st) <= compute_elbo_gaussian(d, st) + 1e-6
+
+
+def test_score_intercept_folds_a_null_fit_as_shared():
+    # a score fit has intercept='null' (plugged in, KL=0). score_intercept='shared' folds it
+    # as a Gaussian factor for an apples-to-apples full-Q2 ELBO: KL recomputed from (m0,v0,tau),
+    # variance folded, so the ELBO drops below the plug-in value and below cf_cavi.
+    X, y = _sim(seed=10)
+    d = prep_data(X, y)
+    sc = fit_glm_susie(X, y, L=3, method="score", max_iter=40)
+    cf = fit_glm_susie(X, y, L=3, method="cf_cavi", max_iter=40)
+    assert sc.family_state.intercept == "null"
+    e_plug = compute_elbo_gaussian(d, sc)                                # as-is: intercept plugged in
+    b_fold = compute_elbo_gaussian(d, sc, score_intercept="shared", return_breakdown=True)
+    assert compute_elbo_gaussian(d, sc, return_breakdown=True).intercept_kl == 0.0
+    assert b_fold.intercept_kl > 1.0                                     # recomputed, no longer 0
+    assert b_fold.elbo < e_plug                                          # folding subtracts the KL
+    assert b_fold.elbo < compute_elbo_gaussian(d, cf)                    # apples-to-apples
+
+
+def test_score_intercept_none_is_exact_for_shared_fit():
+    # for a genuine shared fit, recomputing the KL from the posterior equals the stored field,
+    # so the default (score_intercept=None) ELBO is unchanged.
+    X, y = _sim(seed=11)
+    d = prep_data(X, y)
+    st = fit_glm_susie(X, y, L=3, method="cf_cavi", max_iter=40)
+    b = compute_elbo_gaussian(d, st, return_breakdown=True)
+    assert b.intercept_kl == pytest.approx(float(st.family_state.intercept_kl), abs=1e-9)
+
+
+def test_score_intercept_null_plugs_in_a_shared_fit():
+    # the reverse override: score a shared fit with the intercept plugged in (no KL), which
+    # raises the ELBO by the omitted intercept KL.
+    X, y = _sim(seed=12)
+    d = prep_data(X, y)
+    st = fit_glm_susie(X, y, L=3, method="cf_cavi", max_iter=40)
+    folded = compute_elbo_gaussian(d, st)
+    plugged = compute_elbo_gaussian(d, st, score_intercept="null", return_breakdown=True)
+    assert plugged.intercept_kl == 0.0
+    assert plugged.elbo > folded
+
+
+def test_score_intercept_is_scoring_only():
+    # scoring with the flag never mutates the effect posteriors.
+    X, y = _sim(seed=13)
+    d = prep_data(X, y)
+    sc = fit_glm_susie(X, y, L=3, method="score", max_iter=40)
+    before = [np.asarray(e.mu).copy() for e in sc.single_effects]
+    compute_elbo_gaussian(d, sc, score_intercept="shared")
+    compute_elbo_jj(d, sc, score_intercept="shared")
+    after = [np.asarray(e.mu) for e in sc.single_effects]
+    assert all(np.array_equal(a, b) for a, b in zip(before, after))
