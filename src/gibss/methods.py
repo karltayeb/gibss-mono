@@ -257,6 +257,8 @@ def fit_glm_susie(
     estimate_prior_variance=True,
     prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
     max_prior_variance=None,  # hard ceiling on the estimated prior variance (None = no cap)
+    freeze_prior_variance=None,  # stop updating an effect once its prior variance < this (None
+    # = never); for large L, skips re-fitting effects ARD has driven null. See below.
     estimate_intercept=True,
     random_intercept=False,  # add an iid per-row random intercept b0i ~ N(0, sigma^2_ri)
     random_intercept_variance=1.0,  # sigma^2_ri (fixed value, unless estimated below)
@@ -444,6 +446,17 @@ def fit_glm_susie(
         )
 
     sched = schedule if schedule is not None else glm.default_schedule()
+    if freeze_prior_variance is not None:
+        # once an effect's prior variance shrinks below the threshold, drop it from
+        # update_order so large-L fits stop re-fitting the null effects (ARD-pruned).
+        from functools import partial
+        from .engine import add_step, freeze_shrunk_effects_step
+        sched = add_step(
+            sched,
+            after_sweep=partial(
+                freeze_shrunk_effects_step, min_prior_variance=float(freeze_prior_variance)
+            ),
+        )
     if greedy:
         return fit_ibss_greedy(
             data, state, sched, tol_L=tol_L, stride=stride, max_L=L_alloc,

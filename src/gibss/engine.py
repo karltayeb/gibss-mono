@@ -196,6 +196,36 @@ def add_message_index_step(data, l, state):
     return replace(state, total_message=new_message)
 
 
+def freeze_shrunk_effects_step(data, state, *, min_prior_variance, warmup=1, min_active=1):
+    """after_sweep hook: stop updating effects whose estimated prior variance has fallen below
+    `min_prior_variance` by dropping them from `update_order`. In a large-L fit this keeps
+    sweeps from re-fitting effects that have already gone null (ARD shrank their prior variance
+    to ~0): such an effect has mu ~ 0, so its frozen ~0 message leaves every other effect's
+    offset unchanged. Waits `warmup` completed sweeps so the prior variances settle before any
+    freezing, and keeps at least `min_active` effects so a fit never collapses to nothing.
+
+    Installed on the schedule only when the caller asks to freeze; the frozen effects stay in
+    the state at their last (null) posterior. Note for CAVI: this skips a frozen effect's own
+    update and its offset-table construction, but it does NOT remove it from the OTHER effects'
+    offset folds (those still fold every effect) -- that is a separate optimization."""
+    del data
+    if state.n_iter < warmup:
+        return state
+    order = state.update_order
+    keep = tuple(
+        l for l in order
+        if float(state.single_effects[l].prior_variance) >= min_prior_variance
+    )
+    if len(keep) < min_active:  # floor: keep the strongest by prior variance, never empty
+        keep = tuple(
+            sorted(order, key=lambda l: float(state.single_effects[l].prior_variance),
+                   reverse=True)[:min_active]
+        )
+    if keep == order:
+        return state
+    return replace(state, update_order=keep)
+
+
 @dataclass(frozen=True, slots=True)
 class Schedule:
     before_fit: tuple[Step, ...] = (identity_step,)
