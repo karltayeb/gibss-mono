@@ -360,14 +360,38 @@ def test_breakdown_consistency_and_return_types():
     assert bd.base_measure == 0.0  # Bernoulli
 
 
-def test_profiled_intercept_is_plugged_in():
-    # a profiled intercept is a point (b0 profiled per feature inside the kernel), so it is
-    # NOT integrated and carries no b0 KL.
+def test_profiled_intercept_reference_is_integrated():
+    # a profiled fit decouples b0 per feature during inference, but after convergence it stores
+    # a global REFERENCE factor q(b0)=N(m0, v0) (reference_intercept_step). The ELBO integrates
+    # that reference and charges its KL -- an approximate Q2 ELBO -- and it matches the ELBO of
+    # the same fit with a genuine shared intercept (profiling barely moves inference).
+    X, y = _bern_data(3)
+    data = glm.prep_data(X, y, center=False)
+    prof = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled", **_fit_kw())
+    shared = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="shared", **_fit_kw())
+    fs, fss = prof.family_state, shared.family_state
+    assert fs.intercept == "profiled"
+    assert float(fs.intercept_var) > 0.0 and float(fs.intercept_kl) > 0.0
+    # the reference q(b0) matches the genuine shared-intercept fit's q(b0) (the two agree
+    # because profiling barely moves inference on this data).
+    assert float(fs.intercept_value) == pytest.approx(float(fss.intercept_value), abs=0.05)
+    assert float(fs.intercept_var) == pytest.approx(float(fss.intercept_var), abs=1e-3)
+    bd = compute_elbo(data, prof, return_breakdown=True)
+    bs = compute_elbo(glm.prep_data(X, y, center=False), shared, return_breakdown=True)
+    assert bd.intercept_kl == pytest.approx(float(fs.intercept_kl), abs=1e-12)
+    assert bd.elbo == pytest.approx(bs.elbo, abs=0.2)
+
+
+def test_profiled_intercept_no_estimate_is_plugged_in():
+    # with estimate_intercept=False the profiled fit has NO reference factor, so the ELBO
+    # falls back to plugging in the (zero) point intercept and charges no b0 KL.
     X, y = _bern_data(0)
-    st = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled", **_fit_kw())
+    st = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled",
+                       estimate_intercept=False, **_fit_kw())
     data = glm.prep_data(X, y, center=False)
     bd = compute_elbo(data, st, return_breakdown=True)
     assert st.family_state.intercept == "profiled"
+    assert float(st.family_state.intercept_var) == 0.0
     assert bd.intercept_kl == 0.0
 
 

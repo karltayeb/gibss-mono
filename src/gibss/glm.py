@@ -85,17 +85,18 @@ class GLMFamilyState:
     #   "shared"   -- refit each sweep at the total predictor (estimate_intercept_step);
     #                 conditional per-feature curvature. The default.
     #   "profiled" -- a per-feature b0_j is profiled INSIDE the kernel (Schur
-    #                 curvature; offset-shift-invariant evidence); no shared step.
+    #                 curvature; offset-shift-invariant evidence); no shared step, but a
+    #                 post-hoc global reference q(b0) is stored (reference_intercept_step).
     #   "null"     -- fit ONCE at the b = 0 null model (in initialize_state), then
     #                 frozen: the score-analysis intercept.
     intercept: str = "shared"
     intercept_value: float = 0.0
-    # intercept_var: posterior variance of the shared intercept -- q(b0) =
+    # intercept_var: posterior variance of the intercept factor -- q(b0) =
     # N(intercept, intercept_var), the Gaussian variational factor whose coordinate
     # update is exactly estimate_intercept's Newton + v0 = 1/(sum_i w_i + 1/tau).
     # Flows into the smoothers' ov alongside the message variance (a CONSTANT per
-    # row, O(1/n)); dropped under MeanMessage (mean-only mode) and irrelevant under
-    # kernel="profile" (b0 is profiled per feature inside the kernel instead).
+    # row, O(1/n)); dropped under MeanMessage (mean-only mode). For a profiled intercept
+    # this holds the post-hoc reference q(b0)'s variance (0 during inference itself).
     intercept_var: float = 0.0
     # intercept_prior_variance: the (diffuse) Gaussian prior on the shared intercept,
     # q(b0) ~ N(0, tau). Applied UNIFORMLY by all three shared-intercept fitters
@@ -107,8 +108,9 @@ class GLMFamilyState:
     # per-feature b0 stay flat/exact, and non-GLM callers of estimate_intercept (linear/
     # cox/legacy, whose family_state lacks this field) fall back to flat.
     intercept_prior_variance: float = 1e6
-    # intercept_kl: KL(q(b0) || N(0, intercept_prior_variance)) of the shared intercept
-    # factor, set by estimate_intercept_step (0 for profiled/null -- b0 is a point).
+    # intercept_kl: KL(q(b0) || N(0, intercept_prior_variance)) of the intercept factor, set
+    # by estimate_intercept_step (shared) or reference_intercept_step (profiled reference); 0
+    # for null, or profiled with estimate_intercept=False -- b0 is a plugged-in point there.
     # The ELBO subtracts it exactly as it subtracts each effect's kl.
     intercept_kl: float = 0.0
     estimate_intercept: bool = True
@@ -793,12 +795,14 @@ def _cavi_mode(fs):
     return "plugin"
 
 
-def estimate_intercept_step(data, state):
-    """Route the SHARED intercept to the strategy matching the effect family. (profiled: b0
-    is per-feature inside the kernel; null: frozen since init -- neither refits here.)"""
+def _estimate_shared_intercept(data, state):
+    """Compute the intercept factor q(b0) against the current effects and return the
+    family_state update dict. Routed by the CAVI mode: free-form q(b0) in Q1, Gaussian
+    N(m0, v0) in Q2, and the point/Laplace factor otherwise. Shared by the per-sweep shared
+    intercept update (`estimate_intercept_step`) and the post-fit reference intercept for a
+    profiled fit (`reference_intercept_step`) -- both want the same global b0 given the
+    effects, so they route identically."""
     fs = state.family_state
-    if fs.intercept != "shared" or not fs.estimate_intercept:
-        return state
     tau = fs.intercept_prior_variance
     mode = _cavi_mode(fs)
     if mode == "q1":
@@ -806,15 +810,41 @@ def estimate_intercept_step(data, state):
         # the nodes ride for the zero-mean fold as the intercept's additive effect. The KL
         # is the exact free-form coefficient KL against N(0, tau).
         m0, v0, b0n, lw0, kl = _intercept_freeform(data, state, order=fs.quadrature_order)
-        upd = dict(intercept_value=m0, intercept_var=v0, intercept_kl=kl,
-                   intercept_b_nodes=b0n, intercept_log_node_weight=lw0)
-    else:
-        # Gaussian q(b0) = N(m0, v0): closed-form KL(N(m0, v0) || N(0, tau)).
-        fit = _intercept_gaussian if mode == "q2" else _intercept_point
-        m0, v0 = fit(data, state)
-        kl = 0.5 * (v0 / tau + m0 * m0 / tau - 1.0 + math.log(tau / v0))
-        upd = dict(intercept_value=m0, intercept_var=v0, intercept_kl=kl)
-    return replace(state, family_state=replace(fs, **upd))
+        return dict(intercept_value=m0, intercept_var=v0, intercept_kl=kl,
+                    intercept_b_nodes=b0n, intercept_log_node_weight=lw0)
+    # Gaussian q(b0) = N(m0, v0): closed-form KL(N(m0, v0) || N(0, tau)).
+    fit = _intercept_gaussian if mode == "q2" else _intercept_point
+    m0, v0 = fit(data, state)
+    kl = 0.5 * (v0 / tau + m0 * m0 / tau - 1.0 + math.log(tau / v0))
+    return dict(intercept_value=m0, intercept_var=v0, intercept_kl=kl)
+
+
+def estimate_intercept_step(data, state):
+    """Route the SHARED intercept to the strategy matching the effect family. (profiled: b0
+    is per-feature inside the kernel and gets a post-hoc reference in `reference_intercept_step`;
+    null: frozen since init -- neither refits here.)"""
+    fs = state.family_state
+    if fs.intercept != "shared" or not fs.estimate_intercept:
+        return state
+    return replace(state, family_state=replace(fs, **_estimate_shared_intercept(data, state)))
+
+
+def reference_intercept_step(data, state):
+    """after_fit hook: give a PROFILED fit a single global reference intercept q(b0)=N(m0, v0).
+
+    A profiled fit decouples the intercept per feature INSIDE the kernel (a point profile b0_j,
+    invariant to column shifts) -- ideal for inference, but it leaves no global intercept to
+    report for predictions and no q(b0) for the Q2 ELBO to integrate (compute_elbo would plug
+    in intercept_value = 0). This runs ONCE after convergence: it fits the same shared-intercept
+    factor `estimate_intercept_step` would (routed by CAVI mode) against the CONVERGED effects
+    and stores it. It never feeds back into the effect updates, so inference is byte-for-byte
+    unchanged; the stored (value, var, kl) is both the reference intercept for prediction and
+    the q(b0) the ELBO integrates. Gated on `estimate_intercept` so an explicit opt-out
+    (estimate_intercept=False) is honored."""
+    fs = state.family_state
+    if fs.intercept != "profiled" or not fs.estimate_intercept:
+        return state
+    return replace(state, family_state=replace(fs, **_estimate_shared_intercept(data, state)))
 
 
 def _random_intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
@@ -1137,5 +1167,7 @@ def default_schedule() -> Schedule:
             add_message_index_step,
         ),
         check_convergence=check_alpha_skl_convergence_step,
-        after_fit=(to_numpy_state_step,),
+        # reference_intercept_step runs on the jax state (it rebuilds the offset table), so it
+        # must precede to_numpy_state_step; it is a no-op unless the intercept is profiled.
+        after_fit=(reference_intercept_step, to_numpy_state_step),
     )
