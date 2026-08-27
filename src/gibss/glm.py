@@ -109,9 +109,9 @@ class GLMFamilyState:
     # cox/legacy, whose family_state lacks this field) fall back to flat.
     intercept_prior_variance: float = 1e6
     # intercept_kl: KL(q(b0) || N(0, intercept_prior_variance)) of the intercept factor, set
-    # by estimate_intercept_step (shared) or reference_intercept_step (profiled reference); 0
-    # for null, or profiled with estimate_intercept=False -- b0 is a plugged-in point there.
-    # The ELBO subtracts it exactly as it subtracts each effect's kl.
+    # by estimate_intercept_step (shared) or reference_intercept_step (profiled reference; a
+    # profiled fit always gets one); 0 for null, where b0 is a plugged-in point. The ELBO
+    # subtracts it exactly as it subtracts each effect's kl.
     intercept_kl: float = 0.0
     estimate_intercept: bool = True
     estimate_prior_variance: bool = True
@@ -839,10 +839,14 @@ def reference_intercept_step(data, state):
     factor `estimate_intercept_step` would (routed by CAVI mode) against the CONVERGED effects
     and stores it. It never feeds back into the effect updates, so inference is byte-for-byte
     unchanged; the stored (value, var, kl) is both the reference intercept for prediction and
-    the q(b0) the ELBO integrates. Gated on `estimate_intercept` so an explicit opt-out
-    (estimate_intercept=False) is honored."""
+    the q(b0) the ELBO integrates.
+
+    NOT gated on `estimate_intercept`: profiling ALWAYS estimates the intercept (per feature,
+    inside the kernel), so the flag -- which only means "freeze the shared intercept at 0" --
+    has no meaning for a profiled fit. A profiled fit therefore always carries a usable global
+    intercept summary, regardless of `estimate_intercept`."""
     fs = state.family_state
-    if fs.intercept != "profiled" or not fs.estimate_intercept:
+    if fs.intercept != "profiled":
         return state
     return replace(state, family_state=replace(fs, **_estimate_shared_intercept(data, state)))
 

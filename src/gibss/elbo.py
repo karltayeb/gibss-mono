@@ -17,10 +17,9 @@ The KL side is free: mean-field factorizes it into `sum_l KL(q_l || prior_l)`, w
 exactly the per-effect `e.kl` already stored on every fitted effect (a Gaussian KL for Q2,
 the free-form coefficient KL for Q1 -- both on the same nats scale). A SHARED intercept is a
 genuine variational factor q(b0) with a diffuse N(0, tau) prior: its spread is integrated
-(not dropped) and its KL is subtracted, exactly like an effect. A profiled intercept carries a
-post-hoc reference factor q(b0) that is integrated the same way; a null intercept (or a
-profiled fit with estimate_intercept=False) is a point plugged in at `fs.intercept_value`.
-See `compute_elbo` for the rationale.
+(not dropped) and its KL is subtracted, exactly like an effect. A profiled intercept always
+carries a post-hoc reference factor q(b0) that is integrated the same way; a null intercept is
+a point plugged in at `fs.intercept_value`. See `compute_elbo` for the rationale.
 
 The only real work is the expected log-likelihood `sum_i E_q[log p(y_i | eta_i)]`, where
 `eta_i` couples ALL L effects through the nonlinear cumulant `A`. That expectation over the
@@ -187,10 +186,9 @@ def compute_elbo(
     variance folds into the offset table for Q2, its free-form nodes for Q1) and its KL,
     KL(q(b0) || N(0, tau)), is subtracted -- dropping it would be a real O(v0) error in the
     likelihood, not a constant. A "profiled" intercept is decoupled per feature during
-    inference, but a fitted state carries a post-hoc REFERENCE factor q(b0)=N(m0, v0)
-    (`reference_intercept_step`); when present its spread is integrated and its KL charged too,
-    giving an approximate Q2 ELBO for the profiled fit. A "null" intercept (or a profiled fit
-    with `estimate_intercept=False`, which has no reference) is a point plugged in at
+    inference, but a fitted state always carries a post-hoc REFERENCE factor q(b0)=N(m0, v0)
+    (`reference_intercept_step`); its spread is integrated and its KL charged too, giving an
+    approximate Q2 ELBO for the profiled fit. A "null" intercept is a point plugged in at
     `intercept_value` with no b0 KL. The b0 prior tau is diffuse, so its KL is dominated by a
     `~0.5 log(tau)` term common to all fits on the same data.
 
@@ -220,10 +218,11 @@ def compute_elbo(
 
     # A shared intercept is a genuine q(b0) whose spread must be integrated. A profiled fit
     # decouples b0 per feature during inference (a point), but carries a post-hoc REFERENCE
-    # factor q(b0)=N(m0, v0) (reference_intercept_step); when present (intercept_var > 0) it is
-    # a real Gaussian factor too, so integrate its spread and charge its KL -- an approximate
-    # Q2 ELBO for the profiled fit. A null intercept, or a profiled fit without a reference
-    # (estimate_intercept=False), stays a plugged-in point. intercept_kl is the b0 factor's KL.
+    # factor q(b0)=N(m0, v0) (reference_intercept_step); it is a real Gaussian factor too, so
+    # integrate its spread and charge its KL -- an approximate Q2 ELBO for the profiled fit.
+    # (The intercept_var > 0 guard falls back to a plugged-in point for a hand-built profiled
+    # state that never ran reference_intercept_step.) A null intercept stays a plugged-in
+    # point. intercept_kl is the b0 factor's KL.
     integrate_b0 = fs.intercept == "shared" or (
         fs.intercept == "profiled" and float(getattr(fs, "intercept_var", 0.0)) > 0.0
     )

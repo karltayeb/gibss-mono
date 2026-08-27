@@ -382,17 +382,24 @@ def test_profiled_intercept_reference_is_integrated():
     assert bd.elbo == pytest.approx(bs.elbo, abs=0.2)
 
 
-def test_profiled_intercept_no_estimate_is_plugged_in():
-    # with estimate_intercept=False the profiled fit has NO reference factor, so the ELBO
-    # falls back to plugging in the (zero) point intercept and charges no b0 KL.
-    X, y = _bern_data(0)
-    st = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled",
-                       estimate_intercept=False, **_fit_kw())
-    data = glm.prep_data(X, y, center=False)
-    bd = compute_elbo(data, st, return_breakdown=True)
-    assert st.family_state.intercept == "profiled"
-    assert float(st.family_state.intercept_var) == 0.0
-    assert bd.intercept_kl == 0.0
+def test_profiled_intercept_reference_ignores_estimate_intercept_flag():
+    # profiling ALWAYS estimates the intercept (per feature, inside the kernel), so the
+    # reference is computed regardless of estimate_intercept -- that flag only freezes a
+    # SHARED intercept. A profiled fit therefore always has a usable global intercept, and
+    # estimate_intercept=False gives the SAME reference as the default.
+    X, y = _bern_data(3)
+    on = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled",
+                       estimate_intercept=True, **_fit_kw())
+    off = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled",
+                        estimate_intercept=False, **_fit_kw())
+    for st in (on, off):
+        assert st.family_state.intercept == "profiled"
+        assert float(st.family_state.intercept_var) > 0.0
+        assert float(st.family_state.intercept_kl) > 0.0
+    assert float(off.family_state.intercept_value) == pytest.approx(
+        float(on.family_state.intercept_value), abs=1e-9)
+    assert float(off.family_state.intercept_var) == pytest.approx(
+        float(on.family_state.intercept_var), abs=1e-9)
 
 
 def test_base_measure_toggle():
