@@ -81,7 +81,8 @@ to obtain the Q2 CAVI update. Requires x64.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
@@ -136,6 +137,41 @@ def _concrete_or_none(x):
         return float(np.asarray(jax.device_get(x)))
     except Exception:
         return None
+
+
+def _bucket_size(bucket):
+    """Grid-size bucket: the explicit `bucket` if given, else the `GIBSS_NTAU_BUCKET`
+    env A/B knob (0 = off)."""
+    if bucket is not None:
+        return int(bucket)
+    return int(os.environ.get("GIBSS_NTAU_BUCKET", "0") or 0)
+
+
+class _NtauRatchet:
+    """Monotone high-water mark for the CF quadrature grid size within one fit.
+
+    Holds the largest `ntau` any SER update has needed so far; a later update never
+    compiles a SMALLER grid. Each distinct `(n, ntau)` CF array is a fresh XLA
+    compilation, and the auto-sized `ntau` otherwise drifts every SER update (the offset
+    support shrinks as the posteriors concentrate), so over `L x max_iter x reps` it
+    spawns thousands of recompiles whose LLVM modules accumulate until the process OOMs.
+    Making `ntau` monotone means it settles at its peak within the first sweep or two and
+    stops recompiling.
+
+    Purely a compilation-cache concern: `apply` only ever RAISES `ntau` above the Nyquist
+    `req` the caller already computed (never below it) and clamps to `max_ntau`, so the
+    quadrature is at least as fine as required and results are unchanged. One ratchet
+    lives per `CharFnOffset` instance (one per fit)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: int = 0):
+        self.value = int(value)
+
+    def apply(self, ntau: int, max_ntau: int) -> int:
+        ntau = min(max(int(ntau), self.value), int(max_ntau))
+        self.value = ntau
+        return ntau
 
 
 def effect_moments(effect: Effect):
@@ -212,7 +248,8 @@ def offset_cf(effects, tau, n=None, offset_var=0.0):
     return phi, s, V
 
 
-def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau):
+def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau,
+               bucket=None, ratchet=None):
     """Adaptive `(Tmax, ntau, hw)` for the CF quadrature. `hw = T + kappa sqrt(V)` is the
     per-row fit half-width. `Tmax` is the logistic kernel tail. `ntau` meets the Nyquist
     bound `ntau >= Tmax * driver / pi`, with `driver = max_i(hw_i + kappa sqrt(V_i))` --
@@ -220,7 +257,14 @@ def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau):
     with the offset support `~kappa sqrt(V)`. Crucially the driver is ALPHA-WEIGHTED (via
     the mixture variance V), so thousands of near-zero-alpha features with large means do
     NOT inflate the grid -- their CF amplitude is below tolerance. When `ntau` is passed
-    it is only guarded (raise on aliasing), never shrunk."""
+    it is only guarded (raise on aliasing), never shrunk.
+
+    When `ntau` is auto-sized, `bucket` (additive ladder) and `ratchet` (monotone
+    high-water mark, `_NtauRatchet`) coarsen and freeze the grid so the `(n, ntau)` CF
+    array takes only a handful of distinct shapes across a fit instead of drifting every
+    SER update -- each distinct `ntau` is a separate XLA compilation. Both only ever ROUND
+    UP (never below the Nyquist `req`), so accuracy is preserved; they change only how many
+    compiles the fit triggers."""
     sd = kappa * jnp.sqrt(jnp.maximum(V, 0.0))
     hw = T + sd
     Tmax = _psi_tail_Tmax(tol) if Tmax is None else float(Tmax)
@@ -238,6 +282,15 @@ def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau):
                 f"hw+sd={driver:.1f}, Tmax={Tmax:.1f}); offset variance too large."
             )
         ntau = min(max(req, min_ntau), max_ntau)
+        # Snap UP to a coarse ladder, then to the fit's running max, so the (n, ntau) CF
+        # grid takes only a handful of distinct shapes across a fit (each distinct ntau is a
+        # separate XLA compile; the L x max_iter x reps drift otherwise causes thousands of
+        # recompiles + an OOM). Both only round UP (never below the Nyquist req).
+        b = _bucket_size(bucket)
+        if b > 1:
+            ntau = min(int(math.ceil(ntau / b) * b), max_ntau)
+        if ratchet is not None:
+            ntau = ratchet.apply(ntau, max_ntau)
     else:
         ntau = int(ntau)
         if driver is not None:
@@ -266,6 +319,8 @@ def smoothed_nodes(
     min_ntau=32,
     max_ntau=1 << 15,
     offset_var=0.0,
+    bucket=None,
+    ratchet=None,
 ):
     """Offset-integrated cumulant `Atilde` and its first two z-derivatives at per-row
     CGL nodes, via the psi-tamed residual CF quadrature (logistic base only).
@@ -292,7 +347,9 @@ def smoothed_nodes(
     V0 = jnp.zeros(n) + jnp.asarray(offset_var)
     for effect in effects:
         V0 = V0 + effect_moments(effect)[1]
-    Tmax, ntau, hw = _grid_size(V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
+    Tmax, ntau, hw = _grid_size(
+        V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau, bucket, ratchet
+    )
     tau, wq, psi = _frequency_grid(Tmax, ntau)
     phi, s, V = offset_cf(effects, tau, n=n, offset_var=offset_var)  # + intercept var
     return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
@@ -479,6 +536,8 @@ def smoothed_nodes_sparse(
     entry_chunk=1 << 15,
     offset_var=0.0,
     colmean=None,
+    bucket=None,
+    ratchet=None,
 ):
     """Sparse (BCOO) analogue of `smoothed_nodes`: `effects` is a list of `(alpha, mu,
     var)` over the shared design `X`. Returns `(znodes, At0, At1, At2, hw, s, V)`.
@@ -498,7 +557,9 @@ def smoothed_nodes_sparse(
         V0 = V0 + _sparse_effect_moments(
             op, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var), c_arr
         )[1]
-    Tmax, ntau, hw = _grid_size(V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau)
+    Tmax, ntau, hw = _grid_size(
+        V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau, bucket, ratchet
+    )
     tau, wq, psi = _frequency_grid(Tmax, ntau)
     phi, s, V = offset_cf_sparse(
         X, effects, tau, n=n, entry_chunk=entry_chunk, offset_var=offset_var,
@@ -541,6 +602,22 @@ class CharFnOffset(Smoother):
     kappa: float = 4.0
     T: float = 10.0
     safety: float = 1.3
+    # Grid-size compile control (accuracy-preserving; both only ever round ntau UP).
+    #   ntau_bucket: additive ladder for the auto-sized ntau (default 32; 0/1 = off).
+    #     32 tracks the Nyquist peak tightly (~2-16% grid overhead in practice) while
+    #     collapsing the L x max_iter x reps ntau drift to a couple of distinct (n, ntau)
+    #     shapes -- enough to stop the recompile accumulation without over-sizing. Override
+    #     per instance, or globally via GIBSS_NTAU_BUCKET (raise it only if peaks scatter
+    #     widely across datasets and the compile count creeps into the dozens).
+    #   _ratchet: per-instance (per-fit) monotone high-water mark so ntau never shrinks
+    #             mid-fit and settles after a sweep or two -- kills the recompile OOM.
+    # Excluded from eq/hash/repr so two smoothers stay equal regardless of fit progress.
+    ntau_bucket: int = field(
+        default_factory=lambda: int(os.environ.get("GIBSS_NTAU_BUCKET", "32") or 32)
+    )
+    _ratchet: _NtauRatchet = field(
+        default_factory=_NtauRatchet, compare=False, repr=False, hash=False
+    )
 
     def validate(self, base):
         if not isinstance(base, Bernoulli):
@@ -553,6 +630,7 @@ class CharFnOffset(Smoother):
         return build_aux(
             base, y, effects, self.M, tol=self.tol, kappa=self.kappa, T=self.T,
             safety=self.safety, ntau=ntau, Tmax=Tmax, offset_var=offset_var,
+            bucket=self.ntau_bucket, ratchet=self._ratchet,
         )
 
     def build_aux_sparse(self, base, y, X, effects, ntau=None, Tmax=None,
@@ -564,6 +642,7 @@ class CharFnOffset(Smoother):
             base, y, X, effects, self.M, entry_chunk=entry_chunk, tol=self.tol,
             kappa=self.kappa, T=self.T, safety=self.safety, ntau=ntau, Tmax=Tmax,
             offset_var=offset_var, colmean=colmean,
+            bucket=self.ntau_bucket, ratchet=self._ratchet,
         )
 
     def terms(self, base: ResponseModel, eta, aux):
