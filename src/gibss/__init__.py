@@ -27,8 +27,9 @@ def enable_compilation_cache(path: str | None = None) -> str:
     return path
 
 
-# Auto-enable unless opted out (GIBSS_NO_JAX_CACHE=1).
-if os.environ.get("GIBSS_NO_JAX_CACHE", "").lower() not in ("1", "true", "yes"):
+# Off by default; opt in with GIBSS_USE_JAX_CACHE=1. Persisting XLA
+# compilations to disk is a side effect the user should choose deliberately.
+if os.environ.get("GIBSS_USE_JAX_CACHE", "").lower() in ("1", "true", "yes"):
     try:
         enable_compilation_cache()
     except Exception:
