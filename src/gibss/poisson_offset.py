@@ -66,9 +66,34 @@ __all__ = [
     "log_kappa_sparse",
     "log_kappa_q1_dense",
     "log_kappa_q1_sparse",
+    "effect_log_mgf_q1_dense",
     "PoissonLogNormalOffset",
     "PoissonSelfNormOffset",
 ]
+
+
+# Overflow guard for the Poisson rate. `Atilde = exp(eta + logkappa)` can exceed float64's
+# ~exp(709.8) range on a transient bad iterate -- a tail GH node, or a large offset log-MGF
+# from heavy-tailed design x strong effects x large L (logkappa >= 0 and grows with L). An
+# inf rate poisons grad = y - Atilde and the curvature w = Atilde, turning the whole SER
+# update to nan. Cap the log-rate well below the per-element overflow AND below where a
+# reduction over rows would overflow (exp(600) ~ 4e260, so a sum over up to ~1e47 rows stays
+# finite). The cap is astronomically above any physical Poisson rate, so it never touches a
+# converged fit or any realistic iterate; it only turns an overflowing iterate into a large
+# finite rate whose (kernel-clipped) Newton step still points the predictor back down. The
+# cumulant is exact wherever the cap is inactive (every converged and near-converged state).
+_LOGRATE_CAP = 600.0
+
+
+def _poisson_terms(y, eta, logk):
+    """`(loglik, grad, weight)` for the offset-folded Poisson cumulant `Atilde = exp(eta +
+    logk)`, shared by `PoissonLogNormalOffset` (Q2) and `PoissonSelfNormOffset` (Q1). The
+    linear term `y*eta` uses the UNCLAMPED `eta` (so the evidence is exact); only the rate
+    `e` is capped (`_LOGRATE_CAP`), and only on an overflowing iterate."""
+    y = jnp.asarray(y)
+    eta = jnp.asarray(eta)
+    e = jnp.exp(jnp.minimum(eta + jnp.asarray(logk), _LOGRATE_CAP))
+    return y * eta - e, y - e, e
 
 
 def _effect_log_mgf_dense(x, alpha, mu, var):
@@ -180,33 +205,48 @@ def _log_node_mgf_intercept(node_law):
     return logsumexp(logw + b0) - jnp.sum(W0 * b0)
 
 
-def log_kappa_q1_dense(X, effects, n, intercept=None):
-    """Per-row zero-mean log-MGF (n,) for FREE-FORM (Q1) effects on a dense design.
+@jax.jit
+def effect_log_mgf_q1_dense(X, b_nodes, logW):
+    """Per-row zero-mean log-MGF (n,) of ONE free-form (Q1) effect's row contribution on a
+    dense design: `log(sum_{c,m} W_cm e^{x_ic b_cm}) - sum_{c,m} W_cm x_ic b_cm`. `X` is
+    (n, C); `b_nodes, logW` are the effect's node law (C, Q) (unnormalized joint logW).
 
-    `effects` is a list of `(b_nodes, logW)` each `(C, Q)` -- value nodes and log
-    unnormalized JOINT weights over (feature, node). `intercept` is an optional
-    `(b0_nodes, logW0)` for the shared free-form intercept (all-ones column). Each effect's
-    contribution is `log(sum_{c,m} W_cm e^{x_ic b_cm}) - sum_{c,m} W_cm x_ic b_cm`, the log
-    of the node-weighted MGF minus the mean carried in eta -- computed stably in log space,
-    reduced feature-by-feature with a `lax.scan` (peak memory `O(n Q)`)."""
+    The per-row MGF is reduced feature-by-feature with a `lax.scan` (peak memory O(n Q)).
+    `@jax.jit` gives that scan a stable, shape-keyed compilation cache: `log_kappa_q1_dense`
+    folds the SAME (C, Q)-shaped node law for every leave-one-out effect on every SER update,
+    and an eager `lax.scan` rebuilt from a fresh closure each call re-traces and re-compiles
+    at the same shape every time (the node VALUES drift, their shape does not). Under the
+    wrapper it compiles once per (n, C, Q) and then hits cache for all effects/updates/sweeps
+    -- the sum over effects stays in Python, so the effect COUNT never re-traces it either.
+    Being a pure function of one effect's node law, its result is also the cacheable per-
+    effect term `t_l` for the exact leave-one-out identity logk_{-l} = sum_k t_k - t_l."""
+    X = jnp.asarray(X)
+    b_nodes = jnp.asarray(b_nodes)                       # (C, Q)
+    logw = jnp.asarray(logW)
+    logw = logw - logsumexp(logw)                        # normalize over all (C, Q)
+    W = jnp.exp(logw)
+    mean = X @ jnp.sum(W * b_nodes, axis=1)              # (n,) = sum_{c,m} W_cm x_ic b_cm
+
+    def body(carry_logS, comp):
+        xc, bc, lwc = comp                               # (n,), (Q,), (Q,)
+        logS_c = logsumexp(lwc[None, :] + xc[:, None] * bc[None, :], axis=1)  # (n,)
+        return jnp.logaddexp(carry_logS, logS_c), None
+
+    logS, _ = jax.lax.scan(body, jnp.full(X.shape[0], -jnp.inf), (X.T, b_nodes, logw))
+    return logS - mean
+
+
+def log_kappa_q1_dense(X, effects, n, intercept=None):
+    """Per-row zero-mean log-MGF (n,) for FREE-FORM (Q1) effects on a dense design: the SUM
+    over effects of `effect_log_mgf_q1_dense` (additive -- the mean-field offset MGF
+    factorizes over effects). `effects` is a list of `(b_nodes, logW)` each `(C, Q)`;
+    `intercept` is an optional `(b0_nodes, logW0)` for the shared free-form intercept. The
+    per-effect term is jitted (compiled once per shape, then cached), so neither the per-call
+    scan nor the effect count re-compiles."""
     X = jnp.asarray(X)
     logk = jnp.zeros(n)
     for b_nodes, logW in effects:
-        b_nodes = jnp.asarray(b_nodes)                       # (C, Q)
-        logw = jnp.asarray(logW)
-        logw = logw - logsumexp(logw)                        # normalize over all (C, Q)
-        W = jnp.exp(logw)
-        mean = X @ jnp.sum(W * b_nodes, axis=1)              # (n,) = sum_{c,m} W_cm x_ic b_cm
-
-        def body(carry_logS, comp):
-            xc, bc, lwc = comp                               # (n,), (Q,), (Q,)
-            logS_c = logsumexp(lwc[None, :] + xc[:, None] * bc[None, :], axis=1)  # (n,)
-            return jnp.logaddexp(carry_logS, logS_c), None
-
-        logS, _ = jax.lax.scan(
-            body, jnp.full(n, -jnp.inf), (X.T, b_nodes, logw)
-        )
-        logk = logk + (logS - mean)
+        logk = logk + effect_log_mgf_q1_dense(X, jnp.asarray(b_nodes), jnp.asarray(logW))
     if intercept is not None:
         logk = logk + _log_node_mgf_intercept(intercept)
     return logk
@@ -316,9 +356,7 @@ class PoissonLogNormalOffset(Smoother):
         logkappa}`, all derivatives equal. `eta`, `y`, `logkappa` broadcast elementwise
         (the kernels open the GH-node axis on every leaf)."""
         y, logk = aux
-        e = jnp.exp(jnp.asarray(eta) + jnp.asarray(logk))
-        y = jnp.asarray(y)
-        return y * eta - e, y - e, e
+        return _poisson_terms(y, eta, logk)
 
 
 @dataclass(frozen=True)
@@ -388,6 +426,4 @@ class PoissonSelfNormOffset(Smoother):
         logkappa}`, all derivatives equal. Identical to `PoissonLogNormalOffset.terms`;
         only the `logkappa` builder (node MGF vs Gaussian-mixture MGF) differs."""
         y, logk = aux
-        e = jnp.exp(jnp.asarray(eta) + jnp.asarray(logk))
-        y = jnp.asarray(y)
-        return y * eta - e, y - e, e
+        return _poisson_terms(y, eta, logk)

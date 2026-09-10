@@ -30,8 +30,10 @@ from jax.experimental import sparse as jsp
 
 from gibss.methods import fit_glm_susie
 from gibss.poisson_offset import (
+    _LOGRATE_CAP,
     PoissonLogNormalOffset,
     PoissonSelfNormOffset,
+    effect_log_mgf_q1_dense,
     log_kappa_dense,
     log_kappa_q1_dense,
     log_kappa_q1_sparse,
@@ -171,6 +173,129 @@ def test_empty_effects_contribute_zero_logkappa():
     empty = (np.full(p, 1.0 / p), np.zeros(p), np.zeros(p))
     logk = np.asarray(log_kappa_dense([(X, *empty)], n, offset_var=0.0))
     assert np.max(np.abs(logk)) < 1e-12
+
+
+# ------------------------------------------------------------- Q1 node-MGF build + numerics
+def _brute_logkappa_q1(Xn, effects, intercept=None):
+    """Independent exact reference for the free-form (Q1) zero-mean offset log-MGF. A node
+    law is a DISCRETE distribution, so its MGF is an exact finite sum (no quadrature): for
+    each effect, E[e^{o}] = sum_{c,m} W_cm e^{x_ic b_cm}, mean = sum_{c,m} W_cm x_ic b_cm,
+    and logkappa = sum_effects (log E - mean). Shares no code with the implementation (plain
+    numpy, normalize-then-sum), so it pins the build rather than restating it."""
+    n = Xn.shape[0]
+    logk = np.zeros(n)
+    for b_nodes, logW in effects:
+        b = np.asarray(b_nodes)
+        lw = np.asarray(logW)
+        W = np.exp(lw - np.max(lw))
+        W = W / W.sum()
+        Eb = (W * b).sum(axis=1)                      # (C,) per-feature E[b]
+        mean = Xn @ Eb
+        E = np.zeros(n)
+        for c in range(b.shape[0]):
+            E += (W[c][None, :] * np.exp(np.outer(Xn[:, c], b[c]))).sum(axis=1)
+        logk += np.log(E) - mean
+    if intercept is not None:
+        b0, lw0 = np.asarray(intercept[0]), np.asarray(intercept[1])
+        W0 = np.exp(lw0 - np.max(lw0)); W0 = W0 / W0.sum()
+        logk += np.log((W0 * np.exp(b0)).sum()) - (W0 * b0).sum()
+    return logk
+
+
+def test_poisson_q1_logkappa_matches_bruteforce():
+    """Dense Q1 node-MGF build == the independent finite-sum reference, to ~1e-10."""
+    rng = np.random.default_rng(71)
+    n, p, Q = 12, 8, 10
+    X = rng.standard_normal((n, p))
+    effects = [(rng.standard_normal((p, Q)) * 0.6, rng.standard_normal((p, Q)))
+               for _ in range(3)]
+    intercept = (rng.standard_normal(Q) * 0.3, rng.standard_normal(Q))
+    ej = [(jnp.asarray(b), jnp.asarray(w)) for b, w in effects]
+    ij = (jnp.asarray(intercept[0]), jnp.asarray(intercept[1]))
+    got = np.asarray(log_kappa_q1_dense(jnp.asarray(X), ej, n, intercept=ij))
+    ref = _brute_logkappa_q1(X, effects, intercept)
+    assert np.max(np.abs(got - ref)) < 1e-10
+
+
+def test_poisson_q1_logkappa_additive_and_leaveoneout():
+    """logkappa factorizes over effects: the build is the SUM of per-effect terms (bit-exact),
+    and the leave-one-out fold equals (sum of all terms) - (that effect's term) to machine eps.
+    This is the exactness the additive-caching speedup relies on."""
+    rng = np.random.default_rng(72)
+    n, p, Q, L = 15, 10, 12, 5
+    X = jnp.asarray(rng.standard_normal((n, p)))
+    effects = [(jnp.asarray(rng.standard_normal((p, Q)) * 0.6),
+                jnp.asarray(rng.standard_normal((p, Q)))) for _ in range(L)]
+    terms = [np.asarray(effect_log_mgf_q1_dense(X, b, w)) for b, w in effects]
+    S = np.sum(terms, axis=0)
+    assert np.array_equal(S, np.asarray(log_kappa_q1_dense(X, effects, n)))  # bit-exact sum
+    for l in range(L):
+        loo = np.asarray(log_kappa_q1_dense(
+            X, [e for k, e in enumerate(effects) if k != l], n))
+        assert np.max(np.abs((S - terms[l]) - loo)) < 1e-12
+
+
+def test_poisson_q1_build_is_stable_at_large_exponents():
+    """The node-MGF build stays accurate (vs the finite-sum reference) even when x*b pushes
+    logkappa into the hundreds -- logsumexp keeps it machine-exact; the build never overflows
+    (only the downstream rate does, which terms() clamps)."""
+    rng = np.random.default_rng(73)
+    n, p, Q = 10, 6, 12
+    X = rng.standard_normal((n, p)) * 3.0            # large design
+    effects = [(rng.standard_normal((p, Q)) * 2.0, rng.standard_normal((p, Q)))
+               for _ in range(4)]                    # wide nodes
+    ej = [(jnp.asarray(b), jnp.asarray(w)) for b, w in effects]
+    got = np.asarray(log_kappa_q1_dense(jnp.asarray(X), ej, n))
+    ref = _brute_logkappa_q1(X, effects)
+    assert np.all(np.isfinite(got))
+    assert got.max() > 50.0                           # genuinely large logkappa
+    assert np.max(np.abs(got - ref) / (np.abs(ref) + 1.0)) < 1e-10  # relative, machine-exact
+
+
+@pytest.mark.parametrize("smoother", [PoissonLogNormalOffset(), PoissonSelfNormOffset()])
+def test_poisson_terms_overflow_clamped(smoother):
+    """terms() caps the log-rate so Atilde=exp(eta+logkappa) cannot overflow to inf (which
+    would poison grad/curvature to nan), yet is BIT-EXACT to the raw cumulant wherever the
+    cap is inactive (every converged / realistic state)."""
+    base = Poisson()
+    y = jnp.array([0.0, 1.0, 5.0, 100.0])
+    eta = jnp.array([0.5, -1.0, 2.0, 1.2])
+    # benign: eta + logk well below the cap -> exact, no clamping
+    logk = jnp.array([0.1, 0.2, 0.0, 0.3])
+    ll, g, w = smoother.terms(base, eta, (y, logk))
+    e_raw = jnp.exp(eta + logk)
+    assert np.array_equal(np.asarray(ll), np.asarray(y * eta - e_raw))
+    assert np.array_equal(np.asarray(g), np.asarray(y - e_raw))
+    assert np.array_equal(np.asarray(w), np.asarray(e_raw))
+    # overflow corner: huge eta+logk -> finite, rate capped at exp(_LOGRATE_CAP)
+    logk_big = jnp.array([17094.0, 800.0, 2000.0, 50000.0])
+    ll2, g2, w2 = smoother.terms(base, eta, (y, logk_big))
+    assert np.all(np.isfinite(np.asarray(ll2)))
+    assert np.all(np.isfinite(np.asarray(g2)))
+    assert np.all(np.isfinite(np.asarray(w2)))
+    assert np.allclose(np.asarray(w2), np.exp(_LOGRATE_CAP))       # rate capped
+    assert np.all(np.asarray(g2) < 0.0)                           # y - rate < 0 -> pushes eta down
+
+
+def test_poisson_q1_build_no_recompile():
+    """Regression for the perf fix: the per-effect Q1 term is a module-level @jax.jit, so it
+    compiles ONCE per (n, C, Q) shape and is then cached across every effect, every update, and
+    every distinct effect COUNT -- the eager lax.scan it replaced re-compiled on every call."""
+    cache_size = getattr(effect_log_mgf_q1_dense, "_cache_size", None)
+    if cache_size is None:
+        pytest.skip("jitted fn does not expose _cache_size on this jax version")
+    rng = np.random.default_rng(74)
+    n, p, Q = 50, 12, 15
+    X = jnp.asarray(rng.standard_normal((n, p)))
+    effects = [(jnp.asarray(rng.standard_normal((p, Q)) * 0.6),
+                jnp.asarray(rng.standard_normal((p, Q)))) for _ in range(8)]
+    log_kappa_q1_dense(X, effects, n)                 # warm (one compile for this shape)
+    base = cache_size()
+    for _ in range(3):                                # repeated full builds: no new compiles
+        log_kappa_q1_dense(X, effects, n)
+    for L in (1, 4, 7):                               # varying effect COUNT: no new compiles
+        log_kappa_q1_dense(X, effects[:L], n)
+    assert cache_size() == base
 
 
 # ------------------------------------------------------------------ gold-Q2 stationarity
