@@ -83,6 +83,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -192,11 +193,18 @@ def effect_moments(effect: Effect):
     return mean, jnp.maximum(second - mean**2, 0.0)
 
 
+@jax.jit
 def _effect_cf(effect: Effect, tau):
     """Characteristic function `phi_l(t)` of one effect's row contribution, eq. (1),
     on the shared frequency grid `tau` (ntau,). Returns `(n, ntau)` complex. Reduces
     over the feature axis `c` with a `lax.scan`, so peak memory is `O(n, ntau)` -- the
-    non-materialized offset law (row-independent `(alpha, mu, var)` + design `x`)."""
+    non-materialized offset law (row-independent `(alpha, mu, var)` + design `x`).
+
+    `@jax.jit` gives the inner `scan` a stable, shape-keyed compilation cache: `offset_cf`
+    calls this once per leave-one-out effect every SER update, and an eager `lax.scan`
+    rebuilt from a fresh closure each call would re-trace and re-compile at the SAME shape
+    every sweep (the arrays' VALUES drift as the posteriors move, but their shapes do not).
+    Under the wrapper it compiles once per `(x, tau)` shape and then hits cache."""
     x, alpha, mu, var = effect
     x = jnp.asarray(x)
     alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
@@ -366,10 +374,18 @@ def _frequency_grid(Tmax, ntau):
     return tau, wq, psi
 
 
+@partial(jax.jit, static_argnames=("M",))
 def _atilde_from_cf(phi, V, tau, wq, psi, hw, M):
     """Offset-integrated cumulant `(znodes, At0, At1, At2)` at the per-row CGL nodes from
     a ZERO-MEAN offset CF `phi` (n, ntau) via the psi-tamed residual quadrature. Shared
-    by the dense and sparse builders -- only how `phi` is formed differs."""
+    by the dense and sparse builders -- only how `phi` is formed differs.
+
+    `@jax.jit` (M static) gives the inner CGL `scan` a stable compilation cache. This runs
+    once per SER update on both paths; as an eager `lax.scan` closing over the per-update
+    arrays (`phi`, `V`, `hw`), it re-compiled at the same `(n, ntau)` shape every sweep,
+    the bulk of the `cf_cavi` recompile accumulation. With `phi/V/tau/wq/psi/hw` entering
+    as traced arguments the cache key is just their shapes, so it compiles once per
+    distinct `ntau` (already bounded to ~2 by the `_NtauRatchet`) and then hits cache."""
     R = phi - 1.0  # ~ -t^2 V/2 near 0 -> residual transforms are localized
     tau_safe = jnp.where(tau > 0, tau, 1.0)
     c_val = jnp.where(tau > 0, wq * psi / tau_safe**2, 0.0)  # value residual, /t^2

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -652,24 +653,16 @@ def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli
     return _freeze_null_intercept(data, state)
 
 
-def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
-    """Intercept strategy -- CAVI in Q2 (kernel='vi_gh'): b0 as a unit-ones-column Gaussian
-    factor q(b0) = N(m0, v0), with a diffuse N(0, tau) prior (tau =
-    fs.intercept_prior_variance). Symmetric with the effect updates: the offset is ALL L
-    effects' Gaussian mixture, integrated into the cumulant table (`_intercept_offset_aux`),
-    and b0 is integrated by GH over N(m0, v0). Returns (m0, v0) with m0 solving the
-    GH-averaged + prior score and 1/v0 = sum_i E_{b0}[weight] + 1/tau."""
-    fs = state.family_state
-    inv_tau = 1.0 / fs.intercept_prior_variance  # diffuse Gaussian prior N(0, tau) on b0
-    response = fs.response
-    aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
-    # offset mean s: effects' mean + glm_offset + the random intercept mean (m_i rides in eta)
-    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
-    nodes_np, logw_np = _gh_rule(order)
-    nodes = jnp.asarray(nodes_np)
-    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
-    aux_o = jax.tree_util.tree_map(lambda a: a[None, ...], aux)  # open GH-node axis
-
+@partial(jax.jit, static_argnames=("response", "n_iter", "tol"))
+def _intercept_gaussian_solve(total_mean, aux_o, nodes, wts, inv_tau, m0_init,
+                              response, n_iter, tol):
+    """Gaussian-intercept CAVI Newton solve, hoisted under `@jax.jit` so the `while_loop`
+    has a stable, shape-keyed compilation cache. `_intercept_gaussian` builds `aux_o`
+    eagerly (the CF table needs a concrete ntau, so it cannot itself be jitted) and calls
+    this once per sweep; as a bare eager `while_loop` closing over the per-sweep arrays it
+    re-traced and re-compiled at the same shapes every sweep. Here the per-sweep-varying
+    arrays (`total_mean`, `aux_o`, `inv_tau`, `m0_init`) enter as traced arguments, so it
+    compiles once per shape and then hits cache. Returns `(m0, v0)`."""
     def smoothed(m0, v0):
         sd = jnp.sqrt(2.0 * jnp.maximum(v0, 0.0))
         shft = (total_mean + m0)[None, :] + sd * nodes[:, None]  # (order, n)
@@ -687,7 +680,32 @@ def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     m0, v0, _, _ = jax.lax.while_loop(
         lambda s: (s[3] < n_iter) & (s[2] > tol),
         body,
-        (jnp.asarray(fs.intercept_value), jnp.asarray(1.0), jnp.inf, 0),
+        (m0_init, jnp.asarray(1.0), jnp.inf, 0),
+    )
+    return m0, v0
+
+
+def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
+    """Intercept strategy -- CAVI in Q2 (kernel='vi_gh'): b0 as a unit-ones-column Gaussian
+    factor q(b0) = N(m0, v0), with a diffuse N(0, tau) prior (tau =
+    fs.intercept_prior_variance). Symmetric with the effect updates: the offset is ALL L
+    effects' Gaussian mixture, integrated into the cumulant table (`_intercept_offset_aux`),
+    and b0 is integrated by GH over N(m0, v0). Returns (m0, v0) with m0 solving the
+    GH-averaged + prior score and 1/v0 = sum_i E_{b0}[weight] + 1/tau. The Newton solve
+    itself lives in the jitted `_intercept_gaussian_solve` (stable compile cache)."""
+    fs = state.family_state
+    inv_tau = 1.0 / fs.intercept_prior_variance  # diffuse Gaussian prior N(0, tau) on b0
+    response = fs.response
+    aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
+    # offset mean s: effects' mean + glm_offset + the random intercept mean (m_i rides in eta)
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)
+    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+    aux_o = jax.tree_util.tree_map(lambda a: a[None, ...], aux)  # open GH-node axis
+    m0, v0 = _intercept_gaussian_solve(
+        total_mean, aux_o, nodes, wts, jnp.asarray(inv_tau),
+        jnp.asarray(fs.intercept_value), response, n_iter, tol,
     )
     return float(m0), float(v0)
 
