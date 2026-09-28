@@ -301,7 +301,9 @@ def test_glm_vi_profile_kernel_recovers():
                   glm.default_schedule(), max_iter=50)
     assert _feat_pip(st, causal) > 0.9
     assert causal in _tops(st)
-    assert st.family_state.intercept_value == 0.0  # never modeled
+    # no shared intercept step drives the fit; the profiled reference q(b0) is computed
+    # post hoc from the converged effects (never fed back) and lands near the truth
+    assert abs(st.family_state.intercept_value - (-0.5)) < 0.3
 
 
 def test_glm_kernel_response_compatibility_enforced():
