@@ -254,7 +254,7 @@ def test_null_baseline_is_frozen_and_recovers():
     assert _pip(fit, causal) > 0.9
     assert causal in _tops(fit)
     # the offset never moved off the b = 0 Nelson-Aalen baseline
-    null_l0 = breslow_log_cumhaz(d.fixed, jnp.zeros(n))
+    null_l0 = breslow_log_cumhaz(d.strata[0].fixed, jnp.zeros(n))
     np.testing.assert_allclose(np.asarray(fit.family_state.glm_offset),
                                np.asarray(null_l0), atol=1e-12)
 
@@ -284,7 +284,7 @@ def test_pl_read_out_sparse_matches_dense():
     ds = cox_poisson.prep_data(
         jsparse.BCOO.fromdense(X), event_time=time, event_type=event
     )
-    assert ds.sparse_static is not None
+    assert ds.strata[0].sparse_static is not None
     mu_d, dll_d, prec_d, ll0_d = cox_poisson._pl_fit(dd, offset, warm, 1.0)
     mu_s, dll_s, prec_s, ll0_s = cox_poisson._pl_fit(ds, offset, warm, 1.0)
     np.testing.assert_allclose(np.asarray(mu_s), np.asarray(mu_d), atol=1e-8)

@@ -32,7 +32,7 @@ def enable_compilation_cache(path: str | None = None) -> str:
 if os.environ.get("GIBSS_USE_JAX_CACHE", "").lower() in ("1", "true", "yes"):
     try:
         enable_compilation_cache()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         # Never let cache setup break import (e.g. unwritable home dir).
         pass
 
@@ -41,6 +41,7 @@ from .cox_poisson import fit_cox_susie
 from .history import History, Snapshot
 from .linear import fit_linear_susie
 from .methods import PRESETS, fit_glm_susie
+from .rank import fit_susie_rank
 from .twogroup import fit_twogroup_susie
 
 __all__ = [
@@ -49,8 +50,9 @@ __all__ = [
     "Snapshot",
     "_logistic_intercept",
     "enable_compilation_cache",
-    "fit_glm_susie",
     "fit_cox_susie",
+    "fit_glm_susie",
     "fit_linear_susie",
+    "fit_susie_rank",
     "fit_twogroup_susie",
 ]

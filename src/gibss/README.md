@@ -159,6 +159,32 @@ Main Cox response inputs are:
 
 `cox.prep_data(X, y=...)` also accepts a two-column response with columns `[event_time, event_type]`.
 
+`fit_cox_susie(..., strata=labels)` fits stratified Cox: one Breslow baseline per
+stratum, risk sets that stay inside their stratum.
+
+### Rankings
+
+Use [`rank.py`](./rank.py) for a ranking of items with item-level covariates, under
+the recursive shortlist model at a fixed tree topology. `order[r]` is the item at
+rank `r` (0 = top), and a positive coefficient moves items toward the top.
+
+```python
+import numpy as np
+
+from gibss import fit_susie_rank
+
+order = np.argsort(-score)  # best first
+state = fit_susie_rank(X, order, topology="alternating", L=5)
+```
+
+`topology` is `"forward"` (forward Plackett-Luce), `"backward"` (backward PL),
+`"alternating"` (peel the best, then the worst, then the best, ...), or an explicit
+list of `(start, stop, k)` nodes. Every node of these topologies peels one item
+(k* = min(k, m - k) = 1). The ranking likelihood is then exactly a stratified Cox
+partial likelihood on the stacked design `[X; -X]`, and the fit runs on the
+`cox_poisson` machinery. Topologies with k* > 1 nodes (`"balanced"`) raise
+`NotImplementedError` for now.
+
 ### Two-group
 
 Use [`twogroup.py`](./twogroup.py) for two-group enrichment on summary statistics
@@ -344,6 +370,7 @@ The default schedules in each family module show those extra pieces.
 - Use `linear` for Gaussian outcomes (or `method="linear"`).
 - Use `cox` for survival outcomes; `cox_poisson` for the offset-integrable
   Poisson-Breslow reduction.
+- Use `fit_susie_rank` for rankings (forward / backward / alternating topologies).
 - Use `twogroup.fit` for two-group enrichment on `(bhat, se)`.
 - Reach for `gibss.legacy.{localjj,globaljj,irls,logistic_localtaylor}` only for
   reference / parity against the generic engine, not for new work.
