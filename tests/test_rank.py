@@ -219,6 +219,53 @@ def test_sparse_matches_dense():
         np.testing.assert_allclose(_log_bf(es), _log_bf(ed), atol=1e-8)
 
 
+def _breslow_binned_loglik(eta, order, topology, bins):
+    """Direct Breslow bin model: in each peel group but the last, each sign's peels are
+    tied events against the items alive at the group's start."""
+    n = eta.shape[0]
+    e = np.asarray(eta)[np.asarray(order)]
+    peels, time = rank._peels(n, rank.topology_nodes(n, topology))
+    group = time * bins // (n - 1)
+    total = 0.0
+    for g in range(bins - 1):
+        alive = group >= g
+        for sign in (1, -1):
+            ev = [pos for t, sg, pos in peels if sg == sign and t * bins // (n - 1) == g]
+            if ev:
+                total += sign * e[ev].sum() - len(ev) * np.log(np.exp(sign * e[alive]).sum())
+    return total
+
+
+@pytest.mark.parametrize("topology", TOPOLOGIES)
+@pytest.mark.parametrize("bins", [1, 3, 7, 29])
+def test_binned_is_breslow_bin_model(topology, bins):
+    # bins= codes the grouped peels as Breslow-tied events with the last group censored;
+    # bins >= n - 1 is the full ranking; bins = 1 leaves nothing to fit.
+    rng = np.random.default_rng(bins)
+    n, p = 30, 2
+    X = rng.normal(size=(n, p))
+    b = rng.normal(size=p)
+    order = rng.permutation(n)
+    if bins == 1:
+        with pytest.raises(ValueError, match="nothing to fit"):
+            rank.prep_data(X, order, topology, bins=bins)
+        return
+    d = rank.prep_data(X, order, topology, bins=bins, center=False)
+    eta_s = jnp.asarray(d.X) @ jnp.asarray(b)
+    got = 0.0
+    for s in d.strata:
+        t = np.asarray(s.fixed.time_sorted)[np.asarray(s.fixed.inverse_order)]
+        ev = np.asarray(s.fixed.event_sorted)[np.asarray(s.fixed.inverse_order)]
+        e = np.asarray(eta_s)[np.asarray(s.rows)]
+        risk = t[None, :] >= t[:, None]
+        lse = np.log((np.exp(e)[None, :] * risk).sum(1))
+        got += float((ev * (e - lse)).sum())
+    eta = X @ b
+    want = (float(rank.log_likelihood(eta, order, topology)) if bins == 29
+            else _breslow_binned_loglik(eta, order, topology, bins))
+    np.testing.assert_allclose(got, want, rtol=1e-12)
+
+
 def test_explicit_nodes_equal_preset():
     rng = np.random.default_rng(7)
     n, p = 40, 4

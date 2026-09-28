@@ -151,20 +151,38 @@ def _peels(n: int, nodes: tuple):
     return peels, time
 
 
-def _strata_rows(n: int, nodes: tuple):
+def _strata_rows(n: int, nodes: tuple, bins: int | None = None):
     """For each stratum sign in (+1, -1) with at least one peel: (positions, time,
-    event) of the rows exposed to that stratum's peels, positions ascending."""
+    event) of the rows exposed to that stratum's peels, positions ascending.
+
+    `bins` coarsens the n - 1 peel times into that many equal-width groups. The
+    peels in a group become tied events against the items alive at the group's
+    start (Breslow ties), and the last group is the unsplit leaf block: all of it
+    is censored. bins=None (or >= n - 1) is the full ranking."""
     peels, time = _peels(n, nodes)
+    if bins is not None:
+        if int(bins) < 1:
+            raise ValueError(f"bins must be >= 1, got {bins!r}")
+        bins = min(int(bins), n - 1)
+    if bins is None or bins == n - 1:
+        group = time
+        peel_group = {t: t for t, _, _ in peels}
+        last = None  # no tied leaf block: the final node is a real peel
+    else:
+        group = time * bins // (n - 1)
+        peel_group = {t: t * bins // (n - 1) for t, _, _ in peels}
+        last = bins - 1
     out = []
     for sign in (1, -1):
-        mine = [(t, pos) for t, sg, pos in peels if sg == sign]
+        mine = [(peel_group[t], pos) for t, sg, pos in peels
+                if sg == sign and peel_group[t] != last]
         if not mine:
             continue
-        first = mine[0][0]
-        positions = np.flatnonzero(time >= first)  # alive at this stratum's first peel
+        first = min(g for g, _ in mine)
+        positions = np.flatnonzero(group >= first)  # alive at this stratum's first peel
         event = np.zeros(n)
         event[[pos for _, pos in mine]] = 1.0
-        out.append((sign, positions, time[positions], event[positions]))
+        out.append((sign, positions, group[positions], event[positions]))
     return out
 
 
@@ -177,17 +195,22 @@ def _check_order(order, n: int) -> np.ndarray:
     return order.astype(np.int64)
 
 
-def prep_data(X, order, topology="forward", *, center=None) -> CoxPoissonData:
+def prep_data(X, order, topology="forward", *, bins=None, center=None) -> CoxPoissonData:
     """The stacked stratified-Cox data for ranking `order` under `topology`.
 
     X is (n_items, p), one row per item, in any order. `order[r]` is the item at
-    rank r (r = 0 is the top). Returns `CoxPoissonData` whose rows are the stacked
-    (item, stratum) pairs; fit it with `cox_poisson.fit_prepared`."""
+    rank r (r = 0 is the top). `bins` groups the peels into that many tied groups
+    (see `_strata_rows`): Breslow-binned, and the last group is left unranked.
+    Returns `CoxPoissonData` whose rows are the stacked (item, stratum) pairs; fit
+    it with `cox_poisson.fit_prepared`."""
     n = X.shape[0]
     order = _check_order(order, n)
     nodes = topology_nodes(n, topology)
     items, signs, times, events, labels = [], [], [], [], []
-    for sign, positions, t, ev in _strata_rows(n, nodes):
+    strata = _strata_rows(n, nodes, bins)
+    if not strata:
+        raise ValueError(f"bins={bins} leaves every item in the one tied block: nothing to fit")
+    for sign, positions, t, ev in strata:
         items.append(order[positions])
         signs.append(np.full(positions.size, float(sign)))
         times.append(t.astype(float))
@@ -234,6 +257,7 @@ def fit_susie_rank(
     order,
     topology="forward",
     *,
+    bins=None,  # group the peels into this many tied (Breslow) groups; None = full ranking
     L=5,  # int, or "auto" for greedy forward-selection (grows to max_L)
     prior_variance=1.0,
     estimate_prior_variance=True,
@@ -262,8 +286,14 @@ def fit_susie_rank(
     `topology_nodes`). The remaining arguments are `fit_cox_susie`'s
     method="poisson" arguments: `baseline` ("profiled" = exact per-feature
     evidence, the default; "shared"; "null" = score analysis) and
-    `offset_integration` ("none" or "gh")."""
-    data = prep_data(X, order, topology, center=center)
+    `offset_integration` ("none" or "gh").
+
+    `bins` coarsens the ranking for speed: the n - 1 peels fall into `bins`
+    equal-width groups, each group's peels are tied events against the items alive
+    at its start (Breslow ties, so this approximates the bin model's e_k), and the
+    last group is left unranked. For forward that is rank bins with the bottom bin
+    tied; for alternating each group peels a top and a bottom slice together."""
+    data = prep_data(X, order, topology, bins=bins, center=center)
     return fit_prepared(
         data, L=L, prior_variance=prior_variance,
         estimate_prior_variance=estimate_prior_variance,
