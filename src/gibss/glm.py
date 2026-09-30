@@ -327,7 +327,7 @@ def _ov_any_positive(offset_var):
     return float(ov) > 0.0 if ov.ndim == 0 else bool(jnp.any(ov > 0.0))
 
 
-def _build_offset_table(data, state, effects, offset_var):
+def _build_offset_table(data, state, effects, offset_var, keys=None):
     """The vi_gh aux: an offset-integrated cumulant table from an explicit list of
     single-effects (each read in EFFECT space -- x, alpha, mu, var) PLUS one homogeneous
     zero-mean Gaussian `N(0, offset_var)` (the shared intercept's factor). The offset MEAN
@@ -335,7 +335,10 @@ def _build_offset_table(data, state, effects, offset_var):
 
     Two builders share this seam and the same table contract:
       CharFnOffset : exact CF product; the effects' mixtures and `offset_var` both fold
-                     into the closed-form CF (obar=0 already).
+                     into the closed-form CF (obar=0 already). `keys` (the effects' slot
+                     indices) lets it memoize each effect's CF factor across the tables of
+                     a sweep (`cf_offset._FactorCache`), so a factor is computed once per
+                     effect update, not once per table.
       Compress     : quadrature peel; the intercept N(0, offset_var) is seeded first
                      (sparse `init=`) or appended as a zero-mean effect (dense), and the
                      result is RE-CENTERED to obar=0 (coeffs unchanged, interval was at
@@ -408,20 +411,23 @@ def _build_offset_table(data, state, effects, offset_var):
         # uses the baseline+support split (colmean) instead of zero-clumping -- no densify.
         cbar = getattr(data, "column_center", None)
         return smoother.build_aux_sparse(
-            base, y, X, eff, offset_var=offset_var, colmean=cbar
+            base, y, X, eff, offset_var=offset_var, colmean=cbar, keys=keys
         )
     eff = [(X, e.alpha, e.mu, e.var) for e in effects]
-    return smoother.build_aux(base, y, eff, offset_var=offset_var)
+    return smoother.build_aux(base, y, eff, offset_var=offset_var, keys=keys)
 
 
 def _offset_table_aux(data, state, l):
     """Effect-j vi_gh aux: fold the OTHER effects' Gaussian mixtures PLUS the shared
     intercept's Gaussian factor N(0, v0). The offset MEAN lives in eta (the caller's
     `offset` = LOO message mean + intercept m0)."""
-    others = [e for j, e in enumerate(state.single_effects) if j != l]
+    keys = [j for j in range(len(state.single_effects)) if j != l]
+    others = [state.single_effects[j] for j in keys]
     # offset_var: the shared intercept's N(0, v0) PLUS the random intercept's per-row v_i
     # (both are homogeneous zero-mean Gaussian offsets to fold; the effect means ride in eta).
-    return _build_offset_table(data, state, others, _intercept_ov(state) + _ri_var(state))
+    return _build_offset_table(
+        data, state, others, _intercept_ov(state) + _ri_var(state), keys=keys
+    )
 
 
 def _intercept_offset_aux(data, state):
@@ -429,7 +435,10 @@ def _intercept_offset_aux(data, state):
     effect, so its offset is every b_l; it excludes ITSELF). The random intercept, being a
     SEPARATE factor, is part of the shared intercept's offset -> its per-row v_i rides in
     offset_var (its mean rides in eta via `_intercept_gaussian`'s total_mean)."""
-    return _build_offset_table(data, state, list(state.single_effects), _ri_var(state))
+    effects = list(state.single_effects)
+    return _build_offset_table(
+        data, state, effects, _ri_var(state), keys=list(range(len(effects)))
+    )
 
 
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
@@ -544,6 +553,19 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     return mu, var, log_bf, coefficient_kl, nodes
 
 
+@partial(jax.jit, static_argnames=("response", "jj"))
+def _null_loglik_sum(response, offset, aux, jj):
+    """`sum_i loglik_i(offset_i)` at b=0 (the jj kernel's fixed-tilt bound at the null
+    tilt when `jj`). Jitted: eagerly the table smoothers' Clenshaw is ~150 small dispatches
+    per call, once per SER update."""
+    if jj:
+        y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
+        ov = jnp.asarray(ov)
+        xi0 = jnp.sqrt(jnp.maximum(offset**2 + ov, 1e-12))
+        return jnp.sum(response.terms(offset, (y, ov, xi0))[0])
+    return jnp.sum(response.terms(offset, aux)[0])
+
+
 def _null_log_marginal(fs, aux, offset):
     """The SER's b=0 null log marginal on the KERNEL'S OWN scale -- the reference
     feature_log_bf is measured against, stored so the absolute marginal is
@@ -558,12 +580,7 @@ def _null_log_marginal(fs, aux, offset):
     offset = jnp.asarray(offset)
     if fs.intercept == "profiled":
         return float(_profile_null(response, offset, aux)[1])
-    if fs.kernel == "jj":
-        y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
-        ov = jnp.asarray(ov)
-        xi0 = jnp.sqrt(jnp.maximum(offset**2 + ov, 1e-12))
-        return float(jnp.sum(response.terms(offset, (y, ov, xi0))[0]))
-    return float(jnp.sum(response.terms(offset, aux)[0]))
+    return float(_null_loglik_sum(response, offset, aux, fs.kernel == "jj"))
 
 
 def _fit_effect(data, fs, aux, offset, prior_variance, order):
@@ -736,10 +753,23 @@ def _intercept_point(data, state):
     else:
         aux = _aux(data, state, include_intercept_var=False)
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
+    b0, v0 = _intercept_point_solve(
+        total_mean, aux, jnp.asarray(inv_tau), jnp.asarray(fs.intercept_value),
+        response, fs.kernel == "jj",
+    )
+    return float(b0), float(v0)
 
+
+@partial(jax.jit, static_argnames=("response", "jj", "n_iter"))
+def _intercept_point_solve(total_mean, aux, inv_tau, b0_init, response, jj, n_iter=50):
+    """The point-intercept Newton solve of `_intercept_point`, hoisted under `@jax.jit`
+    (like `_intercept_gaussian_solve`): as a bare eager `while_loop` closing over the
+    per-sweep arrays it re-traced and re-compiled at the same shapes before EVERY effect
+    update -- the dominant cost of a plug-in (gIBSS) sweep at moderate n. Returns
+    `(b0, v0)`."""
     def terms_at(b0):
         eta = total_mean + b0
-        if fs.kernel == "jj":
+        if jj:
             y, ov = aux
             xi = jnp.sqrt(eta**2 + ov)
             return response.terms(eta, (y, ov, xi))
@@ -751,9 +781,9 @@ def _intercept_point(data, state):
         step = (jnp.sum(g) - inv_tau * b0) / jnp.maximum(jnp.sum(w) + inv_tau, 1e-8)
         return b0 + jnp.clip(step, -4.0, 4.0), it + 1
 
-    b0, _ = jax.lax.while_loop(lambda s: s[1] < 50, body, (jnp.asarray(fs.intercept_value), 0))
+    b0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (b0_init, 0))
     v0 = 1.0 / jnp.maximum(jnp.sum(terms_at(b0)[2]) + inv_tau, 1e-8)
-    return float(b0), float(v0)
+    return b0, v0
 
 
 def estimate_intercept(data, state):
@@ -881,7 +911,10 @@ def _random_intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     s2 = jnp.asarray(fs.random_intercept_prior_variance)  # scalar or per-row (n,)
     inv_s2 = 1.0 / s2
     response = fs.response
-    aux = _build_offset_table(data, state, list(state.single_effects), _intercept_ov(state))
+    effects = list(state.single_effects)
+    aux = _build_offset_table(
+        data, state, effects, _intercept_ov(state), keys=list(range(len(effects)))
+    )
     # offset mean in eta: effects' mean + glm_offset + the SHARED intercept (own ri mean out)
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + fs.intercept_value
     nodes_np, logw_np = _gh_rule(order)

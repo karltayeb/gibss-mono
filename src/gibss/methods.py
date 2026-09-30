@@ -125,6 +125,13 @@ def _resolve(cfg):
     if isinstance(fam, ResponseModel):
         # object passed through verbatim: offset_integration args not consulted
         response = fam
+        if vfam == "gaussian" and isinstance(response, Smoothed) and isinstance(
+            response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset)
+        ):
+            # an explicit Q2 offset-table response (the object form of cf_cavi /
+            # compress_cavi): it needs the vi_gh kernel, whose aux is the table -- the
+            # generic "vi" fallthrough below would hand it (y, ov) and fail.
+            return response, "vi_gh"
     else:
         if fam not in _FAMILIES:
             raise ValueError(

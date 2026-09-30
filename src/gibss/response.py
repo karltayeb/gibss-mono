@@ -126,6 +126,22 @@ class Smoother:
     # tuned OUTSIDE the kernel by an engine step (glm.update_row_param_step) via
     # `row_param` -- e.g. JJFixed's tilt, TaylorFixed's expansion anchor.
     takes_row_param = False
+    # residual_order: for a scheme whose `terms` is `plugin_terms + residual_terms` (the
+    # Chebyshev offset tables: Compress, CharFnOffset), the GH order the vi_gh kernels use
+    # to integrate the RESIDUAL over b ~ N(m, v); the plug-in base keeps the kernel's full
+    # order. The residual is 10-100x smaller than the base and just as smooth, so it
+    # reaches the base's absolute accuracy on fewer nodes (7 vs 15 agree to ~1e-10 in log
+    # BF) while it carries the whole per-entry Clenshaw cost. "auto" = max(5, order - 8)
+    # (see `response_ser._gh_split`); an int pins it; None = the scheme has no split.
+    residual_order: int | str | None = None
+
+    def plugin_terms(self, base, eta, aux):
+        """The cheap exact half of a split scheme (see `residual_order`)."""
+        raise NotImplementedError
+
+    def residual_terms(self, base, eta, aux):
+        """The expensive tabulated half of a split scheme (see `residual_order`)."""
+        raise NotImplementedError
 
     def validate(self, base):
         """Raise TypeError if `base` lacks what this scheme needs. Default: any
@@ -492,9 +508,18 @@ class Compress(Smoother):
     M: int = 48
     T: float = 10.0
     kappa: float = 4.0
+    # GH order the vi_gh kernels use for the Chebyshev RESIDUAL over b (the plug-in base
+    # keeps the kernel's full order); see `Smoother.residual_order`. None = no split.
+    residual_order: int | str | None = "auto"
 
     def validate(self, base):
         self.inner.validate(base)
+
+    def plugin_terms(self, base, eta, aux):
+        return _table_plugin_terms(base, eta, aux)
+
+    def residual_terms(self, base, eta, aux):
+        return _table_residual_terms(eta, aux)
 
     def build_aux(self, base, y, means, vars_, log_pi):
         """Precompute the compressed aux from a per-row Gaussian-mixture offset law
@@ -1195,13 +1220,38 @@ class Compress(Smoother):
         return y, s, center, halfwidth, -cr0, -cr1, cr2
 
     def terms(self, base, eta, aux):
-        y, obar, center, halfwidth, coef_ll, coef_g, coef_w = aux
-        bll, bg, bw = base.terms(eta + obar, y)  # exact plug-in at the mean shift
-        t = jnp.clip((eta - center) / halfwidth, -1.0, 1.0)
-        ll = bll + _clenshaw_batched(coef_ll, t)
-        g = bg + _clenshaw_batched(coef_g, t)
-        w = jnp.maximum(bw + _clenshaw_batched(coef_w, t), 0.0)
-        return ll, g, w
+        return _table_terms(base, eta, aux)
+
+
+def _table_plugin_terms(base, eta, aux):
+    """The plug-in half of a Chebyshev offset table: the exact base terms at the mean
+    shift `eta + obar` (`obar` = 0 for the CF table, whose mean lives in eta)."""
+    y, obar = aux[0], aux[1]
+    return base.terms(eta + obar, y)
+
+
+def _table_residual_terms(eta, aux):
+    """The residual half of a Chebyshev offset table: the three degree-M Clenshaw series
+    `(A - Atilde, A' - Atilde', Atilde'' - A'')` on `[center - hw, center + hw]`, clamped
+    to the endpoint value outside (where the residual has decayed). The expensive part of
+    the in-loop evaluation (two series per entry-node in the Newton loop, ~5-10x the
+    base sigmoid); the vi_gh kernels integrate it over b on fewer GH nodes than the base
+    when the smoother sets `residual_order`."""
+    _, _, center, halfwidth, coef_ll, coef_g, coef_w = aux
+    t = jnp.clip((eta - center) / halfwidth, -1.0, 1.0)
+    return (
+        _clenshaw_batched(coef_ll, t),
+        _clenshaw_batched(coef_g, t),
+        _clenshaw_batched(coef_w, t),
+    )
+
+
+def _table_terms(base, eta, aux):
+    """`plug-in base + Clenshaw residual` = `(y*eta - Atilde, y - Atilde', Atilde'')`,
+    with the assembled weight floored at 0 (convex; Atilde'' >= 0 anyway)."""
+    bll, bg, bw = _table_plugin_terms(base, eta, aux)
+    rll, rg, rw = _table_residual_terms(eta, aux)
+    return bll + rll, bg + rg, jnp.maximum(bw + rw, 0.0)
 
 
 @dataclass(frozen=True)

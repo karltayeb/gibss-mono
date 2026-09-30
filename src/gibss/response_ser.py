@@ -64,6 +64,129 @@ def _posterior_moments(logint, b_nodes, dll_nodes):
     return mu, var, log_norm, coefficient_kl
 
 
+def _stein_sums(W, u, w):
+    """Gauss-Hermite node sums that give the v-derivatives of the Gaussian expectation
+    for free (no extra likelihood pass), for the joint (m, v) Newton of the vi_gh kernels.
+
+    For `b ~ N(m, v)` written as `b = m + sqrt(2 v) u` on the GH nodes `u` with weights
+    `W`, Stein's identities `E[(b - m)/v f(b)] = E[f'(b)]` and
+    `E[((b - m)^2/v^2 - 1/v) f(b)] = E[f''(b)]` applied to `f(b) = A''(offset + x b)` give
+
+        x   E[A'''(.)]  = sqrt(2 / v) * T3,   T3 = sum_k W_k u_k        w_k
+        x^2 E[A''''(.)] = T4 / v,             T4 = sum_k W_k (2 u_k^2 - 1) w_k
+
+    from the weights `w_k = A''` already evaluated at the nodes. (A caller that places its
+    nodes at `|x| sqrt(2v) u` rather than `x sqrt(2v) u` has `b - m = sign(x) sqrt(2v) u`
+    and must put `sign(x)` on the odd sum `T3`.) `W` and `u` are the (order,)
+    weights/nodes and `w` is (order, *entry); returns `(E[w], T3, T4)`, each with
+    the node axis reduced, as ONE variadic reduction so the (expensive, table-Clenshaw)
+    producer of `w` is fused and evaluated once: three separate reductions let XLA
+    duplicate it into each consumer (doubling the per-iteration cost), and a contraction
+    against a (3, order) weight matrix materializes the (order, *entry) tensor instead."""
+    lead = (-1,) + (1,) * (jnp.ndim(w) - 1)
+    W, u = W.reshape(lead), u.reshape(lead)
+    zero = jnp.zeros((), w.dtype)
+    return jax.lax.reduce(
+        (W * w, W * u * w, W * (2.0 * u**2 - 1.0) * w),
+        (zero, zero, zero),
+        lambda a, b: tuple(ai + bi for ai, bi in zip(a, b)),
+        (0,),
+    )
+
+
+class _TermsView:
+    """A response-like view exposing one half of a split scheme (`plugin_terms` or
+    `residual_terms`, see `Smoother.residual_order`) as `.terms(eta, aux)`, so helpers
+    written against `response.terms` (e.g. `_background`) can integrate each half on its
+    own GH node set."""
+
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def terms(self, eta, aux):
+        return self._fn(eta, aux)
+
+
+def _gh_split(response, order):
+    """`(rules, views)` for integrating `response.terms` over b ~ N(m, v) by GH: one
+    (nodes, weights, view) per part. A split scheme (a Chebyshev offset table with
+    `residual_order` below `order`) gets its exact plug-in base on the kernel's `order`
+    nodes and its tabulated residual on `residual_order` nodes -- the residual carries the
+    per-entry Clenshaw cost, so this is the CAVI kernel's dominant saving -- and the two
+    GH sums add (E[.] is linear). Anything else is one part on `order` nodes."""
+    sm = getattr(response, "smoother", None)
+    ro = getattr(sm, "residual_order", None)
+    if ro == "auto":
+        # The residual is ~100x smaller than the base, and the GH error is geometric in
+        # the node count, so it reaches the base's ABSOLUTE accuracy with ~8 fewer nodes
+        # (a few for the smooth small-variance columns, ~10 at the hard large-x^2 v end).
+        # Tied to the kernel's order so a caller asking for a high order gets it on both
+        # halves. Floor of 5: below that the residual's own shape is under-resolved.
+        ro = max(5, int(order) - 8)
+    if isinstance(response, Smoothed) and ro is not None and ro < order:
+        base = response.base
+        parts = [
+            (order, _TermsView(lambda eta, aux: sm.plugin_terms(base, eta, aux))),
+            (ro, _TermsView(lambda eta, aux: sm.residual_terms(base, eta, aux))),
+        ]
+    else:
+        parts = [(order, response)]
+    out = []
+    for o, view in parts:
+        nodes_np, logw_np = _gh_rule(o)
+        out.append((jnp.asarray(nodes_np), jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi), view))
+    return out
+
+
+def _joint_newton_step(m, v, G, W, S3, S4, inv_pv, max_step: float = 4.0):
+    """One safeguarded joint Newton step on the per-feature Gaussian-VI stationarity
+    conditions, in `(m, lambda = 1/v)`:
+
+        r1 = G - m/pv = 0             (score:     G = sum_i x E_b[g])
+        r2 = lambda - 1/pv - W = 0    (Price:     W = sum_i x^2 E_b[w])
+
+    with the exact Jacobian from the third/fourth cumulant sums `S3 = sum_i x^3 E[A''']`,
+    `S4 = sum_i x^4 E[A'''']` (`_stein_sums`):
+
+        dr1/dm = -(1/pv + W)      dr1/dlambda =  v^2 S3 / 2
+        dr2/dm = -S3              dr2/dlambda =  1 + v^2 S4 / 2
+
+    The classic alternation (Newton on m at fixed v, then v <- 1/(1/pv + W)) is a Jacobi
+    iteration on this system whose error contracts at rate ~sqrt(v^3/2) |S3|: it is fast for
+    well-supported columns but crawls (alternating-sign steps, rate ~0.4) on weakly supported
+    ones (v ~ prior variance), and the max-over-features tolerance makes the whole batch pay
+    for them. The joint step removes the coupling, so every feature converges quadratically.
+
+    Safeguards: the joint step is used only where the 2x2 system is a well-posed descent
+    system (`d > 0`, `det < 0`, i.e. the same sign structure as at the optimum) and keeps
+    lambda within [1/4, 4] of its current value; elsewhere the plain alternation step is
+    taken. The m-step is clipped to +-`max_step` (the undamped Newton step overshoots to
+    +-inf on a (near-)separated column at large prior variance). Both branches share the
+    fixed point. Returns `(m_new, v_new, resid)` with `resid = max_j max(|dm|, |dlambda|/lambda)`."""
+    lam = 1.0 / v
+    prec = inv_pv + W
+    r1 = G - inv_pv * m
+    r2 = lam - prec
+    a = -prec
+    b = 0.5 * v**2 * S3
+    c = -S3
+    d = 1.0 + 0.5 * v**2 * S4
+    det = a * d - b * c
+    det_safe = jnp.where(det != 0.0, det, -1.0)
+    dm = -(d * r1 - b * r2) / det_safe
+    dl = -(-c * r1 + a * r2) / det_safe
+    lam_j = prec  # the alternation's v-update (Price at the current iterate)
+    dm_j = r1 / prec  # the alternation's Newton m-step at fixed v
+    ok = (d > 0.0) & (det < 0.0) & (lam + dl > 0.25 * lam) & (lam + dl < 4.0 * lam)
+    dm = jnp.where(ok, dm, dm_j)
+    lam_new = jnp.where(ok, lam + dl, lam_j)
+    dm = jnp.clip(dm, -max_step, max_step)
+    resid = jnp.maximum(jnp.max(jnp.abs(dm)), jnp.max(jnp.abs(lam_new - lam) / lam))
+    return m + dm, 1.0 / lam_new, resid
+
+
 def _background(response, offset, aux, c, mode: str = "exact", degree: int = 40):
     """All-rows sums (W, G, L) of (weight, grad, loglik) at eta = offset + c, per c_j.
 
@@ -851,34 +974,44 @@ def glm_vi_gh_ser(
     x = op.entry_x
     inv_pv = 1.0 / prior_variance
 
-    nodes_np, logw_np = _gh_rule(order)
-    nodes = jnp.asarray(nodes_np)
-    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+    parts = _gh_split(response, order)  # [(nodes, weights, terms view)], 1 or 2 parts
+    aux_o = _tmap(lambda a: a[None, ...], aux_e)  # open the GH-node axis on aux
 
-    def smoothed(m, v):
+    def node_terms(m, v):
         # E_{b ~ N(m, v)} of the offset-integrated cumulant terms, by GH over b. The
         # variance folded here is the EFFECT's alone (x^2 v); the offset is already
         # integrated inside `response`/`aux`, so -- unlike glm_vi_ser -- there is no ov.
+        # Returns the per-entry GH sums (E[ll], E[g], E[w]) plus the two Stein sums the
+        # joint (m, v) Newton needs (see `_stein_sums`), all from the same node pass(es):
+        # a split scheme evaluates its plug-in base and its table residual on their own
+        # node sets (`_gh_split`) and the sums add. The assembled E[w] is floored at 0
+        # (the scheme's convexity guard, applied to the GH average here).
         ve = x**2 * op.broadcast_cols(v)
         eta = off_e + x * op.broadcast_cols(m)
         sd = jnp.sqrt(2.0 * jnp.maximum(ve, 0.0))
         lead = (-1,) + (1,) * jnp.ndim(eta)
-        shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)  # (order, *eta)
-        aux_o = _tmap(lambda a: a[None, ...], aux_e)  # open the GH-node axis on aux
-        ll, g, w = response.terms(shft, aux_o)
-        W = wts.reshape(lead)
-        return jnp.sum(W * ll, 0), jnp.sum(W * g, 0), jnp.sum(W * w, 0)
+        acc = None
+        for nodes, wts, view in parts:
+            shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)  # (order, *eta)
+            ll, g, w = view.terms(shft, aux_o)
+            W = wts.reshape(lead)
+            part = (jnp.sum(W * ll, 0), jnp.sum(W * g, 0)) + _stein_sums(wts, nodes, w)
+            acc = part if acc is None else tuple(a + b for a, b in zip(acc, part))
+        Ell, Eg, Ew, T3, T4 = acc
+        return Ell, Eg, jnp.maximum(Ew, 0.0), T3, T4
 
     def body(state):
         m, v, _, it = state
-        _, g, w = smoothed(m, v)
-        prec = inv_pv + op.local_moment(2, w)
-        # Damp: the undamped Newton m-step overshoots on a (near-)separated column at
-        # large prior variance (w -> 0, prec -> inv_pv tiny), sending m to +-inf and a
-        # confidently-wrong log_bf. Clip to +-4 log-odds like glm_ser / the sibling
-        # vi_gh kernels; near the mode the raw step is small, so convergence is kept.
-        step = jnp.clip((op.local_moment(1, g) - inv_pv * m) / prec, -4.0, 4.0)
-        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+        _, g, w, T3, T4 = node_terms(m, v)
+        vb = op.broadcast_cols(v)
+        G = op.local_moment(1, g)
+        Wm = op.local_moment(2, w)
+        # the nodes sit at |x| sqrt(2v) u (sd = sqrt(x^2 v)), so b - m = sign(x) sqrt(2v) u
+        # and the odd Stein sum carries sign(x); the even one does not.
+        S3 = op.local_moment(2, jnp.sign(x) * jnp.sqrt(2.0 / vb) * T3)  # sum_i x^3 E[A''']
+        S4 = op.local_moment(2, T4 / vb)  # sum_i x^4 E[A'''']
+        m_new, v_new, resid = _joint_newton_step(m, v, G, Wm, S3, S4, inv_pv)
+        return m_new, v_new, resid, it + 1
 
     m, v, _, _ = jax.lax.while_loop(
         lambda s: (s[3] < n_iter) & (s[2] > tol),
@@ -891,7 +1024,7 @@ def glm_vi_gh_ser(
 
     # ELBO - baseline: E_q[ll] is the GH-averaged ll at (m, v); baseline is b = 0, where
     # ve = 0 so no GH is needed (the offset is already in the table -> terms at offset).
-    ll = smoothed(m, v)[0]
+    ll = node_terms(m, v)[0]
     ll0 = response.terms(off_e, aux_e)[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
     # A feature that failed to converge (reset to the null m=0) carries no evidence -> 0,
@@ -931,39 +1064,48 @@ def glm_vi_gh_center_ser(
     c_e = op.broadcast_cols(c)
     xc_e = x_e - c_e  # (x_ij - c_j) at support entries
     inv_pv = 1.0 / prior_variance
-    nodes_np, logw_np = _gh_rule(order)
-    nodes = jnp.asarray(nodes_np)
-    wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
+    parts = _gh_split(response, order)  # [(nodes, weights, terms view)], 1 or 2 parts
 
-    def sc_at(b):
+    def sc_at(b, view=response):
         # centered (loglik, score, curvature) per feature at a single b (p,), all-rows:
         # support entries use (x-c); the off-support fill uses -c (the `_background` sum
         # over ALL rows, minus the support rows already counted at the support predictor).
+        # `view` selects the full terms or one half of a split scheme (`_gh_split`).
         b_e = op.broadcast_cols(b)
         eta_e = off_e + xc_e * b_e  # support predictor
         eta_bg_e = off_e - c_e * b_e  # support rows at the background shift (correction)
-        ll_e, g_e, w_e = response.terms(eta_e, aux_e)
-        ll_b, g_b, w_b = response.terms(eta_bg_e, aux_e)
-        BGw, BGg, BGl = _background(response, offset, aux, -c * b, background, degree)
+        ll_e, g_e, w_e = view.terms(eta_e, aux_e)
+        ll_b, g_b, w_b = view.terms(eta_bg_e, aux_e)
+        BGw, BGg, BGl = _background(view, offset, aux, -c * b, background, degree)
         ll = BGl + op.local_moment(0, ll_e - ll_b)
         score = op.local_moment(0, xc_e * g_e) - c * (BGg - op.local_moment(0, g_b))
         curv = op.local_moment(0, xc_e**2 * w_e) + c**2 * (BGw - op.local_moment(0, w_b))
         return ll, score, curv
 
-    def smoothed(m, v):
-        # E_{b ~ N(m, v)} of the centered (ll, score, curv), by GH over b (per feature).
+    def node_terms(m, v):
+        # E_{b ~ N(m, v)} of the centered (ll, score, curv), by GH over b (per feature),
+        # plus the Stein sums of the curvature for the joint (m, v) Newton (`_stein_sums`
+        # with the per-feature centered curvature in place of the per-entry x^2 w). A
+        # split scheme integrates its plug-in base and its table residual on their own
+        # node sets and the sums add; the assembled curvature is floored at 0.
         sd = jnp.sqrt(2.0 * jnp.maximum(v, 0.0))
-        bk = m[None, :] + sd[None, :] * nodes[:, None]  # (order, p) per-feature b nodes
-        ll_k, sc_k, cv_k = jax.vmap(sc_at)(bk)  # (order, p) each
-        W = wts[:, None]
-        return jnp.sum(W * ll_k, 0), jnp.sum(W * sc_k, 0), jnp.sum(W * cv_k, 0)
+        acc = None
+        for nodes, wts, view in parts:
+            bk = m[None, :] + sd[None, :] * nodes[:, None]  # (order, p) per-feature b nodes
+            ll_k, sc_k, cv_k = jax.vmap(lambda b, view=view: sc_at(b, view))(bk)  # (order, p)
+            W = wts[:, None]
+            part = (jnp.sum(W * ll_k, 0), jnp.sum(W * sc_k, 0)) + _stein_sums(wts, nodes, cv_k)
+            acc = part if acc is None else tuple(a + b for a, b in zip(acc, part))
+        Ell, Esc, Ecv, T3, T4 = acc
+        return Ell, Esc, jnp.maximum(Ecv, 0.0), T3, T4
 
     def body(state):
         m, v, _, it = state
-        _, score, curv = smoothed(m, v)
-        prec = inv_pv + curv  # 1/v = 1/pv + sum_i (x-c)^2 E_b[weight]  (Price)
-        step = jnp.clip((score - inv_pv * m) / prec, -4.0, 4.0)
-        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+        _, score, curv, T3, T4 = node_terms(m, v)
+        S3 = jnp.sqrt(2.0 / v) * T3  # sum_i (x-c)^3 E[A''']
+        S4 = T4 / v  # sum_i (x-c)^4 E[A'''']
+        m_new, v_new, resid = _joint_newton_step(m, v, score, curv, S3, S4, inv_pv)
+        return m_new, v_new, resid, it + 1
 
     m, v, _, _ = jax.lax.while_loop(
         lambda s: (s[3] < n_iter) & (s[2] > tol),
@@ -975,7 +1117,7 @@ def glm_vi_gh_center_ser(
     v = jnp.where(ok, v, prior_variance)
     # ELBO - baseline: GH-averaged centered loglik at (m, v) minus the b=0 null (already
     # per-feature summed inside `sc_at`), minus the KL.
-    ll = smoothed(m, v)[0]
+    ll = node_terms(m, v)[0]
     ll0 = sc_at(jnp.zeros(op.p))[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
     return m, v, (ll - ll0) - kl, kl

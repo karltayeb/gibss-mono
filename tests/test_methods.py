@@ -255,3 +255,24 @@ def test_invalid_configurations_raise():
     # unknown intercept: rejected downstream by GLMFamilyState
     with pytest.raises(ValueError, match="intercept"):
         fit_glm_susie(X, y, intercept="wat")
+
+
+def test_explicit_table_response_routes_to_vi_gh():
+    """An explicit Q2 offset-table response passed as `family` (the object form of
+    cf_cavi / compress_cavi) must resolve to the vi_gh kernel: the generic Smoothed
+    fallthrough ('vi') hands it a (y, ov) aux the table cannot consume."""
+    from gibss.cf_offset import CharFnOffset
+    from gibss.methods import _resolve, _DEFAULTS
+    from gibss.response import Bernoulli, Smoothed
+
+    resp = Smoothed(Bernoulli(), CharFnOffset(M=32))
+    cfg = {**_DEFAULTS, "family": resp, "variational_family": "gaussian"}
+    r, kernel = _resolve(cfg)
+    assert r is resp and kernel == "vi_gh"
+    rng = np.random.default_rng(0)
+    n, p = 200, 8
+    X = rng.standard_normal((n, p))
+    y = (rng.random(n) < 1 / (1 + np.exp(-(X[:, 2] * 1.5 - 0.3)))).astype(float)
+    st = fit_glm_susie(X, y, L=2, family=resp, variational_family="gaussian", max_iter=5)
+    assert st.family_state.kernel == "vi_gh"
+    assert int(np.argmax(np.asarray(st.single_effects[0].alpha))) == 2

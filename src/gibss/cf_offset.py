@@ -89,11 +89,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jax.experimental import sparse as jsparse
 from jax.ops import segment_sum
 
-from ._numerics import _cheb_fit_matrix, _clenshaw_batched
+from ._numerics import _cheb_fit_matrix
 from .operators import BCOOOperator
-from .response import Bernoulli, ResponseModel, Smoother
+from .response import (
+    Bernoulli,
+    ResponseModel,
+    Smoother,
+    _table_plugin_terms,
+    _table_residual_terms,
+    _table_terms,
+)
 
 __all__ = [
     "effect_moments",
@@ -175,6 +183,85 @@ class _NtauRatchet:
         return ntau
 
 
+class _FactorCache:
+    """Per-fit memo of the per-effect CF factors `phi_l` (n, ntau) and row moments.
+
+    Under mean-field the offset CF is the PRODUCT of per-effect factors (eq. 2), and an
+    effect's factor is fully determined by its current law `(alpha, mu, var)`. A sweep
+    updates each of the L effects once, yet builds an offset table before every effect
+    update (the L-1 others) AND before every intercept update (all L): without a memo
+    that is O(L^2) factor computations per sweep for O(L) distinct factors. The memo
+    keys each factor by the SLOT the caller names (the effect index, stable across
+    sweeps) and validates it by the IDENTITY of the law arrays -- a SER update replaces
+    the effect's arrays, so a stale factor can never be served -- and by the frequency
+    grid it was computed on (a ratchet bump invalidates every slot at once).
+
+    Bounded memory: one factor per slot (L slots), and no factor is stored once the memo
+    would exceed `max_bytes` (the builder then just recomputes, as without a memo). The
+    memo also remembers, per design object, whether its entries are all 0/1 (the
+    set-membership case), which selects the GEMM factor path (`_binary_terms`).
+
+    Purely a cost concern: the product of memoized factors equals the recomputed product
+    up to floating-point reassociation (~1e-15)."""
+
+    __slots__ = ("slots", "binary", "max_bytes", "nbytes")
+
+    def __init__(self, max_bytes: int):
+        self.slots = {}  # slot -> dict(refs, moments, grid, phi)
+        self.binary = {}  # id(x) -> (x, is_binary)
+        self.max_bytes = int(max_bytes)
+        self.nbytes = 0
+
+    def _entry(self, slot, refs):
+        e = self.slots.get(slot)
+        if e is None or any(a is not b for a, b in zip(e["refs"], refs)):
+            return None
+        return e
+
+    def moments(self, slot, refs, compute):
+        e = self._entry(slot, refs)
+        if e is not None:
+            return e["moments"]
+        mom = compute()
+        if slot is not None:
+            self._drop(slot)
+            self.slots[slot] = {"refs": refs, "moments": mom, "grid": None, "phi": None}
+        return mom
+
+    def factor(self, slot, refs, grid, compute):
+        e = self._entry(slot, refs)
+        if e is not None and e["phi"] is not None and e["grid"] == grid:
+            return e["phi"]
+        phi = compute()
+        if slot is not None and e is not None:  # moments already registered this slot
+            if e["phi"] is not None:
+                self.nbytes -= int(e["phi"].nbytes)
+                e["phi"] = None
+            if self.nbytes + int(phi.nbytes) <= self.max_bytes:
+                e["phi"], e["grid"] = phi, grid
+                self.nbytes += int(phi.nbytes)
+        return phi
+
+    def _drop(self, slot):
+        e = self.slots.pop(slot, None)
+        if e is not None and e["phi"] is not None:
+            self.nbytes -= int(e["phi"].nbytes)
+
+    def is_binary(self, x):
+        hit = self.binary.get(id(x))
+        if hit is not None and hit[0] is x:
+            return hit[1]
+        flag = _is_binary_design(x)
+        self.binary[id(x)] = (x, flag)
+        return flag
+
+
+def _is_binary_design(x) -> bool:
+    """True if every entry of the design `x` (dense or BCOO) is 0 or 1."""
+    vals = x.data if isinstance(x, jsparse.BCOO) else jnp.asarray(x)
+    return bool(jnp.all((vals == 0.0) | (vals == 1.0)))
+
+
 def effect_moments(effect: Effect):
     """Per-row mean and variance of one effect's row contribution `o_li = x_ic b`, both
     `(n,)` and formed WITHOUT an `(n, C)` intermediate beyond the design itself.
@@ -223,14 +310,58 @@ def _effect_cf(effect: Effect, tau):
     return phi_l
 
 
-def offset_cf(effects, tau, n=None, offset_var=0.0):
+@jax.jit
+def _binary_terms(alpha, mu, var, tau, colmean):
+    """Row-independent pieces of one effect's CF on a 0/1 (set-membership) design.
+
+    With `x_ic in {0, 1}` the per-entry phase `exp(i t x_ic mu_c - t^2 x_ic^2 var_c / 2)`
+    takes only two values per feature, so the factor is an affine function of the design:
+
+        phi_l,i(t) = base(t) + sum_c x_ic D_c(t),
+
+    i.e. `base[None, :] + X @ D` -- a GEMM (or SpMM), with no per-entry transcendental.
+    Uncentered (`colmean = 0`): `base = 1`, `D_c = alpha_c (g_c - 1)`, `g_c = exp(i t mu_c
+    - t^2 var_c / 2)` (the zero-clumping identity). Centered by `c_c`: an off-support entry
+    sits at `-c_c` and a support entry at `1 - c_c`, so `base = G_l = sum_c alpha_c g0_c`,
+    `D_c = alpha_c (h_c - g0_c)` with `g0_c, h_c` the phases at `-c_c, 1 - c_c` (the
+    baseline+support split of `offset_cf_sparse`). Returns `(base (ntau,), D (p, ntau))`."""
+    t = tau[None, :]
+    x0 = -colmean[:, None]  # off-support centered value (0 when uncentered)
+    x1 = 1.0 - colmean[:, None]  # on-support centered value
+    g0 = jnp.exp(1j * t * x0 * mu[:, None] - 0.5 * t**2 * x0**2 * var[:, None])
+    h = jnp.exp(1j * t * x1 * mu[:, None] - 0.5 * t**2 * x1**2 * var[:, None])
+    a = alpha[:, None]
+    return jnp.sum(a * g0, axis=0), a * (h - g0)
+
+
+@jax.jit
+def _binary_matmul(x, base, D):
+    """`base[None, :] + x @ D` for a real design `x` (dense or BCOO) and complex `D`, as
+    ONE real matmul over the stacked `[Re D | Im D]` (a BCOO SpMM walks the indices once)."""
+    ntau = D.shape[1]
+    RI = x @ jnp.concatenate([jnp.real(D), jnp.imag(D)], axis=1)  # (n, 2 ntau)
+    return base[None, :] + RI[:, :ntau] + 1j * RI[:, ntau:]
+
+
+def _effect_factor_dense(x, alpha, mu, var, tau, binary):
+    """One dense effect's CF factor (n, ntau): the GEMM path on a 0/1 design, else the
+    feature scan."""
+    if binary:
+        base, D = _binary_terms(alpha, mu, var, tau, jnp.zeros_like(mu))
+        return _binary_matmul(x, base, D)
+    return _effect_cf((x, alpha, mu, var), tau)
+
+
+def offset_cf(effects, tau, n=None, offset_var=0.0, keys=None, cache=None):
     """Zero-mean offset characteristic function, eq. (2): the PRODUCT of the per-effect
-    factors, centered by the total offset mean `s`. Returns `(phi, s, V, spread)` with
-    `phi` `(n, ntau)` complex (centered), and `s, V, spread` `(n,)`.
+    factors, centered by the total offset mean `s`. Returns `(phi, s, V)` with
+    `phi` `(n, ntau)` complex (centered), and `s, V` `(n,)`.
 
     Effects are combined by multiplying their factors -- no sequential peel, no rebuild.
-    Only the changed effect's factor need be recomputed by the caller across updates.
-    Peak memory `O(n, ntau)` (one running product). Returns `(phi, s, V)`.
+    With `keys` (one hashable slot per effect) and a `cache` (`_FactorCache`), a factor
+    whose law arrays are the same objects as when it was last computed on this grid is
+    served from the memo, so across a sweep each effect's factor is computed once, not
+    once per table. Peak memory `O(n, ntau)` for the running product (+ the memo).
 
     `offset_var` (scalar or `(n,)`) adds one extra HOMOGENEOUS zero-mean Gaussian
     `N(0, offset_var)` to the offset -- e.g. the shared intercept's posterior variance
@@ -241,14 +372,33 @@ def offset_cf(effects, tau, n=None, offset_var=0.0):
         if not effects:
             raise ValueError("offset_cf: pass n when effects is empty")
         n = jnp.asarray(effects[0][0]).shape[0]
+    grid = (float(tau[-1]), int(tau.shape[0]))
+    keys = [None] * len(effects) if keys is None else list(keys)
     phi = jnp.ones((n, tau.shape[0]), dtype=jnp.complex128)
     s = jnp.zeros(n)
     V = jnp.zeros(n)
-    for effect in effects:
-        mean, v = effect_moments(effect)
+    for effect, slot in zip(effects, keys):
+        x, alpha, mu, var = effect
+        x = jnp.asarray(x)
+        alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
+        eff = (x, alpha, mu, var)
+        binary = cache.is_binary(x) if cache is not None else _is_binary_design(x)
+        mom = lambda e=eff: effect_moments(e)  # noqa: E731
+        fac = lambda e=eff: _effect_factor_dense(*e, tau, binary)  # noqa: E731
+        if cache is None:
+            mean, v = mom()
+            f = fac()
+        else:
+            mean, v = cache.moments(slot, (alpha, mu, var), mom)
+            f = cache.factor(slot, (alpha, mu, var), grid, fac)
         s = s + mean
         V = V + v
-        phi = phi * _effect_cf(effect, tau)
+        phi = phi * f
+    return _finish_cf(phi, s, V, tau, offset_var)
+
+
+def _finish_cf(phi, s, V, tau, offset_var):
+    """Fold the extra zero-mean Gaussian `N(0, offset_var)` and center to zero mean."""
     ov = jnp.asarray(offset_var)
     V = V + ov  # extra zero-mean Gaussian offset component (e.g. intercept variance)
     phi = phi * jnp.exp(-0.5 * (ov[..., None] if ov.ndim else ov) * tau[None, :] ** 2)
@@ -258,14 +408,18 @@ def offset_cf(effects, tau, n=None, offset_var=0.0):
 
 def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau,
                bucket=None, ratchet=None):
-    """Adaptive `(Tmax, ntau, hw)` for the CF quadrature. `hw = T + kappa sqrt(V)` is the
-    per-row fit half-width. `Tmax` is the logistic kernel tail. `ntau` meets the Nyquist
-    bound `ntau >= Tmax * driver / pi`, with `driver = max_i(hw_i + kappa sqrt(V_i))` --
-    the position content of `Atilde(z) = (A * q_o)(z)` is the sample range `hw` convolved
-    with the offset support `~kappa sqrt(V)`. Crucially the driver is ALPHA-WEIGHTED (via
-    the mixture variance V), so thousands of near-zero-alpha features with large means do
-    NOT inflate the grid -- their CF amplitude is below tolerance. When `ntau` is passed
-    it is only guarded (raise on aliasing), never shrunk.
+    """Adaptive `(Tmax, ntau, hw)` for the CF quadrature. `hw = T + kappa sqrt(max_i V_i)`
+    is the fit half-width, SHARED by every row (a scalar): the Chebyshev nodes `hw x_k`
+    are then the same for all rows, which turns the per-row transform into one GEMM
+    (`_atilde_from_cf`); the widest row sets it, and a row with a narrower offset pays only
+    a marginally larger interval for the same degree (`hw` is dominated by the `T` pad).
+    `Tmax` is the logistic kernel tail. `ntau` meets the Nyquist bound `ntau >= Tmax *
+    driver / pi`, with `driver = max_i(hw + kappa sqrt(V_i))` -- the position content of
+    `Atilde(z) = (A * q_o)(z)` is the sample range `hw` convolved with the offset support
+    `~kappa sqrt(V)`. Crucially the driver is ALPHA-WEIGHTED (via the mixture variance V),
+    so thousands of near-zero-alpha features with large means do NOT inflate the grid --
+    their CF amplitude is below tolerance. When `ntau` is passed it is only guarded (raise
+    on aliasing), never shrunk.
 
     When `ntau` is auto-sized, `bucket` (additive ladder) and `ratchet` (monotone
     high-water mark, `_NtauRatchet`) coarsen and freeze the grid so the `(n, ntau)` CF
@@ -273,16 +427,11 @@ def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau,
     SER update -- each distinct `ntau` is a separate XLA compilation. Both only ever ROUND
     UP (never below the Nyquist `req`), so accuracy is preserved; they change only how many
     compiles the fit triggers."""
-    sd = kappa * jnp.sqrt(jnp.maximum(V, 0.0))
-    hw = T + sd
+    sd_max = kappa * math.sqrt(max(_concrete_or_none(jnp.max(V)) or 0.0, 0.0))
+    hw = T + sd_max
     Tmax = _psi_tail_Tmax(tol) if Tmax is None else float(Tmax)
-    driver = _concrete_or_none(jnp.max(hw + sd))
+    driver = hw + sd_max
     if ntau is None:
-        if driver is None:
-            raise ValueError(
-                "cf_offset: cannot auto-size ntau under jax.jit (the offset support is a "
-                "tracer); pass ntau= explicitly."
-            )
         req = int(math.ceil(safety * Tmax * driver / math.pi)) + 1
         if req > max_ntau:
             raise ValueError(
@@ -301,14 +450,13 @@ def _grid_size(V, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau,
             ntau = ratchet.apply(ntau, max_ntau)
     else:
         ntau = int(ntau)
-        if driver is not None:
-            req = int(math.ceil(Tmax * driver / math.pi))
-            if ntau < req:
-                raise ValueError(
-                    f"cf_offset: ntau={ntau} violates the Nyquist bound (need >= {req} "
-                    f"for driver hw+sd={driver:.1f}, Tmax={Tmax:.1f}); the CF product "
-                    "would alias. Raise ntau, or leave ntau=None to auto-size."
-                )
+        req = int(math.ceil(Tmax * driver / math.pi))
+        if ntau < req:
+            raise ValueError(
+                f"cf_offset: ntau={ntau} violates the Nyquist bound (need >= {req} "
+                f"for driver hw+sd={driver:.1f}, Tmax={Tmax:.1f}); the CF product "
+                "would alias. Raise ntau, or leave ntau=None to auto-size."
+            )
     return Tmax, ntau, hw
 
 
@@ -329,17 +477,21 @@ def smoothed_nodes(
     offset_var=0.0,
     bucket=None,
     ratchet=None,
+    keys=None,
+    cache=None,
 ):
-    """Offset-integrated cumulant `Atilde` and its first two z-derivatives at per-row
-    CGL nodes, via the psi-tamed residual CF quadrature (logistic base only).
+    """Offset-integrated cumulant `Atilde` and its first two z-derivatives at the CGL
+    nodes, via the psi-tamed residual CF quadrature (logistic base only).
 
     `effects` is the leave-one-out set (all effects EXCEPT the one being updated), each
     `(x, alpha, mu, var)` in effect space. Returns `(znodes, At0, At1, At2, hw, s, V)`:
-    `znodes, At0..At2` are `(n, M+1)`; `hw, s, V` are `(n,)`. `znodes` are centered at 0
-    (the offset mean `s` is returned separately for the caller to carry in eta).
+    `znodes, At0..At2` are `(n, M+1)`; `hw, s, V` are `(n,)` (`hw` is one shared value,
+    broadcast). `znodes` are centered at 0 (the offset mean `s` is returned separately for
+    the caller to carry in eta).
 
     `offset_var` folds one extra homogeneous zero-mean Gaussian into the offset (e.g. the
-    shared intercept's posterior variance), sized into the grid and the CF alike."""
+    shared intercept's posterior variance), sized into the grid and the CF alike. `keys` /
+    `cache` memoize the per-effect factors across tables (see `_FactorCache`)."""
     if not isinstance(base, Bernoulli):
         raise TypeError(
             "cf_offset.smoothed_nodes supports only the Bernoulli (logistic) base; "
@@ -349,18 +501,25 @@ def smoothed_nodes(
         if not effects:
             raise ValueError("smoothed_nodes: pass n when effects is empty")
         n = jnp.asarray(effects[0][0]).shape[0]
+    keys = [None] * len(effects) if keys is None else list(keys)
 
     # --- offset moments + adaptive alias-safe grid (concrete/eager) ---
     # a light first pass for the moments only (no ntau), to size the grid
     V0 = jnp.zeros(n) + jnp.asarray(offset_var)
-    for effect in effects:
-        V0 = V0 + effect_moments(effect)[1]
+    for effect, slot in zip(effects, keys):
+        x, alpha, mu, var = effect
+        refs = (jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var))
+        eff = (jnp.asarray(x),) + refs
+        mom = lambda e=eff: effect_moments(e)  # noqa: E731
+        V0 = V0 + (mom() if cache is None else cache.moments(slot, refs, mom))[1]
     Tmax, ntau, hw = _grid_size(
         V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau, bucket, ratchet
     )
     tau, wq, psi = _frequency_grid(Tmax, ntau)
-    phi, s, V = offset_cf(effects, tau, n=n, offset_var=offset_var)  # + intercept var
-    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
+    phi, s, V = offset_cf(
+        effects, tau, n=n, offset_var=offset_var, keys=keys, cache=cache
+    )  # + intercept var
+    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (jnp.full((n,), hw), s, V)
 
 
 def _frequency_grid(Tmax, ntau):
@@ -376,16 +535,16 @@ def _frequency_grid(Tmax, ntau):
 
 @partial(jax.jit, static_argnames=("M",))
 def _atilde_from_cf(phi, V, tau, wq, psi, hw, M):
-    """Offset-integrated cumulant `(znodes, At0, At1, At2)` at the per-row CGL nodes from
-    a ZERO-MEAN offset CF `phi` (n, ntau) via the psi-tamed residual quadrature. Shared
+    """Offset-integrated cumulant `(znodes, At0, At1, At2)` at the CGL nodes from a
+    ZERO-MEAN offset CF `phi` (n, ntau) via the psi-tamed residual quadrature. Shared
     by the dense and sparse builders -- only how `phi` is formed differs.
 
-    `@jax.jit` (M static) gives the inner CGL `scan` a stable compilation cache. This runs
-    once per SER update on both paths; as an eager `lax.scan` closing over the per-update
-    arrays (`phi`, `V`, `hw`), it re-compiled at the same `(n, ntau)` shape every sweep,
-    the bulk of the `cf_cavi` recompile accumulation. With `phi/V/tau/wq/psi/hw` entering
-    as traced arguments the cache key is just their shapes, so it compiles once per
-    distinct `ntau` (already bounded to ~2 by the `_NtauRatchet`) and then hits cache."""
+    The half-width `hw` is one scalar shared by every row, so the CGL nodes `z_k = hw x_k`
+    and the phases `E = exp(i tau z)` (ntau, M+1) are row-independent and the three
+    residual transforms are ONE GEMM over the stacked, kernel-weighted residual
+    `[R c_val; R c_grd; R c_wt] @ E` (3n, ntau) x (ntau, M+1) -- no per-node complex
+    exponential over `(n, ntau)` (the former `scan` over the M+1 nodes cost `(M+1)` such
+    passes per table). `@jax.jit` (M static) keeps one compilation per distinct `ntau`."""
     R = phi - 1.0  # ~ -t^2 V/2 near 0 -> residual transforms are localized
     tau_safe = jnp.where(tau > 0, tau, 1.0)
     c_val = jnp.where(tau > 0, wq * psi / tau_safe**2, 0.0)  # value residual, /t^2
@@ -393,20 +552,33 @@ def _atilde_from_cf(phi, V, tau, wq, psi, hw, M):
     c_wt = wq * psi  # weight residual (no 1/t)
     inv_pi = 1.0 / jnp.pi
     xnodes = jnp.asarray(_cheb_fit_matrix(M)[0])  # (M+1,) CGL nodes on [-1, 1]
-
-    def node(_, xk):
-        z = hw * xk  # (n,)
-        P = R * jnp.exp(1j * (tau[None, :] * z[:, None]))  # (n, ntau) = (phi-1) e^{itz}
-        re, im = jnp.real(P), jnp.imag(P)
-        D_ll = inv_pi * (re @ c_val + wq[0] * (-0.5 * V))  # A - Atilde
-        D_g = -inv_pi * (im @ c_grd)  # A' - Atilde'
-        D_w = inv_pi * (re @ c_wt)  # Atilde'' - A''
-        return _, (D_ll, D_g, D_w)
-
-    _, (D_ll, D_g, D_w) = jax.lax.scan(node, 0.0, xnodes)  # each (M+1, n)
-    znodes = hw[:, None] * xnodes[None, :]  # (n, M+1)
+    z = hw * xnodes  # (M+1,) shared CGL nodes in z
+    E = jnp.exp(1j * (tau[:, None] * z[None, :]))  # (ntau, M+1)
+    stacked = jnp.concatenate(
+        [R * c_val[None, :], R * c_grd[None, :], R * c_wt[None, :]], axis=0
+    )  # (3n, ntau)
+    P = stacked @ E  # (3n, M+1) complex
+    n = phi.shape[0]
+    D_ll = inv_pi * (jnp.real(P[:n]) + wq[0] * (-0.5 * V)[:, None])  # A - Atilde
+    D_g = -inv_pi * jnp.imag(P[n : 2 * n])  # A' - Atilde'
+    D_w = inv_pi * jnp.real(P[2 * n :])  # Atilde'' - A''
+    znodes = jnp.broadcast_to(z[None, :], (n, M + 1))
     sig = jax.nn.sigmoid(znodes)
-    return znodes, jax.nn.softplus(znodes) - D_ll.T, sig - D_g.T, sig * (1.0 - sig) + D_w.T
+    return znodes, jax.nn.softplus(znodes) - D_ll, sig - D_g, sig * (1.0 - sig) + D_w
+
+
+def _fit_table(y, znodes, At0, At1, At2, hw, M):
+    """Compress-style aux `(y, obar, center, halfwidth, coef_ll, coef_g, coef_w)` from the
+    node values: degree-M Chebyshev fits of the plug-in residuals `(A - Atilde, A' -
+    Atilde', Atilde'' - A'')` on `[-hw, hw]`, `obar = center = 0`."""
+    _, Vinv_np = _cheb_fit_matrix(M)
+    Vinv = jnp.asarray(Vinv_np)
+    fit = lambda vals: vals @ Vinv.T  # noqa: E731  (n, M+1) samples -> coeffs
+    sig = jax.nn.sigmoid(znodes)
+    A0 = jax.nn.softplus(znodes)
+    A2 = sig * (1.0 - sig)
+    z = jnp.zeros_like(hw)  # obar/center = 0
+    return y, z, z, hw, fit(A0 - At0), fit(sig - At1), fit(At2 - A2)
 
 
 def build_aux(base, y, effects, M=48, **kwargs):
@@ -419,14 +591,7 @@ def build_aux(base, y, effects, M=48, **kwargs):
     znodes, At0, At1, At2, hw, s, V = smoothed_nodes(
         effects, M, base=base, n=y.shape[0], **kwargs
     )
-    _, Vinv_np = _cheb_fit_matrix(M)
-    Vinv = jnp.asarray(Vinv_np)
-    fit = lambda vals: vals @ Vinv.T  # noqa: E731  (n, M+1) samples -> coeffs
-    sig = jax.nn.sigmoid(znodes)
-    A0 = jax.nn.softplus(znodes)
-    A2 = sig * (1.0 - sig)
-    z = jnp.zeros_like(hw)  # obar/center = 0
-    return y, z, z, hw, fit(A0 - At0), fit(sig - At1), fit(At2 - A2)
+    return _fit_table(y, znodes, At0, At1, At2, hw, M)
 
 
 # --------------------------------------------------------------------------------------
@@ -453,9 +618,52 @@ def _sparse_effect_moments(op, alpha, mu, var, colmean=None):
     return mean, jnp.maximum(second - mean**2, 0.0)
 
 
+@partial(jax.jit, static_argnames=("n",))
+def _sparse_support_chunk(r, c, x, alpha, mu, var, tau, colmean, n):
+    """Per-row support sum of one entry chunk of a general-valued sparse effect factor:
+    `sum_{c in supp(i)} alpha_c (h_ic(t) - g_c(t))` with `h_ic` the phase at the (centered)
+    entry value and `g_c` the phase at the off-support value `-c_c` (`g_c = 1` uncentered).
+    Jitted with `n` static so the chunk loop in `_effect_factor_sparse` hits cache."""
+    t = tau[None, :]
+    mc, vc = mu[c][:, None], var[c][:, None]
+    xc = (x - colmean[c])[:, None]  # centered support value (x_ic - c_c)
+    h = jnp.exp(1j * t * xc * mc - 0.5 * t**2 * xc**2 * vc)
+    x0 = -colmean[c][:, None]
+    g_on = jnp.exp(1j * t * x0 * mc - 0.5 * t**2 * x0**2 * vc)  # == 1 when uncentered
+    g = alpha[c][:, None] * (h - g_on)
+    return segment_sum(g, r, num_segments=n)
+
+
+def _effect_factor_sparse(X, alpha, mu, var, tau, colmean, binary, entry_chunk):
+    """One effect's CF factor (n, ntau) on a shared BCOO design, by the zero-clumping
+    identity (`offset_cf_sparse`): the GEMM/SpMM path on a 0/1 design, else the chunked
+    per-entry support sum on top of the row-independent baseline `G_l`."""
+    p = X.shape[1]
+    ntau = tau.shape[0]
+    c_arr = jnp.zeros(p) if colmean is None else jnp.asarray(colmean)
+    if binary:
+        base, D = _binary_terms(alpha, mu, var, tau, c_arr)
+        return _binary_matmul(X, base, D)
+    # baseline G_l(t): 1 in the uncentered case; sum_c alpha_c g_c(t) when centered.
+    if colmean is None:
+        G = jnp.ones((1, ntau), dtype=jnp.complex128)
+    else:
+        G = _binary_terms(alpha, mu, var, tau, c_arr)[0][None, :]
+    idx = X.indices
+    rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
+    n, nnz = X.shape[0], vals.shape[0]
+    acc = jnp.zeros((n, ntau), dtype=jnp.complex128)
+    for k0 in range(0, nnz, entry_chunk):
+        k1 = min(k0 + entry_chunk, nnz)
+        acc = acc + _sparse_support_chunk(
+            rows[k0:k1], cols[k0:k1], vals[k0:k1], alpha, mu, var, tau, c_arr, n
+        )
+    return G + acc
+
+
 def offset_cf_sparse(
     X, effects, tau, n=None, entry_chunk=1 << 15, offset_var=0.0,
-    colmean=None, feat_chunk=1 << 13,
+    colmean=None, feat_chunk=None, keys=None, cache=None,
 ):
     """Zero-mean offset CF on a sparse (BCOO) design via the zero-clumping identity
 
@@ -463,10 +671,13 @@ def offset_cf_sparse(
                         - 1/2 t^2 x_ic^2 var_lc) - 1),
 
     which is EXACT (uses sum_c alpha_lc = 1): a gene not in set c contributes the constant
-    alpha_lc, so only the nnz support entries carry t-dependence. The support sum is a
-    per-row `segment_sum` over the BCOO entries, chunked (`entry_chunk`) to bound peak
-    memory at `O(entry_chunk * ntau)`. `effects` is a list of `(alpha, mu, var)` (each
-    (p,)); X is shared. Returns `(phi, s, V)` -- `phi` (n, ntau) centered.
+    alpha_lc, so only the nnz support entries carry t-dependence. On a 0/1 design the
+    support term is `X @ D` with `D_c = alpha_c (g_c - 1)` row-independent -- one SpMM, no
+    per-entry transcendental (`_binary_terms`); for general values it is a per-row
+    `segment_sum` over the BCOO entries, chunked (`entry_chunk`) to bound peak memory at
+    `O(entry_chunk * ntau)`. `effects` is a list of `(alpha, mu, var)` (each (p,)); X is
+    shared. Returns `(phi, s, V)` -- `phi` (n, ntau) centered. `keys`/`cache` memoize the
+    per-effect factors across tables (`_FactorCache`).
 
     Centering (`colmean` (p,) given): the off-support value is no longer 0 but `-c_j`,
     so the "1 +" collapse fails. Split the centered value into a row-independent baseline
@@ -476,63 +687,39 @@ def offset_cf_sparse(
         G_l(t) = sum_c alpha_lc g_c(t),   g_c(t) = exp(-i t c_j mu_c - 1/2 t^2 c_j^2 var_c),
         h_ic(t) = exp(i t (x_ic - c_j) mu_c - 1/2 t^2 (x_ic - c_j)^2 var_c).
 
-    `G_l` is a single row-independent length-ntau reduction over all p features (chunked by
-    `feat_chunk`, done once per effect); the support correction stays `O(nnz*ntau)`. The
-    uncentered branch is the special case `c = 0` (`g_c = G_l = 1`), left byte-for-byte
-    intact as the hot path. `phi(0) = 1` is preserved either way, so the psi-tamed residual
-    quadrature is unchanged."""
+    `G_l` is a single row-independent length-ntau reduction over all p features; the
+    support correction stays `O(nnz*ntau)`. The uncentered branch is the special case
+    `c = 0` (`g_c = G_l = 1`). `phi(0) = 1` is preserved either way, so the psi-tamed
+    residual quadrature is unchanged."""
+    del feat_chunk  # the baseline reduction is one jitted (p, ntau) pass now
     tau = jnp.asarray(tau)
-    ntau = tau.shape[0]
     op = BCOOOperator(X)
-    idx = X.indices
-    rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
     n = X.shape[0] if n is None else n
-    p = X.shape[1]
-    nnz = vals.shape[0]
     c_arr = None if colmean is None else jnp.asarray(colmean)
+    grid = (float(tau[-1]), int(tau.shape[0]))
+    keys = [None] * len(effects) if keys is None else list(keys)
+    binary = cache.is_binary(X) if cache is not None else _is_binary_design(X)
 
     s = jnp.zeros(n)
     V = jnp.zeros(n)
-    phi = jnp.ones((n, ntau), dtype=jnp.complex128)
-    for alpha, mu, var in effects:
+    phi = jnp.ones((n, tau.shape[0]), dtype=jnp.complex128)
+    for (alpha, mu, var), slot in zip(effects, keys):
         alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
-        mean, v = _sparse_effect_moments(op, alpha, mu, var, c_arr)
+        refs = (alpha, mu, var)
+        mom = lambda r=refs: _sparse_effect_moments(op, *r, c_arr)  # noqa: E731
+        fac = lambda r=refs: _effect_factor_sparse(  # noqa: E731
+            X, *r, tau, c_arr, binary, entry_chunk
+        )
+        if cache is None:
+            mean, v = mom()
+            f = fac()
+        else:
+            mean, v = cache.moments(slot, refs, mom)
+            f = cache.factor(slot, refs, grid, fac)
         s = s + mean
         V = V + v
-        # baseline G_l(t): 1 in the uncentered case; sum_c alpha_c g_c(t) when centered.
-        if c_arr is None:
-            G = 1.0
-        else:
-            G = jnp.zeros(ntau, dtype=jnp.complex128)
-            for j0 in range(0, p, feat_chunk):
-                j1 = min(j0 + feat_chunk, p)
-                uc = c_arr[j0:j1, None] * tau[None, :]  # (fchunk, ntau)
-                gc = jnp.exp(-1j * uc * mu[j0:j1, None] - 0.5 * uc**2 * var[j0:j1, None])
-                G = G + (alpha[j0:j1, None] * gc).sum(axis=0)
-            G = G[None, :]
-        acc = jnp.zeros((n, ntau), dtype=jnp.complex128)
-        for k0 in range(0, nnz, entry_chunk):
-            k1 = min(k0 + entry_chunk, nnz)
-            r, c, x = rows[k0:k1], cols[k0:k1], vals[k0:k1]
-            if c_arr is None:
-                u = x[:, None] * tau[None, :]  # (chunk, ntau)
-                g = alpha[c][:, None] * (
-                    jnp.exp(1j * u * mu[c][:, None] - 0.5 * u**2 * var[c][:, None]) - 1.0
-                )
-            else:
-                xc = x - c_arr[c]  # centered support value x_ic - c_j
-                uh = xc[:, None] * tau[None, :]
-                h = jnp.exp(1j * uh * mu[c][:, None] - 0.5 * uh**2 * var[c][:, None])
-                ug = c_arr[c][:, None] * tau[None, :]
-                g_on = jnp.exp(-1j * ug * mu[c][:, None] - 0.5 * ug**2 * var[c][:, None])
-                g = alpha[c][:, None] * (h - g_on)
-            acc = acc + segment_sum(g, r, num_segments=n)
-        phi = phi * (G + acc)
-    ov = jnp.asarray(offset_var)
-    V = V + ov  # extra zero-mean Gaussian offset component (e.g. intercept variance)
-    phi = phi * jnp.exp(-0.5 * (ov[..., None] if ov.ndim else ov) * tau[None, :] ** 2)
-    phi = phi * jnp.exp(-1j * (tau[None, :] * s[:, None]))  # center to zero mean
-    return phi, s, V
+        phi = phi * f
+    return _finish_cf(phi, s, V, tau, offset_var)
 
 
 def smoothed_nodes_sparse(
@@ -554,6 +741,8 @@ def smoothed_nodes_sparse(
     colmean=None,
     bucket=None,
     ratchet=None,
+    keys=None,
+    cache=None,
 ):
     """Sparse (BCOO) analogue of `smoothed_nodes`: `effects` is a list of `(alpha, mu,
     var)` over the shared design `X`. Returns `(znodes, At0, At1, At2, hw, s, V)`.
@@ -568,20 +757,21 @@ def smoothed_nodes_sparse(
     n = X.shape[0]
     op = BCOOOperator(X)
     c_arr = None if colmean is None else jnp.asarray(colmean)
+    keys = [None] * len(effects) if keys is None else list(keys)
     V0 = jnp.zeros(n) + jnp.asarray(offset_var)
-    for alpha, mu, var in effects:  # variance only, to size the grid
-        V0 = V0 + _sparse_effect_moments(
-            op, jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var), c_arr
-        )[1]
+    for (alpha, mu, var), slot in zip(effects, keys):  # variance only, to size the grid
+        refs = (jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var))
+        mom = lambda r=refs: _sparse_effect_moments(op, *r, c_arr)  # noqa: E731
+        V0 = V0 + (mom() if cache is None else cache.moments(slot, refs, mom))[1]
     Tmax, ntau, hw = _grid_size(
         V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau, bucket, ratchet
     )
     tau, wq, psi = _frequency_grid(Tmax, ntau)
     phi, s, V = offset_cf_sparse(
         X, effects, tau, n=n, entry_chunk=entry_chunk, offset_var=offset_var,
-        colmean=colmean,
+        colmean=colmean, keys=keys, cache=cache,
     )
-    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (hw, s, V)
+    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (jnp.full((n,), hw), s, V)
 
 
 def build_aux_sparse(base, y, X, effects, M=48, entry_chunk=1 << 15, **kwargs):
@@ -591,13 +781,7 @@ def build_aux_sparse(base, y, X, effects, M=48, entry_chunk=1 << 15, **kwargs):
     znodes, At0, At1, At2, hw, s, V = smoothed_nodes_sparse(
         X, effects, M, base=base, entry_chunk=entry_chunk, **kwargs
     )
-    Vinv = jnp.asarray(_cheb_fit_matrix(M)[1])
-    fit = lambda vals: vals @ Vinv.T  # noqa: E731
-    sig = jax.nn.sigmoid(znodes)
-    A0 = jax.nn.softplus(znodes)
-    A2 = sig * (1.0 - sig)
-    z = jnp.zeros_like(hw)
-    return y, z, z, hw, fit(A0 - At0), fit(sig - At1), fit(At2 - A2)
+    return _fit_table(y, znodes, At0, At1, At2, hw, M)
 
 
 @dataclass(frozen=True)
@@ -634,6 +818,22 @@ class CharFnOffset(Smoother):
     _ratchet: _NtauRatchet = field(
         default_factory=_NtauRatchet, compare=False, repr=False, hash=False
     )
+    # Per-fit memo of the per-effect CF factors (see `_FactorCache`): a sweep then computes
+    # each effect's (n, ntau) factor once instead of once per offset table (L-1 + L tables
+    # per effect update). `factor_cache_bytes` caps the memo (0 disables it); above the cap
+    # factors are recomputed as before. Like the ratchet, mutable per-instance state
+    # excluded from eq/hash/repr.
+    factor_cache_bytes: int = 4 << 30
+    # GH order the vi_gh kernels use for the Chebyshev RESIDUAL over b (the plug-in base
+    # keeps the kernel's full order); see `Smoother.residual_order`. None = no split.
+    residual_order: int | str | None = "auto"
+    _cache: _FactorCache | None = field(
+        default=None, compare=False, repr=False, hash=False
+    )
+
+    def __post_init__(self):
+        if self._cache is None:
+            object.__setattr__(self, "_cache", _FactorCache(self.factor_cache_bytes))
 
     def validate(self, base):
         if not isinstance(base, Bernoulli):
@@ -642,30 +842,38 @@ class CharFnOffset(Smoother):
                 f"got {type(base).__name__}."
             )
 
-    def build_aux(self, base, y, effects, ntau=None, Tmax=None, offset_var=0.0):
+    def _memo(self):
+        return self._cache if self.factor_cache_bytes > 0 else None
+
+    def build_aux(self, base, y, effects, ntau=None, Tmax=None, offset_var=0.0, keys=None):
+        """Dense build. `keys` (one hashable slot per effect, e.g. its index) enables the
+        per-fit factor memo; without it every factor is recomputed."""
         return build_aux(
             base, y, effects, self.M, tol=self.tol, kappa=self.kappa, T=self.T,
             safety=self.safety, ntau=ntau, Tmax=Tmax, offset_var=offset_var,
             bucket=self.ntau_bucket, ratchet=self._ratchet,
+            keys=keys, cache=self._memo(),
         )
 
     def build_aux_sparse(self, base, y, X, effects, ntau=None, Tmax=None,
-                         entry_chunk=1 << 15, offset_var=0.0, colmean=None):
+                         entry_chunk=1 << 15, offset_var=0.0, colmean=None, keys=None):
         """Sparse (BCOO) build: `X` shared, `effects = [(alpha, mu, var)]`. Same aux.
         `offset_var` folds an extra homogeneous zero-mean Gaussian (intercept var).
-        `colmean` (p,), if given, treats `X` as centered via the baseline+support split."""
+        `colmean` (p,), if given, treats `X` as centered via the baseline+support split.
+        `keys` enables the per-fit factor memo (see `build_aux`)."""
         return build_aux_sparse(
             base, y, X, effects, self.M, entry_chunk=entry_chunk, tol=self.tol,
             kappa=self.kappa, T=self.T, safety=self.safety, ntau=ntau, Tmax=Tmax,
             offset_var=offset_var, colmean=colmean,
             bucket=self.ntau_bucket, ratchet=self._ratchet,
+            keys=keys, cache=self._memo(),
         )
 
+    def plugin_terms(self, base: ResponseModel, eta, aux):
+        return _table_plugin_terms(base, eta, aux)
+
+    def residual_terms(self, base: ResponseModel, eta, aux):
+        return _table_residual_terms(eta, aux)
+
     def terms(self, base: ResponseModel, eta, aux):
-        y, obar, center, halfwidth, coef_ll, coef_g, coef_w = aux
-        bll, bg, bw = base.terms(eta + obar, y)  # exact plug-in at the mean shift
-        t = jnp.clip((eta - center) / halfwidth, -1.0, 1.0)
-        ll = bll + _clenshaw_batched(coef_ll, t)
-        g = bg + _clenshaw_batched(coef_g, t)
-        w = jnp.maximum(bw + _clenshaw_batched(coef_w, t), 0.0)
-        return ll, g, w
+        return _table_terms(base, eta, aux)

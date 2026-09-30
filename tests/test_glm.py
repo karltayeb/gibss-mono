@@ -301,7 +301,12 @@ def test_glm_vi_profile_kernel_recovers():
                   glm.default_schedule(), max_iter=50)
     assert _feat_pip(st, causal) > 0.9
     assert causal in _tops(st)
-    assert st.family_state.intercept_value == 0.0  # never modeled
+    # the intercept is never a shared factor during inference (profiled per feature inside
+    # the kernel); what the state carries is the post-hoc REFERENCE q(b0) fit once after
+    # convergence (reference_intercept_step), near the true b0 = -0.5 and with a variance.
+    fs = st.family_state
+    assert abs(fs.intercept_value + 0.5) < 0.3
+    assert fs.intercept_var > 0.0 and np.isfinite(fs.intercept_kl)
 
 
 def test_glm_kernel_response_compatibility_enforced():
