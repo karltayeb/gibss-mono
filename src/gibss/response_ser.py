@@ -64,6 +64,22 @@ def _posterior_moments(logint, b_nodes, dll_nodes):
     return mu, var, log_norm, coefficient_kl
 
 
+def _laplace_var_at_order_one(var, precision, order):
+    """The per-feature variance the quad kernels report at `order == 1`.
+
+    One GH node sits at the mode, so the node-measure moments (`_posterior_moments`) give
+    `var = 0`: a degenerate quadrature, not a posterior variance. The kernel already has the
+    Laplace precision `H = sum_i x^2 A''(eta_mode) + 1/pv` (it placed the node with it), and
+    `1/H` is the variance the order-1 kernel MEANS -- the Laplace approximation N(mode, 1/H),
+    the m=1 arm of the quadrature family. It matters downstream: `var` feeds the message
+    variance every Smoothed offset scheme integrates, the ELBO, and the Q1 -> Q2 moment
+    reduction (`glm.to_gaussian_family`). At `order >= 2` the quadrature variance is the
+    posterior variance estimate and is returned unchanged. `order` is static."""
+    if int(order) == 1:
+        return 1.0 / precision
+    return var
+
+
 def _stein_sums(W, u, w):
     """Gauss-Hermite node sums that give the v-derivatives of the Gaussian expectation
     for free (no extra likelihood pass), for the joint (m, v) Newton of the vi_gh kernels.
@@ -413,6 +429,7 @@ def _glm_profile_ser_impl(
 
     logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, b0_nodes, BGll)
     mu, var, log_norm, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
+    var = _laplace_var_at_order_one(var, 1.0 / var_lap, order)
     return mu, var, log_norm, coefficient_kl, b0_hat, 1.0 / var_lap, b_nodes, logint
 
 
@@ -1384,6 +1401,7 @@ def _glm_ser_impl(
 
     logint, b_nodes, dll_nodes = jax.vmap(node_term)(nodes, log_w)  # (order, p) x3
     mu, var, log_bf, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
+    var = _laplace_var_at_order_one(var, precision, order)
     return mu, var, log_bf, coefficient_kl, b_nodes, logint
 
 
@@ -1519,6 +1537,7 @@ def _glm_center_ser_impl(
 
     logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, BGll)
     mu, var, log_bf, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
+    var = _laplace_var_at_order_one(var, curv, order)
     return mu, var, log_bf, coefficient_kl, b_nodes, logint
 
 

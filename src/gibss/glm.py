@@ -70,6 +70,7 @@ __all__ = [
     "estimate_random_intercept_step",
     "update_row_param_step",
     "default_schedule",
+    "to_gaussian_family",
 ]
 
 
@@ -1250,3 +1251,49 @@ def default_schedule() -> Schedule:
         # must precede to_numpy_state_step; it is a no-op unless the intercept is profiled.
         after_fit=(reference_intercept_step, to_numpy_state_step),
     )
+
+
+def _gaussian_effect_kl(effect):
+    """The SER-level KL of a Gaussian-factor effect: the categorical part plus the
+    alpha-weighted per-feature KL(N(mu, var) || N(0, prior_variance))."""
+    alpha, mu, var = jnp.asarray(effect.alpha), jnp.asarray(effect.mu), jnp.asarray(effect.var)
+    pv = float(effect.prior_variance)
+    p = alpha.shape[0]
+    var = jnp.maximum(var, 1e-300)
+    coef_kl = 0.5 * (jnp.log(pv / var) + (var + mu**2) / pv - 1.0)
+    return float(jnp.sum(alpha * (jnp.log(alpha + 1e-30) + math.log(p))) + jnp.sum(alpha * coef_kl))
+
+
+def to_gaussian_family(state):
+    """Moment-based reduction of a free-form (Q1) state to the Gaussian family (Q2).
+
+    Each effect's per-feature conditional `q(b | gamma = c)` is replaced by the Gaussian with
+    the same mean and variance -- the `mu`/`var` the quad kernel already reports as the
+    node-measure moments (at `effect_quadrature_points=1` the Laplace `N(mode, 1/H)`) -- and
+    its raw quadrature nodes are dropped, so every consumer that dispatches on `b_nodes is
+    None` (`compute_elbo`, `compute_elbo_gaussian`, the Q2 offset folds) treats the state as
+    Q2. `alpha` is shared by both families and is kept; each effect's `kl` is recomputed as
+    the Gaussian factor's KL (the stored one was the free-form conditional's), so the reduced
+    state's Gaussian ELBO is a valid bound. The shared intercept's free-form `q(b0)` reduces
+    to `N(intercept_value, intercept_var)` -- already its moments -- and its nodes are dropped
+    (its KL is left as stored: the free-form KL against the same N(0, tau) prior, a scoring
+    detail below the effects' O(1/n) reduction gap).
+
+    The reduced state is a feasible Q2 point, NOT the Q2 CAVI optimum: the moment-matched
+    Gaussian is not the KL-optimal Gaussian given the other factors. Its ELBO is therefore
+    <= the Q2 CAVI fixed point's, and one `cf_cavi` sweep warm-started from it
+    (`fit_glm_susie(..., initial_state=reduced)`) closes that gap. A state that already has
+    Gaussian effects is returned unchanged. `feature_log_marginal` / `marginal_log_likelihood`
+    keep the free-form evidence they were fit with."""
+    effects = list(state.single_effects)
+    if all(e.b_nodes is None for e in effects):
+        return state
+    new_effects = [
+        replace(e, b_nodes=None, log_node_weight=None, kl=_gaussian_effect_kl(e))
+        if e.b_nodes is not None else e
+        for e in effects
+    ]
+    fs = state.family_state
+    if getattr(fs, "intercept_b_nodes", None) is not None:
+        fs = replace(fs, intercept_b_nodes=None, intercept_log_node_weight=None)
+    return replace(state, single_effects=new_effects, family_state=fs)
