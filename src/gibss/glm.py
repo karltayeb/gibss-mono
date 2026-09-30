@@ -32,7 +32,7 @@ from .engine import (
     to_numpy_state_step,
 )
 from ._numerics import _gh_rule
-from .cf_offset import CharFnOffset
+from .cf_offset import CharFnOffset, CharFnSelfNorm
 from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .linear import (  # noqa: F401 (prep_data re-export)
     is_bcoo,
@@ -814,6 +814,7 @@ def _intercept_freeform(data, state, order=15):
     fold_aux = _selfnorm_fold_aux(
         data, state, fs.response.smoother, base, jnp.asarray(data.y), n,
         state.single_effects, include_intercept=False,
+        keys=list(range(len(state.single_effects))),
     )
     mu, var, _, coef_kl, b0_nodes, logW0 = glm_ser_nodes(
         ones, fold_aux, offset, fs.intercept_prior_variance, fs.response, order=order,
@@ -837,7 +838,7 @@ def _cavi_mode(fs):
         return "q2" if isinstance(smoother, exact) else "q2_plugin"
     if isinstance(
         getattr(fs.response, "smoother", None),
-        (CompressSelfNorm, PoissonSelfNormOffset),
+        (CompressSelfNorm, PoissonSelfNormOffset, CharFnSelfNorm),
     ):
         return "q1"
     return "plugin"
@@ -1060,7 +1061,8 @@ def _effect_offset(fs, state):
 _B0_POINT_GH_ORDER = 32
 
 
-def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=True):
+def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=True,
+                       keys=None):
     """Self-normalized (`CompressSelfNorm`) offset aux: fold a list of effects -- and,
     when `include_intercept`, the shared intercept -- against their TRUE, non-Gaussian
     posteriors via raw quadrature `(b_nodes, logW)`, not Gaussian moments. Effects carry
@@ -1089,7 +1091,10 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
                 "kernel/intercept combination does not expose quadrature nodes; the fold "
                 "would silently use a zero offset. Use kernel='quad'."
             )
-    others = [e for e in others if e.b_nodes is not None]  # skip unfit effects
+    keys = [None] * len(others) if keys is None else list(keys)
+    fitted = [(e, k) for e, k in zip(others, keys) if e.b_nodes is not None]  # skip unfit
+    others = [e for e, _ in fitted]
+    keys = [k for _, k in fitted]
     # intercept as an additive non-Gaussian effect (zero-mean; mean is intercept_value).
     # A shared intercept is folded whether it carries its own free-form quad nodes (Q1 CAVI)
     # or is a Gaussian POINT q(b0)=N(m0, v0) with no nodes (a plug-in gIBSS state being
@@ -1140,6 +1145,24 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
         lw0 = icpt_logw
         iv = float(fs.intercept_var)
 
+    if isinstance(comp, CharFnSelfNorm):
+        # CF product over the node laws (exact w.r.t. the same node measure the peel
+        # folds); the intercept is one more row-independent factor on its centered nodes.
+        # `keys` (effect slots) drive the per-fit factor memo. Table is already at obar=0.
+        icpt = (bc, lw0) if have_icpt else None
+        # memo validity keys: the effect's STORED node arrays (the .T views below are
+        # fresh objects every call and would never hit).
+        refs = [(e.b_nodes, e.log_node_weight) for e in others]
+        if is_bcoo(data.X):
+            effects = [(e.b_nodes.T, e.log_node_weight.T) for e in others]
+            return comp.build_aux_nodes_sparse(
+                base, y, data.X, effects, intercept=icpt,
+                colmean=getattr(data, "column_center", None), keys=keys, refs=refs,
+            )
+        Xd = jnp.asarray(data.X)
+        effects = [(Xd, e.b_nodes.T, e.log_node_weight.T) for e in others]
+        return comp.build_aux_nodes(base, y, effects, intercept=icpt, keys=keys, refs=refs)
+
     if is_bcoo(data.X):
         effects = [(e.b_nodes.T, e.log_node_weight.T) for e in others]
         init = None
@@ -1176,10 +1199,11 @@ def _selfnorm_effect_aux(data, state, l):
     `(b_nodes, logW)`, plus the shared intercept as one additive all-ones effect. The mean
     rides in eta (the fold re-centers to obar=0). Dense + sparse (zero-clumping)."""
     fs = state.family_state
-    others = [e for i, e in enumerate(state.single_effects) if i != l]
+    keys = [i for i in range(len(state.single_effects)) if i != l]
+    others = [state.single_effects[i] for i in keys]
     return _selfnorm_fold_aux(
         data, state, fs.response.smoother, fs.response.base,
-        jnp.asarray(data.y), data.X.shape[0], others,
+        jnp.asarray(data.y), data.X.shape[0], others, keys=keys,
     )
 
 

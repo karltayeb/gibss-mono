@@ -659,12 +659,16 @@ def test_poisson_lognormal_offset_rejects_non_poisson():
         Smoothed(Bernoulli(), PoissonLogNormalOffset())
 
 
-def test_cf_poisson_requires_gaussian_vfam():
+def test_cf_poisson_unconstrained_uses_analytic_q1_fold():
+    # cf + unconstrained on the Poisson base routes to the analytic node-MGF Q1 fold
+    # (PoissonSelfNormOffset), exactly as compress_selfnorm does -- no CF grid needed.
+    from gibss.poisson_offset import PoissonSelfNormOffset
     rng = np.random.default_rng(0)
     X, y = _poisson_data(rng, n=60, p=5, idx=[1], val=[0.8])
-    with pytest.raises(ValueError, match="variational_family"):
-        fit_glm_susie(X, y, family="poisson", offset_integration="cf",
-                      variational_family="unconstrained")
+    st = fit_glm_susie(X, y, family="poisson", offset_integration="cf",
+                       variational_family="unconstrained", max_iter=5)
+    assert st.family_state.kernel == "quad"
+    assert isinstance(st.family_state.response.smoother, PoissonSelfNormOffset)
 
 
 def test_cf_poisson_sparse_centering_matches_dense():

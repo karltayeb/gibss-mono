@@ -90,6 +90,24 @@ halving `hw` would halve `D` for the same accuracy. `m=9` GH nodes agree with `m
 to 1e-10 for both Q2 methods (~25% faster); the default stays 15 because the same
 knob feeds the free-form Q1 kernel.
 
+## Free-form family (Q1): plug-in gIBSS vs exact CAVI via the CF product
+
+`cf_cavi_q1` (`CharFnSelfNorm`) is the Q1 counterpart of `cf_cavi`: the quad kernel's
+self-normalized node measure `sum_{c,k} W_ck delta(b - b_ck)` has the closed-form CF
+`sum_{c,k} W_ck exp(i t x_ic b_ck)`, so the other effects fold as a memoized product of
+node-law factors and ONE Chebyshev fit per table -- replacing the sequential
+`compress_selfnorm` peel (L-1 folds per table, each refit through the previous stage's
+interpolant; did not finish at GO:BP scale). Per effect update: one factor (`O(np·Q·ntau)`
+complex exps on a general design, i.e. Q x the Q2 factor; one SpMM `O(nnz·ntau)` plus a
+`(p, Q, ntau)` precompute on a 0/1 design), two tables, and the quad kernel (Newton to the
+mode, ~5 passes of two Clenshaw series, plus the `m`-node GH tail, `m` passes of one
+series). Exact w.r.t. the same node measure the peel folds.
+
+Measured (M3 Pro, L=5, 3 sweeps, sparse 0/1 20000x2000 d=0.05): gIBSS-Q1 2.4 s,
+CAVI-Q1 (cf) 14.0 s, CAVI-Q2 (cf) 29.1 s. 10 sweeps at 2000x1000 d=0.05: 0.5 / 3.4 /
+4.8 s. Dense general 1000x300: the Q1 factor is ~1 s (vs 64 ms for Q2), so CAVI-Q1 is
+slower than CAVI-Q2 there; the win is on set-membership designs.
+
 The joint `(m, v)` Newton (`response_ser._joint_newton_step`) replaces the m-Newton /
 Price-v alternation, whose Jacobi coupling crawled (rate ~0.4) on weakly supported
 columns and held the whole batch to ~20 iterations; it converges in ~5-8, from the

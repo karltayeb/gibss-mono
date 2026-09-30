@@ -18,7 +18,7 @@ family, Gaussian q without a smoothing scheme).
 from __future__ import annotations
 
 from . import glm
-from .cf_offset import CharFnOffset
+from .cf_offset import CharFnOffset, CharFnSelfNorm
 from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
@@ -90,6 +90,9 @@ PRESETS = {
     "smoothed": {"offset_integration": "gh"},
     "localjj": {"variational_family": "gaussian", "offset_integration": "jj"},
     "cf_cavi": {"variational_family": "gaussian", "offset_integration": "cf"},
+    # exact free-form CAVI in Q1 through the CF product over the node laws (the CF
+    # replacement for offset_integration="compress_selfnorm").
+    "cf_cavi_q1": {"variational_family": "unconstrained", "offset_integration": "cf"},
     "compress_cavi": {"variational_family": "gaussian", "offset_integration": "compress"},
     # plug-in Q2 (gIBSS with a Gaussian effect): plug in the other effects' mean, no
     # offset integration; the effect b is Gaussian-VI-integrated (glm_vi_gh_ser, plain base).
@@ -165,11 +168,17 @@ def _resolve(cfg):
             # the CF at t=-i), so it uses the closed-form PoissonLogNormalOffset -- exact
             # and cheaper, no quadrature grid.
             if vfam != "gaussian":
-                raise ValueError(
-                    "offset_integration='cf' (CAVI in Q2) needs variational_family="
-                    "'gaussian'; free-form Q1 posteriors have no closed-form "
-                    "characteristic function -- use 'compress' or 'compress_selfnorm'."
+                # EXACT free-form CAVI in Q1 through the CF product: the quad kernel's
+                # self-normalized node measure has a closed-form (finite-sum) CF, so the
+                # other effects fold as a product of node-law factors (CharFnSelfNorm) --
+                # the CF replacement for the sequential 'compress_selfnorm' peel. The
+                # Poisson base keeps its analytic node-MGF fold.
+                offset = (
+                    PoissonSelfNormOffset()
+                    if isinstance(base, Poisson)
+                    else CharFnSelfNorm(M=cfg["compress_degree"])
                 )
+                return Smoothed(base, offset), "quad"
             offset = (
                 PoissonLogNormalOffset()
                 if isinstance(base, Poisson)
@@ -211,7 +220,8 @@ def _resolve(cfg):
     if getattr(response, "quadratic", False):
         return response, "linear"
     if (
-        isinstance(getattr(response, "smoother", None), (Compress, PoissonSelfNormOffset))
+        isinstance(getattr(response, "smoother", None),
+                   (Compress, PoissonSelfNormOffset, CharFnSelfNorm))
         and vfam != "unconstrained"
     ):
         # reachable only for compress_selfnorm + gaussian (compress + gaussian returned
@@ -395,7 +405,7 @@ def fit_glm_susie(
         # at -c_j, not a constant) -- so center=True is honored, like the Bernoulli Q1 fold.
         if center is None:
             center = False
-    elif isinstance(smoother, Compress):  # compress_selfnorm (quad): dense + sparse center
+    elif isinstance(smoother, (Compress, CharFnSelfNorm)):  # Q1 folds: dense + sparse center
         if center is None:
             center = False
     else:

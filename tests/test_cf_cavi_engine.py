@@ -209,11 +209,14 @@ def test_cf_cavi_eb_prior_variance_fixed_point():
 def test_cf_cavi_guards():
     rng = np.random.default_rng(3)
     X, y = _logit_data(rng, n=50, p=8, signal_idx=[1], signal_val=[1.5])
-    # cf needs gaussian variational family
-    with pytest.raises(ValueError, match="variational_family='gaussian'"):
-        fit_glm_susie(
-            X, y, L=2, offset_integration="cf", variational_family="unconstrained"
-        )
+    # cf + unconstrained = exact free-form CAVI in Q1 through the CF product over the
+    # node laws (CharFnSelfNorm, quad kernel), no longer rejected.
+    from gibss.cf_offset import CharFnSelfNorm
+    st = fit_glm_susie(
+        X, y, L=2, offset_integration="cf", variational_family="unconstrained", max_iter=5
+    )
+    assert st.family_state.kernel == "quad"
+    assert isinstance(st.family_state.response.smoother, CharFnSelfNorm)
     # cf now supports a profiled intercept (glm_vi_gh_profile_ser)
     st = fit_glm_susie(X, y, L=2, method="cf_cavi", intercept="profiled", max_iter=5)
     assert st.family_state.kernel == "vi_gh" and st.family_state.intercept == "profiled"

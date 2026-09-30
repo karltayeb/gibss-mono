@@ -112,6 +112,7 @@ __all__ = [
     "smoothed_nodes_sparse",
     "build_aux_sparse",
     "CharFnOffset",
+    "CharFnSelfNorm",
 ]
 
 # An effect in EFFECT SPACE: design block `x` (n, C) and its row-independent Q2 law
@@ -868,6 +869,314 @@ class CharFnOffset(Smoother):
             bucket=self.ntau_bucket, ratchet=self._ratchet,
             keys=keys, cache=self._memo(),
         )
+
+    def plugin_terms(self, base: ResponseModel, eta, aux):
+        return _table_plugin_terms(base, eta, aux)
+
+    def residual_terms(self, base: ResponseModel, eta, aux):
+        return _table_residual_terms(eta, aux)
+
+    def terms(self, base: ResponseModel, eta, aux):
+        return _table_terms(base, eta, aux)
+
+
+# --------------------------------------------------------------------------------------
+# Free-form (Q1) offsets: the self-normalized node law's CF. The quad kernel represents
+# each effect's posterior by its adaptive-GH nodes `(b_nodes, logW)` (C, Q) -- a DISCRETE
+# measure `sum_{c,k} W_ck delta(b - b_ck)`, `W = softmax(logW)` over all (c, k). Its CF is
+# a finite sum, `phi_l,i(t) = sum_{c,k} W_ck exp(i t x_ic b_ck)`, so the whole Q2
+# product-and-transform machinery applies to Q1 unchanged: only how a factor is formed
+# differs. This replaces the sequential Chebyshev peel (`CompressSelfNorm`), which re-fits
+# an interpolant at every stage, with one closed-form product per table (and the factor
+# memo makes that one factor per effect update). Exact with respect to the same node
+# measure the peel folds.
+# --------------------------------------------------------------------------------------
+
+
+def _node_law(b_nodes, logW):
+    """Self-normalized weights `W` (C, Q) over ALL (feature, node) pairs, and the
+    per-feature first/second moments `s_c = sum_k W_ck b_ck`, `q_c = sum_k W_ck b_ck^2`
+    (each (C,)) -- the node-law analogues of `alpha mu` and `alpha (mu^2 + var)`."""
+    b_nodes = jnp.asarray(b_nodes)
+    W = jax.nn.softmax(jnp.asarray(logW).reshape(-1)).reshape(b_nodes.shape)
+    return W, jnp.sum(W * b_nodes, axis=-1), jnp.sum(W * b_nodes**2, axis=-1)
+
+
+@jax.jit
+def _node_effect_cf(x, b_nodes, W, tau):
+    """CF factor (n, ntau) of one node-law effect on a general dense design `x` (n, C):
+    a scan over features with an inner scan over the Q nodes, so peak memory is
+    O(n, ntau) and the cost is n C Q ntau complex exponentials."""
+    x = jnp.asarray(x)
+    n, ntau = x.shape[0], tau.shape[0]
+
+    def feature(acc, comp):
+        xc, bc, wc = comp  # (n,), (Q,), (Q,)
+        u = xc[:, None] * tau[None, :]  # (n, ntau)
+
+        def node(a, kk):
+            bk, wk = kk
+            return a + wk * jnp.exp(1j * u * bk), None
+
+        term, _ = jax.lax.scan(node, jnp.zeros((n, ntau), jnp.complex128), (bc, wc))
+        return acc + term, None
+
+    phi, _ = jax.lax.scan(
+        feature, jnp.zeros((n, ntau), jnp.complex128), (x.T, b_nodes, W)
+    )
+    return phi
+
+
+@jax.jit
+def _binary_node_terms(b_nodes, W, tau, colmean):
+    """Node-law analogue of `_binary_terms` on a 0/1 design: `phi = base + X @ D` with
+    `base = sum_{c,k} W_ck g0_ck`, `D_c = sum_k W_ck (h_ck - g0_ck)`, `g0/h` the phases at
+    the off-support value `-c_c` (1 when uncentered) and the on-support value `1 - c_c`.
+    A scan over the Q nodes keeps memory at O(p, ntau)."""
+    t = tau[None, :]
+    x0 = -colmean[:, None]
+    x1 = 1.0 - colmean[:, None]
+    p, ntau = b_nodes.shape[0], tau.shape[0]
+
+    def node(carry, kk):
+        G, D = carry
+        bk, wk = kk  # (p,), (p,)
+        g0 = jnp.exp(1j * t * (x0 * bk[:, None]))
+        h = jnp.exp(1j * t * (x1 * bk[:, None]))
+        return (G + jnp.sum(wk[:, None] * g0, axis=0), D + wk[:, None] * (h - g0)), None
+
+    (G, D), _ = jax.lax.scan(
+        node,
+        (jnp.zeros(ntau, jnp.complex128), jnp.zeros((p, ntau), jnp.complex128)),
+        (b_nodes.T, W.T),
+    )
+    return G, D
+
+
+@partial(jax.jit, static_argnames=("n",))
+def _sparse_node_support_chunk(r, c, x, b_nodes, W, tau, colmean, n):
+    """Node-law analogue of `_sparse_support_chunk`: per-row support sum of
+    `sum_k W_ck (h_ick - g0_ck)` over one entry chunk, scanning the Q nodes."""
+    t = tau[None, :]
+    xc = (x - colmean[c])[:, None]
+    x0 = -colmean[c][:, None]
+    bcn, wcn = b_nodes[c], W[c]  # (chunk, Q)
+
+    def node(acc, kk):
+        bk, wk = kk  # (chunk,)
+        h = jnp.exp(1j * t * (xc * bk[:, None]))
+        g0 = jnp.exp(1j * t * (x0 * bk[:, None]))
+        return acc + wk[:, None] * (h - g0), None
+
+    g, _ = jax.lax.scan(node, jnp.zeros((x.shape[0], tau.shape[0]), jnp.complex128),
+                        (bcn.T, wcn.T))
+    return segment_sum(g, r, num_segments=n)
+
+
+def _node_factor_sparse(X, b_nodes, W, tau, colmean, binary, entry_chunk):
+    """One node-law effect's CF factor (n, ntau) on a shared BCOO design."""
+    p = X.shape[1]
+    c_arr = jnp.zeros(p) if colmean is None else jnp.asarray(colmean)
+    if binary:
+        base, D = _binary_node_terms(b_nodes, W, tau, c_arr)
+        return _binary_matmul(X, base, D)
+    if colmean is None:
+        G = jnp.ones((1, tau.shape[0]), dtype=jnp.complex128)
+    else:
+        G = _binary_node_terms(b_nodes, W, tau, c_arr)[0][None, :]
+    idx = X.indices
+    rows, cols, vals = idx[:, 0], idx[:, 1], jnp.asarray(X.data)
+    n, nnz = X.shape[0], vals.shape[0]
+    acc = jnp.zeros((n, tau.shape[0]), dtype=jnp.complex128)
+    for k0 in range(0, nnz, entry_chunk):
+        k1 = min(k0 + entry_chunk, nnz)
+        acc = acc + _sparse_node_support_chunk(
+            rows[k0:k1], cols[k0:k1], vals[k0:k1], b_nodes, W, tau, c_arr, n
+        )
+    return G + acc
+
+
+def _node_moments_dense(x, s_c, q_c):
+    mean = x @ s_c
+    return mean, jnp.maximum((x**2) @ q_c - mean**2, 0.0)
+
+
+def _node_moments_sparse(op, s_c, q_c, colmean):
+    """Per-row mean/variance of a node-law effect on a BCOO design, centered by `colmean`
+    if given (the `alpha mu -> s_c`, `alpha (mu^2+var) -> q_c` substitution in
+    `_sparse_effect_moments`)."""
+    mean = op.matvec(s_c)
+    second = op.matvec_sq(q_c)
+    if colmean is not None:
+        c = colmean
+        mean = mean - jnp.dot(s_c, c)
+        second = second - 2.0 * op.matvec(c * q_c) + jnp.dot(c * c, q_c)
+    return mean, jnp.maximum(second - mean**2, 0.0)
+
+
+def _table_from_items(y, items, M, *, tol, Tmax, ntau, kappa, T, safety, min_ntau,
+                      max_ntau, bucket, ratchet, cache):
+    """Build the Compress-style aux from a list of offset `items`, each
+    `(slot, refs, moments_fn, factor_fn)`: `moments_fn() -> (mean (n,), var (n,))`,
+    `factor_fn(tau) -> phi (n, ntau) or (ntau,)`. Moments size the grid, the memoized
+    factors are multiplied, the mean is centered out (it lives in eta), and the
+    psi-tamed transform + Chebyshev fit give the table."""
+    y = jnp.asarray(y)
+    n = y.shape[0]
+    moms = []
+    for slot, refs, mom, _ in items:
+        moms.append(mom() if cache is None or slot is None else cache.moments(slot, refs, mom))
+    V0 = jnp.zeros(n)
+    for _, v in moms:
+        V0 = V0 + v
+    Tmax, ntau, hw = _grid_size(
+        V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau, bucket, ratchet
+    )
+    tau, wq, psi = _frequency_grid(Tmax, ntau)
+    grid = (Tmax, ntau)
+    phi = jnp.ones((n, ntau), dtype=jnp.complex128)
+    s = jnp.zeros(n)
+    for (slot, refs, _, fac), (mean, _) in zip(items, moms):
+        f = lambda fac=fac: fac(tau)  # noqa: E731
+        phi = phi * (f() if cache is None or slot is None else cache.factor(slot, refs, grid, f))
+        s = s + mean
+    phi, s, V = _finish_cf(phi, s, V0, tau, 0.0)
+    znodes, At0, At1, At2 = _atilde_from_cf(phi, V, tau, wq, psi, hw, M)
+    return _fit_table(y, znodes, At0, At1, At2, jnp.full((n,), hw), M)
+
+
+def _intercept_item(intercept):
+    """The shared intercept's free-form factor: CENTERED nodes `bc` (Q0,) (the posterior
+    mean lives in eta) with log-weights; row-independent, so its factor is (ntau,)."""
+    bc, logw = jnp.asarray(intercept[0]), jnp.asarray(intercept[1])
+    W0 = jax.nn.softmax(logw)
+    m0 = jnp.sum(W0 * bc)
+    v0 = jnp.maximum(jnp.sum(W0 * bc**2) - m0**2, 0.0)
+
+    def mom(n):
+        return jnp.full((n,), m0), jnp.full((n,), v0)
+
+    def fac(tau):
+        return jnp.sum(W0[:, None] * jnp.exp(1j * tau[None, :] * bc[:, None]), axis=0)
+
+    return ("icpt", (bc, logw), mom, fac)
+
+
+@dataclass(frozen=True)
+class CharFnSelfNorm(Smoother):
+    """Exact free-form CAVI in Q1 through the characteristic-function product.
+
+    The Q1 counterpart of `CharFnOffset`: each OTHER effect is folded against its TRUE
+    non-Gaussian posterior -- the self-normalized adaptive-GH node measure the quad kernel
+    produces -- whose CF is the finite sum `sum_{c,k} W_ck exp(i t x_ic b_ck)`. The offset
+    CF is the product of those factors (memoized per effect across a sweep, GEMM/SpMM on a
+    0/1 design), and the same psi-tamed transform gives the offset-integrated cumulant
+    table `CharFnOffset` uses. Same table contract (`terms` = plug-in base + Clenshaw
+    residual, mean in eta), consumed by the quad kernel exactly like `CompressSelfNorm`'s
+    -- which it replaces: the sequential peel re-fits a Chebyshev interpolant at every
+    stage (O(L) refits per table, each a full fold) and was the bottleneck of
+    `compress_selfnorm` at scale. Logistic base only (the psi kernel is the logistic
+    density's Fourier transform)."""
+
+    M: int = 48
+    tol: float = 1e-10
+    kappa: float = 4.0
+    T: float = 10.0
+    safety: float = 1.3
+    ntau_bucket: int = field(
+        default_factory=lambda: int(os.environ.get("GIBSS_NTAU_BUCKET", "32") or 32)
+    )
+    _ratchet: _NtauRatchet = field(
+        default_factory=_NtauRatchet, compare=False, repr=False, hash=False
+    )
+    factor_cache_bytes: int = 4 << 30
+    _cache: _FactorCache | None = field(
+        default=None, compare=False, repr=False, hash=False
+    )
+
+    def __post_init__(self):
+        if self._cache is None:
+            object.__setattr__(self, "_cache", _FactorCache(self.factor_cache_bytes))
+
+    def validate(self, base):
+        if not isinstance(base, Bernoulli):
+            raise TypeError(
+                "CharFnSelfNorm supports only the Bernoulli (logistic) base; "
+                f"got {type(base).__name__}."
+            )
+
+    def _memo(self):
+        return self._cache if self.factor_cache_bytes > 0 else None
+
+    def _kwargs(self, ntau, Tmax):
+        return dict(
+            tol=self.tol, kappa=self.kappa, T=self.T, safety=self.safety, ntau=ntau,
+            Tmax=Tmax, min_ntau=32, max_ntau=1 << 15, bucket=self.ntau_bucket,
+            ratchet=self._ratchet, cache=self._memo(),
+        )
+
+    def build_aux_nodes(self, base, y, effects, intercept=None, keys=None,
+                        ntau=None, Tmax=None, refs=None):
+        """Dense build. `effects` = `[(x (n, C), b_nodes (C, Q), logW (C, Q))]` (the
+        leave-one-out set), `intercept` = `(centered nodes (Q0,), logw (Q0,))` or None,
+        `keys` = one hashable slot per effect for the factor memo, `refs` = per effect
+        the array objects whose IDENTITY validates the memo (default: the node arrays
+        as passed; the engine passes the effect's stored `(b_nodes, log_node_weight)`,
+        since the transposed views it hands in are fresh objects every call)."""
+        y = jnp.asarray(y)
+        n = y.shape[0]
+        keys = [None] * len(effects) if keys is None else list(keys)
+        refs = [None] * len(effects) if refs is None else list(refs)
+        items = []
+        for (x, b_nodes, logW), slot, ref in zip(effects, keys, refs):
+            x, b_nodes, logW = jnp.asarray(x), jnp.asarray(b_nodes), jnp.asarray(logW)
+            ref = (b_nodes, logW) if ref is None else tuple(ref)
+            W, s_c, q_c = _node_law(b_nodes, logW)
+            cache = self._memo()
+            binary = cache.is_binary(x) if cache is not None else _is_binary_design(x)
+
+            def fac(tau, x=x, b_nodes=b_nodes, W=W, binary=binary):
+                if binary:
+                    base_, D = _binary_node_terms(b_nodes, W, tau, jnp.zeros_like(s_c))
+                    return _binary_matmul(x, base_, D)
+                return _node_effect_cf(x, b_nodes, W, tau)
+
+            items.append((slot, ref, lambda x=x, s_c=s_c, q_c=q_c:
+                          _node_moments_dense(x, s_c, q_c), fac))
+        if intercept is not None:
+            slot, refs, mom, fac = _intercept_item(intercept)
+            items.append((slot, refs, lambda mom=mom: mom(n), fac))
+        return _table_from_items(y, items, self.M, **self._kwargs(ntau, Tmax))
+
+    def build_aux_nodes_sparse(self, base, y, X, effects, intercept=None, colmean=None,
+                               keys=None, ntau=None, Tmax=None, entry_chunk=1 << 14,
+                               refs=None):
+        """Sparse (BCOO) build: `X` shared, `effects = [(b_nodes (p, Q), logW (p, Q))]`,
+        `colmean` (p,) treats `X` as centered via the baseline+support split. `keys` /
+        `refs` as in `build_aux_nodes`."""
+        y = jnp.asarray(y)
+        n = y.shape[0]
+        op = BCOOOperator(X)
+        c_arr = None if colmean is None else jnp.asarray(colmean)
+        keys = [None] * len(effects) if keys is None else list(keys)
+        refs = [None] * len(effects) if refs is None else list(refs)
+        cache = self._memo()
+        binary = cache.is_binary(X) if cache is not None else _is_binary_design(X)
+        items = []
+        for (b_nodes, logW), slot, ref in zip(effects, keys, refs):
+            b_nodes, logW = jnp.asarray(b_nodes), jnp.asarray(logW)
+            ref = (b_nodes, logW) if ref is None else tuple(ref)
+            W, s_c, q_c = _node_law(b_nodes, logW)
+            items.append((
+                slot, ref,
+                lambda s_c=s_c, q_c=q_c: _node_moments_sparse(op, s_c, q_c, c_arr),
+                lambda tau, b_nodes=b_nodes, W=W: _node_factor_sparse(
+                    X, b_nodes, W, tau, c_arr, binary, entry_chunk),
+            ))
+        if intercept is not None:
+            slot, refs, mom, fac = _intercept_item(intercept)
+            items.append((slot, refs, lambda mom=mom: mom(n), fac))
+        return _table_from_items(y, items, self.M, **self._kwargs(ntau, Tmax))
 
     def plugin_terms(self, base: ResponseModel, eta, aux):
         return _table_plugin_terms(base, eta, aux)

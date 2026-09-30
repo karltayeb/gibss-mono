@@ -157,15 +157,21 @@ def test_null_intercept_cavi(integ, vfam):
     assert abs(float(st.family_state.intercept_value) - np.log(yb / (1 - yb))) < 1e-6
 
 
-def test_cf_requires_gaussian_vfam():
-    # cf is Q2-only (no closed-form CF for a free-form Q1 posterior); it must reject
-    # variational_family='unconstrained'. (compress, by contrast, is valid for BOTH
-    # Q1/unconstrained -> quad and Q2/gaussian -> vi_gh; see test_compress_both_families.)
+def test_cf_both_families():
+    # cf, like compress, is valid for BOTH families: Q2/gaussian -> vi_gh (CharFnOffset)
+    # and Q1/unconstrained -> quad (CharFnSelfNorm: the node measure's finite-sum CF).
+    from gibss.cf_offset import CharFnOffset, CharFnSelfNorm
     rng = np.random.default_rng(3)
     X, y = _logit_data(rng, n=120, p=12, signal_idx=[2], signal_val=[1.5])
-    with pytest.raises(ValueError, match="variational_family="):
-        fit_glm_susie(X, y, L=2, offset_integration="cf",
-                      variational_family="unconstrained")
+    q2 = fit_glm_susie(X, y, L=2, offset_integration="cf",
+                       variational_family="gaussian", max_iter=5)
+    q1 = fit_glm_susie(X, y, L=2, offset_integration="cf",
+                       variational_family="unconstrained", max_iter=5)
+    assert q2.family_state.kernel == "vi_gh"
+    assert isinstance(q2.family_state.response.smoother, CharFnOffset)
+    assert q1.family_state.kernel == "quad"
+    assert isinstance(q1.family_state.response.smoother, CharFnSelfNorm)
+    assert int(np.argmax(np.asarray(q1.pip))) == 2 == int(np.argmax(np.asarray(q2.pip)))
 
 
 @pytest.mark.slow
