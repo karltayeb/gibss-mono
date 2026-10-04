@@ -27,6 +27,7 @@ from .engine import (
     Schedule,
     add_message_index_step,
     check_alpha_skl_convergence_step,
+    check_skl_convergence_step,
     replace_effect_in_gibss_state,
     subtract_message_index_step,
     to_numpy_state_step,
@@ -153,8 +154,9 @@ class GLMFamilyState:
     # row_param: the smoother's per-row engine-tuned parameter (JJFixed: the tilt
     # xi = sqrt(E[eta]^2 + V[eta]), globaljj-style; TaylorFixed: the expansion anchor
     # zhat, IRLS "update" or score "null"), refreshed by update_row_param_step from
-    # the FULL message. Tuned per-row DATA that rides into the kernels through aux,
-    # held as state exactly like the shared `intercept`.
+    # the FULL message + the shared intercept (profiled: + the profiled null intercept).
+    # Tuned per-row DATA that rides into the kernels through aux, held as state exactly
+    # like the shared `intercept`.
     row_param: object = None
     skl_tolerance: float = 1e-4
     skl_history: list[float] = field(default_factory=list)
@@ -576,12 +578,65 @@ def _null_log_marginal(fs, aux, offset):
     kernel subtracts internally:
       profiled -> the profiled null (b0 maximized at b=0), _profile_null;
       jj       -> the b=0 fixed-tilt bound (xi0^2 = offset^2 + ov);
-      else     -> the b=0 loglik summed over all rows (smoothed at variance ov)."""
+      else     -> the b=0 loglik summed over all rows (smoothed at variance ov).
+    For the row-parameterized schemes (globaljj / irls) this is the null under the
+    parameter tuned at the FULL predictor -- the kernel's baseline, not an honest null
+    score; `_fit_effect` re-scores it (`_null_row_param_solve`)."""
     response = fs.response
     offset = jnp.asarray(offset)
     if fs.intercept == "profiled":
         return float(_profile_null(response, offset, aux)[1])
     return float(_null_loglik_sum(response, offset, aux, fs.kernel == "jj"))
+
+
+def _row_param_retuned(fs):
+    """Is this fit's row parameter (JJFixed tilt / TaylorFixed anchor) engine-tuned at the
+    full predictor -- globaljj / irls, shared or profiled? Those need the null scored under
+    a parameter re-tuned AT the null. Not the jj kernel (its own per-entry tilt, null at xi0
+    already) and not intercept="null" (the parameter is frozen at the null by construction)."""
+    smoother = getattr(fs.response, "smoother", None)
+    return (
+        smoother is not None
+        and smoother.takes_row_param
+        and fs.kernel != "jj"
+        and fs.intercept != "null"
+    )
+
+
+@partial(jax.jit, static_argnames=("response", "profiled", "n_iter"))
+def _null_row_param_solve(mean, ov, y, base, response, profiled, n_iter=200, tol=1e-10):
+    """The b = 0 operating point of a row-parameterized scheme, and the null scored there.
+
+    The scheme's per-row parameter (JJFixed: the tilt xi; TaylorFixed: the anchor zhat) is
+    tuned at the null predictor `mean + base (+ c0)`, where `c0` is the profiled null
+    intercept when `profiled` (the per-candidate b0_j lives inside the kernel, so the
+    feature-independent null intercept is the shared operating point) and 0 otherwise.
+    `c0` and the parameter it defines are alternated to convergence: one Newton step on
+    the (quadratic-in-c) scheme at the current parameter, then re-tune. Returns
+    `(c0, param, ll0)` with `ll0 = sum_i terms(mean_i + base_i + c0)` under `param` -- the
+    scheme's null value with its parameter TIGHT at the null (JJ: a bound tight at xi;
+    Taylor: the expansion exact at its anchor)."""
+    smoother = response.smoother
+    mean, ov, y, base = (jnp.asarray(mean), jnp.asarray(ov), jnp.asarray(y), jnp.asarray(base))
+
+    def tune(c):
+        return smoother.row_param(mean, ov, base + c)
+
+    if profiled:
+        def body(s):
+            c, _, it = s
+            _, g, w = response.terms(mean + base + c, (y, ov, tune(c)))
+            step = jnp.clip(jnp.sum(g) / jnp.maximum(jnp.sum(w), 1e-8), -4.0, 4.0)
+            return c + step, jnp.abs(step), it + 1
+
+        c0, _, _ = jax.lax.while_loop(
+            lambda s: (s[2] < n_iter) & (s[1] > tol), body, (jnp.zeros(()), jnp.inf, 0)
+        )
+    else:
+        c0 = jnp.zeros(())
+    param = tune(c0)
+    ll0 = jnp.sum(response.terms(mean + base + c0, (y, ov, param))[0])
+    return c0, param, ll0
 
 
 def _fit_effect(data, fs, aux, offset, prior_variance, order):
@@ -592,6 +647,21 @@ def _fit_effect(data, fs, aux, offset, prior_variance, order):
         data, fs, aux, offset, prior_variance, order
     )
     null = _null_log_marginal(fs, aux, offset)
+    if _row_param_retuned(fs):
+        # `null` is the kernel's own baseline: the b=0 value under the row parameter tuned
+        # at the FULL predictor -- tight at the alternative, so at the null the JJ bound is
+        # loose (Taylor: far from its anchor) and every BF against it is inflated. Re-score
+        # the null under the parameter tuned AT the null (profiled: at its own null
+        # intercept) and shift log_bf by the feature-independent difference: alpha is
+        # unchanged, feature_log_marginal stays the kernel's alternative value, and
+        # feature_log_bf is the difference of two values each tight at its own point.
+        y, ov = aux[0], aux[1]
+        _, _, tight = _null_row_param_solve(
+            offset, ov, y, 0.0, fs.response, fs.intercept == "profiled"
+        )
+        tight = float(tight)
+        log_bf = log_bf + (null - tight)
+        null = tight
     b_nodes, log_node_weight = nodes if nodes is not None else (None, None)
     return build_ser_state(
         mu, var, log_bf, coefficient_kl, prior_variance, null_log_marginal=null,
@@ -1039,7 +1109,15 @@ def update_row_param_step(data, state):
     xi = sqrt(E[eta]^2 + V[eta]); TaylorFixed: the working-model anchor zhat (the
     current predictor for anchor="update" = IRLS, the intercept-only null for
     anchor="null" = score mode). No-op for schemes without a row parameter, and
-    under kernel="jj" (which tunes its own per-entry tilt from the b-posterior)."""
+    under kernel="jj" (which tunes its own per-entry tilt from the b-posterior).
+
+    intercept="profiled": the per-candidate intercept b0_j lives INSIDE the kernel and no
+    shared intercept is estimated, so the shared parameter is tuned at the
+    feature-independent operating point of the full predictor: message + the profiled
+    NULL intercept c0 (`_null_row_param_solve`). Tuning at the bare message (intercept 0)
+    put the tilt / anchor at the wrong point whenever the intercept is far from 0 (an
+    intercept of -3 tuned the JJ tilt at |eta| ~ 0.3 instead of ~3, halving the
+    posterior mean and quartering the evidence)."""
     fs = state.family_state
     if (
         fs.kernel == "jj"
@@ -1047,11 +1125,16 @@ def update_row_param_step(data, state):
         or not fs.response.smoother.takes_row_param
     ):
         return state
-    param = fs.response.smoother.row_param(
-        jnp.asarray(state.total_message.mean),
-        _offset_var(state),  # message variance + intercept variance
-        fs.intercept_value + fs.glm_offset,  # base = every non-effect part of the predictor
-    )
+    mean = jnp.asarray(state.total_message.mean)
+    ov = _offset_var(state)  # message variance + intercept variance
+    if fs.intercept == "profiled":
+        _, param, _ = _null_row_param_solve(
+            mean, ov, jnp.asarray(data.y), fs.glm_offset, fs.response, True
+        )
+    else:
+        param = fs.response.smoother.row_param(
+            mean, ov, fs.intercept_value + fs.glm_offset  # every non-effect part of eta
+        )
     return replace(state, family_state=replace(fs, row_param=param))
 
 
@@ -1241,6 +1324,23 @@ def update_effect_index_step(data, l, state):
     return replace_effect_in_gibss_state(state, l, new_effect)
 
 
+def check_glm_convergence_step(data, prev_state, state):
+    """Sweep-level convergence for the GLM families. Kernels whose per-column fit is exact
+    given the offset (quad / jj / vi / vi_gh / plain linear) converge on alpha alone: once
+    the selection stops moving, (mu, var) have followed. The row-parameterized global
+    schemes (globaljj's tilt, IRLS's anchor) are different: the engine-tuned row parameter
+    and the posterior co-converge, linearly and slowly (a saturated PIP freezes alpha at
+    sweep 1 while mu is still a third of the way to its fixed point, contraction ~0.7-0.85
+    per sweep), so they converge on the full distributional SKL (alpha AND the Gaussian
+    moments), the only statistic that sees the parameter still moving."""
+    check = (
+        check_skl_convergence_step
+        if _row_param_retuned(state.family_state)
+        else check_alpha_skl_convergence_step
+    )
+    return check(data, prev_state, state)
+
+
 def default_schedule() -> Schedule:
     return Schedule(
         # the random intercept is a block coordinate updated once per sweep (a no-op unless
@@ -1253,7 +1353,7 @@ def default_schedule() -> Schedule:
             update_prior_variance_index_step,
             add_message_index_step,
         ),
-        check_convergence=check_alpha_skl_convergence_step,
+        check_convergence=check_glm_convergence_step,
         # reference_intercept_step runs on the jax state (it rebuilds the offset table), so it
         # must precede to_numpy_state_step; it is a no-op unless the intercept is profiled.
         after_fit=(reference_intercept_step, to_numpy_state_step),
