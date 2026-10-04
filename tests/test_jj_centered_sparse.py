@@ -107,3 +107,33 @@ def test_front_door_no_longer_raises():
     st = fit_glm_susie(Xs, y, L=2, method="localjj", center=True, max_iter=20)
     assert st.family_state.kernel == "jj"
     assert np.all(np.isfinite(np.asarray(st.alpha)))
+
+
+def test_surrogate_rounds_match_exact_when_iterates_leave_the_first_box():
+    # the Chebyshev surrogate is fit per ROUND over the box around the current iterates
+    # (+-0.5 padding) and refit when an iterate leaves it. Dense-ish columns (c ~ 0.5) with a
+    # strong effect push `a = c m` well past the first box (fit at m = 0), so this exercises
+    # the refit; the answer must still match the exact (n, p) background and the dense
+    # eagerly-centered kernel.
+    rng = np.random.default_rng(5)
+    n, p = 400, 8
+    X = (rng.uniform(size=(n, p)) < 0.5).astype(float)
+    c = X.mean(0)
+    eta = -1.0 + 4.0 * (X[:, 2] - c[2]) - 3.0 * (X[:, 5] - c[5])
+    y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+    offset = rng.standard_normal(n) * 0.2
+    pv = 4.0
+    resp = Smoothed(Bernoulli(), JJFixed())
+    op_s = as_operator(jsparse.BCOO.fromdense(jnp.asarray(X)))
+    args = (op_s, (jnp.asarray(y), 0.0), jnp.asarray(offset), jnp.asarray(c), pv, resp)
+    m_c, v_c, lbf_c, _ = glm_jj_center_ser(*args, background="chebyshev")
+    m_x, v_x, lbf_x, _ = glm_jj_center_ser(*args, background="exact")
+    m_d, v_d, lbf_d, _ = glm_jj_ser(
+        as_operator(jnp.asarray(X - c)), (jnp.asarray(y), 0.0), jnp.asarray(offset), pv, resp
+    )
+    assert np.max(np.abs(np.asarray(c * m_c))) > 0.5  # left the m = 0 box: a refit happened
+    np.testing.assert_allclose(m_c, m_x, atol=1e-8)
+    np.testing.assert_allclose(v_c, v_x, atol=1e-8)
+    np.testing.assert_allclose(lbf_c, lbf_x, atol=1e-7)
+    np.testing.assert_allclose(m_c, m_d, atol=1e-8)
+    np.testing.assert_allclose(lbf_c, lbf_d, atol=1e-7)

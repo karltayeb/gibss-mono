@@ -71,7 +71,7 @@ def test_gibss_gaussian_plugin_stationarity():
     X, y = _logit_data(rng, n=300, p=6, idx=[2], val=[2.0])
     pv = 1.0
     st = fit_glm_susie(X, y, L=2, method="gibss_gaussian", estimate_prior_variance=False,
-                       prior_variance=pv, max_iter=300, tol=1e-10)
+                       prior_variance=pv, max_iter=300, tol=1e-10, center=False)
     e0, e1 = st.single_effects[0], st.single_effects[1]
     Xn, yn = np.asarray(X), np.asarray(y)
     off = float(st.family_state.intercept_value) + Xn @ (np.asarray(e1.alpha) * np.asarray(e1.mu))

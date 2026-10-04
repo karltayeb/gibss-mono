@@ -335,7 +335,7 @@ def test_gold_q2_poisson_stationarity():
     st = fit_glm_susie(
         X, y, L=2, family="poisson", offset_integration="cf",
         variational_family="gaussian", estimate_prior_variance=False,
-        prior_variance=1.0, max_iter=800, tol=1e-12, effect_quadrature_points=order,
+        prior_variance=1.0, max_iter=800, tol=1e-12, effect_quadrature_points=order, center=False
     )
     e0, e1 = st.single_effects[0], st.single_effects[1]
     assert np.max(np.asarray(e1.alpha)) < 0.6  # effect 1 is a genuine (diffuse) mixture
@@ -565,13 +565,13 @@ def _poisson_elbo_reference(data, st, is_q1):
     return ll - sum(float(e.kl) for e in st.single_effects) - float(fs.intercept_kl)
 
 
-def _fit_q2(X, y):
-    return fit_glm_susie(X, y, L=3, method="cf_cavi", family="poisson", max_iter=80)
+def _fit_q2(X, y):  # uncentered: the ELBO references below are built on the raw design
+    return fit_glm_susie(X, y, L=3, method="cf_cavi", family="poisson", max_iter=80, center=False)
 
 
 def _fit_q1(X, y):
     return fit_glm_susie(X, y, L=3, family="poisson", variational_family="unconstrained",
-                         offset_integration="compress_selfnorm", max_iter=80)
+                         offset_integration="compress_selfnorm", max_iter=80, center=False)
 
 
 @pytest.mark.slow

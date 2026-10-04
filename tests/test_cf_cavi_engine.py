@@ -58,7 +58,7 @@ def test_cf_cavi_fixed_point_self_consistent():
     that the fit is a genuine fixed point."""
     rng = np.random.default_rng(1)
     X, y = _logit_data(rng, n=300, p=25, signal_idx=[3, 14], signal_val=[2.2, -2.0])
-    st = fit_glm_susie(X, y, L=3, method="cf_cavi", max_iter=100, tol=1e-7)
+    st = fit_glm_susie(X, y, L=3, method="cf_cavi", max_iter=100, tol=1e-7, center=False)
     data = glm.prep_data(X, y, center=False)
     fs = st.family_state
     for l in range(len(st.single_effects)):
@@ -118,7 +118,7 @@ def test_cf_cavi_matches_exact_cavi_stationarity():
     X, y = _logit_data(rng, n=200, p=4, signal_idx=[1], signal_val=[2.0])
     st = fit_glm_susie(
         X, y, L=2, method="cf_cavi", max_iter=300, tol=1e-10,
-        estimate_prior_variance=False, prior_variance=1.0,
+        estimate_prior_variance=False, prior_variance=1.0, center=False
     )
     e0, e1 = st.single_effects[0], st.single_effects[1]
     b0_int = float(st.family_state.intercept_value)
@@ -160,7 +160,7 @@ def test_cf_cavi_intercept_stationarity():
     X, y = _logit_data(rng, n=250, p=5, signal_idx=[2], signal_val=[1.8])
     st = fit_glm_susie(
         X, y, L=1, method="cf_cavi", max_iter=300, tol=1e-10,
-        estimate_prior_variance=False, prior_variance=1.0,
+        estimate_prior_variance=False, prior_variance=1.0, center=False
     )
     e0 = st.single_effects[0]
     Xn = np.asarray(X)
@@ -269,7 +269,7 @@ def test_cf_cavi_sparse_matches_dense():
     y = (rng.uniform(size=n) < _sigmoid(Xd @ b - 0.3)).astype(float)
     Xs = sparse.BCOO.fromdense(jax.numpy.asarray(Xd))
     st_d = fit_glm_susie(Xd, y, L=4, method="cf_cavi", max_iter=40, center=False)
-    st_s = fit_glm_susie(Xs, y, L=4, method="cf_cavi", max_iter=40)
+    st_s = fit_glm_susie(Xs, y, L=4, method="cf_cavi", max_iter=40, center=False)
     assert st_d.converged and st_s.converged
     assert np.allclose(np.asarray(st_d.pip), np.asarray(st_s.pip), atol=1e-8)
     fm_d = np.asarray([e.feature_log_marginal for e in st_d.single_effects])

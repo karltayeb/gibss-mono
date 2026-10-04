@@ -120,7 +120,8 @@ def test_q2_dense_centering(integ):
 def test_q2_sparse_centering_matches_dense():
     # Sparse-centered Q2 (Compress): the centered offset fold + the centered effect kernel
     # (glm_vi_gh_center_ser) together == the manual dense-centered fit, to machine
-    # precision. cf can't center sparse (its closed-form product densifies) -> rejected.
+    # precision. The cf builder centers sparse too (baseline + support split; pinned
+    # against dense in test_cf_cavi_engine), so it must run, not be rejected.
     rng = np.random.default_rng(7)
     n, p, c = 400, 20, 3
     Xd = (rng.random((n, p)) < 0.2) * rng.normal(1.5, 0.3, (n, p))
@@ -135,9 +136,9 @@ def test_q2_sparse_centering_matches_dense():
     flm = lambda st: np.stack([np.asarray(e.feature_log_marginal) for e in st.single_effects])
     assert np.max(np.abs(flm(s_sp) - flm(s_de))) < 1e-4
     assert np.asarray(s_sp.pip)[c] > 0.9
-    with pytest.raises(ValueError, match="cf"):
-        fit_glm_susie(Xb, jnp.asarray(y), L=2, offset_integration="cf",
-                      variational_family="gaussian", center=True, max_iter=3)
+    s_cf = fit_glm_susie(Xb, jnp.asarray(y), L=2, offset_integration="cf",
+                         variational_family="gaussian", center=True, max_iter=3)
+    assert np.all(np.isfinite(np.asarray(s_cf.pip)))
 
 
 @pytest.mark.parametrize("integ,vfam", [

@@ -762,11 +762,15 @@ def _intercept_point(data, state):
 
 
 @partial(jax.jit, static_argnames=("response", "jj", "n_iter"))
-def _intercept_point_solve(total_mean, aux, inv_tau, b0_init, response, jj, n_iter=50):
+def _intercept_point_solve(
+    total_mean, aux, inv_tau, b0_init, response, jj, n_iter=50, tol=1e-10
+):
     """The point-intercept Newton solve of `_intercept_point`, hoisted under `@jax.jit`
     (like `_intercept_gaussian_solve`): as a bare eager `while_loop` closing over the
     per-sweep arrays it re-traced and re-compiled at the same shapes before EVERY effect
-    update -- the dominant cost of a plug-in (gIBSS) sweep at moderate n. Returns
+    update -- the dominant cost of a plug-in (gIBSS) sweep at moderate n. Stops at
+    `n_iter` or once a step is below `tol` (it runs before every effect update, warm from
+    the previous b0, so it usually needs a few steps, not the full budget). Returns
     `(b0, v0)`."""
     def terms_at(b0):
         eta = total_mean + b0
@@ -777,12 +781,15 @@ def _intercept_point_solve(total_mean, aux, inv_tau, b0_init, response, jj, n_it
         return response.terms(eta, aux)
 
     def body(s):
-        b0, it = s
+        b0, _, it = s
         _, g, w = terms_at(b0)
         step = (jnp.sum(g) - inv_tau * b0) / jnp.maximum(jnp.sum(w) + inv_tau, 1e-8)
-        return b0 + jnp.clip(step, -4.0, 4.0), it + 1
+        step = jnp.clip(step, -4.0, 4.0)
+        return b0 + step, jnp.abs(step), it + 1
 
-    b0, _ = jax.lax.while_loop(lambda s: s[1] < n_iter, body, (b0_init, 0))
+    b0, _, _ = jax.lax.while_loop(
+        lambda s: (s[2] < n_iter) & (s[1] > tol), body, (b0_init, jnp.inf, 0)
+    )
     v0 = 1.0 / jnp.maximum(jnp.sum(terms_at(b0)[2]) + inv_tau, 1e-8)
     return b0, v0
 

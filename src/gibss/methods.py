@@ -393,21 +393,21 @@ def fit_glm_susie(
     #     fold; Poisson via the node-MGF baseline+support split (log_kappa_q1_sparse).
     #   quad / linear (classic): dense eager; sparse via glm_center_ser / CenteredOperator.
     #   vi / jj: dense only (their per-entry variance/tilt drops the sparse off-support fill).
-    # Default (center=None) is uncentered on sparse (layout-consistent), centered where free
-    # on dense; an EXPLICIT center=True on an unsupported combo is an error, not a fallback.
+    # Default (center=None) is CENTERED wherever the resolved kernel and builder support it,
+    # on BOTH layouts -- the canonical model, so a method name means one model and a dense
+    # and a BCOO design fit the same thing. The one exception is the sparse vi kernel (no
+    # centered fold yet), which falls back to uncentered; an EXPLICIT center=True on an
+    # unsupported combo is an error, not a fallback.
     smoother = getattr(response, "smoother", None)
-    if kernel == "vi_gh":
+    if kernel == "vi_gh" or isinstance(
+        smoother, (PoissonSelfNormOffset, Compress, CharFnSelfNorm)
+    ):
+        # every Q2 (vi_gh) and Q1 (self-normalized) fold consumes centering on both layouts.
+        # The analytic Q1 Poisson fold pre-centers a BCOO design via the baseline+support
+        # split (an off-support entry contributes the per-feature node MGF at -c_j, not a
+        # constant), like the Bernoulli Q1 fold.
         if center is None:
-            center = False  # default uncentered (layout-consistent); center=True honored
-    elif isinstance(smoother, PoissonSelfNormOffset):
-        # analytic Q1 Poisson fold: the sparse (BCOO) node-MGF fold pre-centers via the
-        # baseline+support split (an off-support entry contributes the per-feature node MGF
-        # at -c_j, not a constant) -- so center=True is honored, like the Bernoulli Q1 fold.
-        if center is None:
-            center = False
-    elif isinstance(smoother, (Compress, CharFnSelfNorm)):  # Q1 folds: dense + sparse center
-        if center is None:
-            center = False
+            center = True
     else:
         center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear", "jj")
         if center is None:

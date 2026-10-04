@@ -73,7 +73,7 @@ def test_gold_q2_stationarity(integ):
     X, y = _logit_data(rng, n=220, p=4, idx=[1], val=[2.0])
     st = fit_glm_susie(
         X, y, L=2, offset_integration=integ, variational_family="gaussian",
-        estimate_prior_variance=False, prior_variance=1.0, max_iter=300, tol=1e-10,
+        estimate_prior_variance=False, prior_variance=1.0, max_iter=300, tol=1e-10, center=False
     )
     e0, e1 = st.single_effects[0], st.single_effects[1]
     Xn = np.asarray(X)
@@ -138,7 +138,7 @@ def test_gold_q1_freeform_fixed_point():
     X, y = _logit_data(rng, n=160, p=5, idx=[2], val=[1.8])
     st = fit_glm_susie(
         X, y, L=2, offset_integration="compress_selfnorm",
-        estimate_prior_variance=False, prior_variance=1.0, max_iter=300, tol=1e-10,
+        estimate_prior_variance=False, prior_variance=1.0, max_iter=300, tol=1e-10, center=False
     )
     e0, e1 = st.single_effects[0], st.single_effects[1]
     fs = st.family_state
@@ -207,7 +207,7 @@ def test_gold_profiled_vi_gh():
     st = fit_glm_susie(
         X, y, L=1, intercept="profiled", offset_integration="cf",
         variational_family="gaussian", estimate_prior_variance=False,
-        prior_variance=pv, max_iter=150, tol=1e-10,
+        prior_variance=pv, max_iter=150, tol=1e-10, center=False
     )
     e = st.single_effects[0]
     Xn, yn = np.asarray(X), np.asarray(y)

@@ -54,6 +54,15 @@ Gauss-Hermite-over-`b` elaboration (local Taylor only: `quadrature`, `profile`).
 - The single-panel cheb rebuilds its fit range each call from `min(b0)-0.5,
   max(b0)+0.5`, so eval points are strictly interior (no out-of-range); accuracy is
   degree-limited over the range (degree-40 held to ~1e-13 even at wide `b0`).
+- **Sparse pre-centered localjj** (`glm_jj_center_ser`, `center=True` on BCOO -- the
+  default) has TWO per-feature fill params off-support (`a = c m`, `bvar = c^2 v`), so
+  its background is a 2-D surrogate (`D=16`, `(D+1)^2 = 289` nodes). It is fit per
+  ROUND, not per MM iteration: one `O(n D^2)` grid over the box around the current
+  iterates, refit only when an iterate leaves the box (`R` rounds, typically 1-2), and
+  evaluated per iteration at `O(D^2 p)` on top of the `O(nnz)` support pass:
+  `O(n D^2 R + (D^2 p + nnz) I)`. The per-iteration refit it replaced was `O(n D^2 I)`,
+  which at `d = 0.05` cost more than the support pass itself (5.8M vs 4M tanh per
+  iteration on 20000x2000); hoisting it is 2.4x on the kernel.
 
 ## Gaussian variational family (Q2): plug-in gIBSS vs exact CAVI
 

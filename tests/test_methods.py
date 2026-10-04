@@ -154,9 +154,9 @@ def test_prior_variance_threads_through():
 
 @pytest.mark.parametrize("method", sorted(PRESETS))
 def test_every_preset_runs_on_sparse(method):
-    # the center=None default must be layout- AND kernel-aware: on a BCOO design only
-    # the quad kernel consumes centering, so every OTHER preset must fall back to
-    # uncentered rather than crash (guards the center=True front-door regression).
+    # the center=None default is CENTERED wherever the resolved kernel has a sparse
+    # centered fold (every preset but the sparse vi kernel), so each preset must fit a
+    # BCOO design centered rather than crash (guards the center=True front-door regression).
     import jax
     from jax.experimental import sparse
     fam = PRESETS[method].get("family", "logistic")
@@ -276,3 +276,25 @@ def test_explicit_table_response_routes_to_vi_gh():
     st = fit_glm_susie(X, y, L=2, family=resp, variational_family="gaussian", max_iter=5)
     assert st.family_state.kernel == "vi_gh"
     assert int(np.argmax(np.asarray(st.single_effects[0].alpha))) == 2
+
+
+@pytest.mark.parametrize("method", ["cf_cavi", "gibss_gaussian", "compress_cavi", "cf_cavi_q1"])
+@pytest.mark.parametrize("layout", ["dense", "sparse"])
+def test_q2_and_q1_presets_default_to_centered(method, layout):
+    # "always center": the CAVI / plug-in Q2 and Q1 presets fit the CENTERED model by default
+    # on both layouts (they used to default to uncentered), so the default equals an explicit
+    # center=True and differs from center=False on an off-center design.
+    import jax
+    from jax.experimental import sparse
+    rng = np.random.default_rng(7)
+    n, p, causal = 200, 8, 2
+    X = (rng.normal(size=(n, p)) + 2.0) * (rng.random((n, p)) < 0.4)  # off-center
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-2 + 1.5 * X[:, causal]))), n).astype(float)
+    if layout == "sparse":
+        X = sparse.BCOO.fromdense(jax.numpy.asarray(X))
+    kw = dict(L=2, method=method, max_iter=4, tol=-1.0)
+    default = fit_glm_susie(X, y, **kw)
+    centered = fit_glm_susie(X, y, center=True, **kw)
+    uncentered = fit_glm_susie(X, y, center=False, **kw)
+    np.testing.assert_allclose(np.asarray(default.alpha), np.asarray(centered.alpha), atol=1e-12)
+    assert not np.allclose(np.asarray(default.alpha), np.asarray(uncentered.alpha), atol=1e-6)

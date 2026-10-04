@@ -74,6 +74,14 @@ class DesignOperator:
         """sum_i x_ij^k W_ij with a per-ENTRY weight W (n,p dense / nnz sparse)."""
         raise NotImplementedError
 
+    def local_moments(self, specs: Any) -> Any:
+        """Several `local_moment(k, W)` at once: `((k1, W1), (k2, W2), ...)` -> tuple of (p,)
+        sums. The default loops; a layout whose sibling reductions fuse into ONE pass
+        overrides it (DenseOperator) so an elementwise producer the W's share (e.g. the JJ
+        tilt's tanh feeding both g and w) is evaluated once rather than duplicated into
+        each reduction by XLA's fusion."""
+        return tuple(self.local_moment(k, W) for k, W in specs)
+
     def broadcast_rows(self, v: Any) -> Any:
         """Lift a per-row (n,) vector into entry space."""
         raise NotImplementedError
@@ -144,6 +152,20 @@ class DenseOperator(DesignOperator):
 
     def local_moment(self, k, W):
         return jnp.sum((self.X**k) * W, axis=0)
+
+    def local_moments(self, specs):
+        # ONE variadic reduce over the row axis. Separate `jnp.sum`s let XLA fuse a shared
+        # producer of the W's into each reduction and evaluate it per consumer (the jj
+        # kernel's tanh twice: ~22% of its iteration); a stacked (n, p, 2) operand would
+        # materialize instead. (BCOO keeps separate segment sums: a stacked scatter is slower.)
+        X = self.X
+        operands = tuple(
+            (X**k) * W if k else jnp.broadcast_to(W, X.shape) for k, W in specs
+        )
+        inits = tuple(jnp.zeros((), o.dtype) for o in operands)
+        return jax.lax.reduce(
+            operands, inits, lambda a, b: tuple(ai + bi for ai, bi in zip(a, b)), (0,)
+        )
 
     def broadcast_rows(self, v):
         return v[:, None]

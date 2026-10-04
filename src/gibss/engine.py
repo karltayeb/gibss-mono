@@ -186,14 +186,18 @@ def identity_index_step(data, l, state):
 
 def subtract_message_index_step(data, l, state):
     effect = state.single_effects[l]
-    new_message = state.total_message.subtract(effect.message(data))
-    return replace(state, total_message=new_message)
+    msg = getattr(effect, "cached_message", None)
+    if msg is None:
+        msg = effect.message(data)
+    return replace(state, total_message=state.total_message.subtract(msg))
 
 
 def add_message_index_step(data, l, state):
     effect = state.single_effects[l]
-    new_message = state.total_message.add(effect.message(data))
-    return replace(state, total_message=new_message)
+    msg = effect.message(data)
+    if "cached_message" in getattr(effect, "__dataclass_fields__", ()):
+        state = replace_effect_in_gibss_state(state, l, replace(effect, cached_message=msg))
+    return replace(state, total_message=state.total_message.add(msg))
 
 
 def freeze_shrunk_effects_step(data, state, *, min_prior_variance, warmup=1, min_active=1):
@@ -361,6 +365,14 @@ class BaseSERState:
     # offset fold consumes (`Compress.build_aux_selfnorm_sequential`). Shapes (order, p).
     b_nodes: Any = None
     log_node_weight: Any = None
+    # Engine-owned cache of `message(data)` for this effect's current (alpha, mu, var): set
+    # by `add_message_index_step`, consumed by `subtract_message_index_step`, so the design
+    # contraction behind each effect's message is computed once per update, not twice
+    # (once to remove it, once to put the refit back). Never part of the fit's semantics: a
+    # kernel's new effect starts it at None, a `replace` that keeps (alpha, mu, var) keeps
+    # it valid, and `effect_to_numpy` drops it (a host snapshot must not pin a design-sized
+    # message, and a warm start re-derives it against its own data).
+    cached_message: Any = None
 
     def get_cs(self, coverage: float = 0.95) -> tuple[int, ...]:
         """Indices of the smallest set of features with sum(alpha) >= coverage."""
@@ -455,10 +467,14 @@ def _to_numpy_leaf(x):
 
 
 def effect_to_numpy(effect: Any) -> Any:
-    """Host-numpy copy of one single-effect dataclass (arrays -> np.asarray, 0-d -> float)."""
-    return replace(
-        effect, **{f: _to_numpy_leaf(getattr(effect, f)) for f in effect.__dataclass_fields__}
-    )
+    """Host-numpy copy of one single-effect dataclass (arrays -> np.asarray, 0-d -> float).
+    The engine's `cached_message` is dropped, not copied: it is a design-sized transient
+    that only the live sweep needs."""
+    fields = {
+        f: (None if f == "cached_message" else _to_numpy_leaf(getattr(effect, f)))
+        for f in effect.__dataclass_fields__
+    }
+    return replace(effect, **fields)
 
 
 def message_to_numpy(tm: Any) -> Any:

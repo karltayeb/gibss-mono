@@ -562,8 +562,9 @@ def test_glm_jj_ser_matches_localjj(opkind, with_ov):
           else BCOOOperator(sparse.BCOO.fromdense(jnp.asarray(X))))
     yj, oj, ovj = jnp.asarray(y), jnp.asarray(off), jnp.asarray(ov)
     aux = (yj, ovj) if with_ov else yj
-    got = glm_jj_ser(op, aux, oj, 1.0)
-    ref = localjj_ser(op, yj, oj, 1.0, offset_var=(ovj if with_ov else None))
+    # both run to a tight stop: this pins the FIXED POINT, not the kernels' default tolerance
+    got = glm_jj_ser(op, aux, oj, 1.0, tol=1e-12)
+    ref = localjj_ser(op, yj, oj, 1.0, offset_var=(ovj if with_ov else None), tol=1e-12)
     for u, v in zip(got[:3], ref):
         np.testing.assert_allclose(np.asarray(u), np.asarray(v), atol=1e-9)
 
@@ -630,7 +631,7 @@ def test_glm_vi_ser_jj_envelope_equals_conjugate_localjj(with_ov):
     op = DenseOperator(jnp.asarray(X))
     aux = (jnp.asarray(y), jnp.asarray(ov)) if with_ov else jnp.asarray(y)
     vi = glm_vi_ser(op, aux, jnp.asarray(off), 1.0, Smoothed(Bernoulli(), JJEnvelope()))
-    jj = glm_jj_ser(op, aux, jnp.asarray(off), 1.0)
+    jj = glm_jj_ser(op, aux, jnp.asarray(off), 1.0, tol=1e-10)  # same fixed point, tight stop
     for a, b in zip(vi, jj):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-7)
 
