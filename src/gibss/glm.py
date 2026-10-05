@@ -201,6 +201,25 @@ class GLMFamilyState:
     # default: sigma^2 is weakly identified for an observation-level random effect (a flat
     # EBNM marginal likelihood), so it is a fixed knob unless the caller opts into estimating.
     estimate_random_intercept_variance: bool = False
+    # covariates: a FIXED dense (n, k) covariate design Z on `data.covariates`, absorbed
+    # into the SHARED intercept factor: ONE Gaussian factor q(b0, gamma) = N(m, V) over the
+    # nuisance design W = [1 | Z] (the ones column iff the intercept is estimated), with the
+    # same diffuse N(0, tau I) prior (`intercept_prior_variance`). The intercept is the
+    # k = 0 case: `intercept_value` / `intercept_var` stay b0's marginal mean and variance
+    # (m[0], V[0, 0]), so every intercept consumer is unchanged. Row i sees the factor only
+    # through the scalar w_i' (b0, gamma) ~ N(w_i' m, w_i' V w_i), so its mean rides in eta
+    # (`covariate_eta` = Z gamma, next to `intercept_value`) and its per-row variance
+    # (`nuisance_var`) rides in the effect offset variance where the scalar `intercept_var`
+    # did -- the plug-in modes drop it, exact Q2 CAVI integrates it, dense and sparse X
+    # alike (the factor never touches X). The joint covariance V keeps the b0-gamma
+    # correlation inside the factor (no mean-field split between them), so Z needs no
+    # centering. Shared intercept only: a profiled intercept has no shared factor to put Z
+    # in (ValueError), and the free-form Q1 intercept has no per-row-variance seam
+    # (NotImplementedError) -- both checked at `initialize_state`.
+    covariate_mean: object = None  # (k,) posterior mean of gamma (None = no covariates)
+    covariate_eta: object = 0.0  # (n,) Z @ covariate_mean (scalar 0.0 = none)
+    nuisance_cov: object = None  # (d, d) joint posterior covariance of (b0, gamma)
+    nuisance_var: object = None  # (n,) w_i' V w_i; None = intercept-only (use intercept_var)
 
     def __post_init__(self):
         legacy = {"profile": "quad", "vi_profile": "vi", "linear_profile": "linear"}
@@ -276,15 +295,112 @@ def _ri_var(state, include=True):
     return 0.0 if v is None else jnp.asarray(v)
 
 
+def _has_covariates(fs):
+    return getattr(fs, "covariate_mean", None) is not None
+
+
+def _nuisance_mean(fs):
+    """The shared nuisance factor's mean in eta: b0 + Z gamma (just b0 without covariates).
+    Scalar when there are no covariates, (n,) with them."""
+    return fs.intercept_value + getattr(fs, "covariate_eta", 0.0)
+
+
+def _nuisance_var(fs):
+    """Per-row posterior variance of the shared nuisance factor's contribution to eta,
+    w_i' V w_i: the scalar `intercept_var` (v0) for an intercept-only factor, the (n,)
+    `nuisance_var` once covariates are in the factor. Folds into the effect offset
+    variance wherever the intercept's v0 did."""
+    nv = getattr(fs, "nuisance_var", None)
+    return fs.intercept_var if nv is None else jnp.asarray(nv)
+
+
+def _nuisance_design(data, fs):
+    """`(W, has_intercept)`: the shared nuisance factor's dense design W = [1 | Z]. The
+    ones column is present when the shared intercept is estimated -- or always under
+    intercept='null' (the frozen null fit fits b0) and 'profiled' (whose post-fit
+    reference factor is not gated on `estimate_intercept`); the Z block when
+    `data.covariates` is set. W is None when neither applies (nothing to fit)."""
+    n = jnp.shape(jnp.asarray(data.y))[0]
+    has_icpt = bool(getattr(fs, "estimate_intercept", True)) or (
+        getattr(fs, "intercept", "shared") in ("null", "profiled")
+    )
+    cols = [jnp.ones((n, 1))] if has_icpt else []
+    Z = getattr(data, "covariates", None)
+    if Z is not None:
+        cols.append(jnp.asarray(Z))
+    if not cols:
+        return None, has_icpt
+    return jnp.concatenate(cols, axis=1), has_icpt
+
+
+def _nuisance_init(fs, has_icpt):
+    """The factor's current mean vector m = (b0, gamma) in W's column order (warm start)."""
+    parts = [jnp.asarray(fs.intercept_value)[None]] if has_icpt else []
+    if _has_covariates(fs):
+        parts.append(jnp.asarray(fs.covariate_mean))
+    return jnp.concatenate(parts)
+
+
+def _gauss_kl(m, V, tau):
+    """KL(N(m, V) || N(0, tau I)) for a d-dimensional Gaussian factor."""
+    d = m.shape[0]
+    _, logdet = jnp.linalg.slogdet(V)
+    return 0.5 * (jnp.trace(V) / tau + m @ m / tau - d + d * math.log(tau) - logdet)
+
+
+def _nuisance_kl(fs):
+    """The stored shared factor's KL against its N(0, tau I) prior, recomputed from the
+    posterior (not the stored `intercept_kl`, which reflects the FITTING mode and is 0 for
+    a null fit). Intercept-only: the scalar closed form; with covariates: the joint."""
+    tau = float(getattr(fs, "intercept_prior_variance", 1e6))
+    V = getattr(fs, "nuisance_cov", None)
+    if V is None:
+        m0 = float(getattr(fs, "intercept_value", 0.0))
+        v0 = max(float(getattr(fs, "intercept_var", 0.0)), 1e-300)
+        return float(0.5 * (v0 / tau + m0 * m0 / tau - 1.0 + math.log(tau / v0)))
+    V = jnp.asarray(V)
+    has_icpt = V.shape[0] == jnp.asarray(fs.covariate_mean).shape[0] + 1
+    return float(_gauss_kl(_nuisance_init(fs, has_icpt), V, tau))
+
+
+def _nuisance_fields(data, fs, m, V):
+    """family_state update dict for a fitted Gaussian shared factor q(b0, gamma) = N(m, V):
+    b0's marginal (`intercept_value`, `intercept_var`), the covariate block (`covariate_mean`,
+    `covariate_eta` = Z gamma, `nuisance_cov`, per-row `nuisance_var` = w_i' V w_i) and the
+    joint KL. Intercept-only (k = 0) writes exactly the three scalar fields it always did."""
+    W, has_icpt = _nuisance_design(data, fs)
+    tau = fs.intercept_prior_variance
+    out = dict(intercept_kl=float(_gauss_kl(m, V, tau)))
+    if has_icpt:
+        out.update(intercept_value=float(m[0]), intercept_var=float(V[0, 0]))
+    Z = getattr(data, "covariates", None)
+    if Z is not None:
+        gamma = m[1:] if has_icpt else m
+        out.update(
+            covariate_mean=gamma,
+            covariate_eta=jnp.asarray(Z) @ gamma,
+            nuisance_cov=V,
+            nuisance_var=jnp.sum((W @ V) * W, axis=1),
+        )
+    return out
+
+
+def _zero_nuisance_var(fs, n):
+    """Mean-field self-exclusion: the factor's own spread out of the offset variance."""
+    nv = None if not _has_covariates(fs) else jnp.zeros(n)
+    return replace(fs, intercept_var=0.0, nuisance_var=nv)
+
+
 def _offset_var(state, include_intercept_var=True, include_ri_var=True):
     """Per-row variance of the random offset: the message variance plus the shared
-    intercept's variance (a constant) plus the random intercept's per-row variance. Each is
-    excluded under MeanMessage (mean-only mode), and its own factor is excluded when that
-    factor is the one being updated (mean-field)."""
+    nuisance factor's variance (the intercept's constant v0, or per-row w_i' V w_i with
+    covariates) plus the random intercept's per-row variance. Each is excluded under
+    MeanMessage (mean-only mode), and its own factor is excluded when that factor is the
+    one being updated (mean-field)."""
     fs = state.family_state
     ov = jnp.asarray(state.total_message.var)
     if include_intercept_var and not isinstance(state.total_message, MeanMessage):
-        ov = ov + fs.intercept_var
+        ov = ov + _nuisance_var(fs)
     ov = ov + _ri_var(state, include_ri_var)
     return ov
 
@@ -338,7 +454,8 @@ def _intercept_ov(state):
     fs = state.family_state
     if fs.intercept != "shared" or isinstance(state.total_message, MeanMessage):
         return 0.0
-    return float(fs.intercept_var)
+    nv = _nuisance_var(fs)
+    return float(nv) if jnp.ndim(nv) == 0 else nv
 
 
 def _gh_expand(effect, order):
@@ -716,20 +833,69 @@ def _freeze_null_intercept(data, state):
     # inside estimate_intercept, so a single pass gives the one-step estimator;
     # the alternation converges to the exact null MLE with the anchor/tilt at it
     # (for schemes without a row parameter the first pass already is exact).
-    b0_prev = None
+    n = data.X.shape[0]
+    mean_keys = ("intercept_value", "covariate_mean", "covariate_eta")
+    var_keys = ("intercept_var", "nuisance_cov", "nuisance_var")
+    m_prev = None
     for _ in range(300):  # MM (JJ) converges linearly; Taylor anchors are Newton-fast
-        # mean-field self-exclusion during the null fit: the intercept's own
-        # variance stays out of the tilt/anchor tuning (as it does in
-        # estimate_intercept's ov), so the JJ fixed point is the EXACT null MLE
-        # (tilt tight at b0); v0 is recorded only once converged.
-        state = replace(state, family_state=replace(state.family_state, intercept_var=0.0))
+        # mean-field self-exclusion during the null fit: the factor's own variance stays
+        # out of the tilt/anchor tuning (as it does in estimate_intercept's ov), so the JJ
+        # fixed point is the EXACT null MLE (tilt tight at b0); V is recorded only once
+        # converged. With covariates the null fit is the joint (b0, gamma) null MLE.
+        state = replace(state, family_state=_zero_nuisance_var(state.family_state, n))
         state = update_row_param_step(data, state)
-        b0, v0 = estimate_intercept(data, state)
-        state = replace(state, family_state=replace(state.family_state, intercept_value=b0))
-        if b0_prev is not None and abs(b0 - b0_prev) < 1e-10:
+        m, V = estimate_intercept(data, state)
+        fields = _nuisance_fields(data, state.family_state, m, V)
+        state = replace(state, family_state=replace(
+            state.family_state, **{k: v for k, v in fields.items() if k in mean_keys}
+        ))
+        if m_prev is not None and float(jnp.max(jnp.abs(m - m_prev))) < 1e-10:
             break
-        b0_prev = b0
-    return replace(state, family_state=replace(state.family_state, intercept_var=v0))
+        m_prev = m
+    # a null intercept is a plugged-in point: its spread is recorded, no KL is charged.
+    return replace(state, family_state=replace(
+        state.family_state, **{k: v for k, v in fields.items() if k in var_keys}
+    ))
+
+
+def _init_nuisance(data, fs):
+    """Seed the covariate block of the shared factor (gamma = 0, Z gamma = 0, zero spread)
+    when `data.covariates` is set; a no-op otherwise or if already seeded."""
+    Z = getattr(data, "covariates", None)
+    if Z is None or _has_covariates(fs):
+        return fs
+    n, k = Z.shape
+    return replace(
+        fs, covariate_mean=jnp.zeros(k), covariate_eta=jnp.zeros(n), nuisance_var=jnp.zeros(n)
+    )
+
+
+def _check_covariates(data, fs):
+    """Fixed covariates ride the SHARED intercept factor only."""
+    Z = getattr(data, "covariates", None)
+    if Z is None:
+        return
+    if fs.intercept == "profiled":
+        raise ValueError(
+            "covariates need a shared nuisance factor to live in, but intercept='profiled' "
+            "profiles the intercept per feature inside the kernel (no shared factor). Use "
+            "intercept='shared' (the default) with covariates."
+        )
+    if _cavi_mode(fs) == "q1":
+        raise NotImplementedError(
+            "covariates are implemented for the Gaussian shared factor (plug-in and exact "
+            "Q2 CAVI: cf_cavi / compress_cavi / localjj / ...), not for the free-form Q1 "
+            "intercept (variational_family='unconstrained' with offset_integration="
+            "'compress_selfnorm'/'cf'): the self-normalized fold has no per-row "
+            "offset-variance seam."
+        )
+    W, _ = _nuisance_design(data, fs)
+    if int(jnp.linalg.matrix_rank(W)) < W.shape[1]:
+        raise ValueError(
+            "covariates are rank deficient (collinear among themselves or with the "
+            "intercept column -- e.g. a constant column while the intercept is estimated). "
+            "Drop the redundant column; the intercept is fit by the model."
+        )
 
 
 def _init_random_intercept(fs, n):
@@ -748,10 +914,12 @@ def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_st
     n = data.X.shape[0]
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
     _check_trials(data, response)
+    fs = _init_nuisance(data, _init_random_intercept(GLMFamilyState(**kw), n))
+    _check_covariates(data, fs)
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=Message(jnp.zeros(n), jnp.zeros(n)),
-        family_state=_init_random_intercept(GLMFamilyState(**kw), n),
+        family_state=fs,
     )
     return _freeze_null_intercept(data, state)
 
@@ -770,82 +938,114 @@ def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli
     n = data.X.shape[0]
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
     _check_trials(data, response)
+    fs = _init_nuisance(data, _init_random_intercept(GLMFamilyState(**kw), n))
+    _check_covariates(data, fs)
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=MeanMessage(jnp.zeros(n)),
-        family_state=_init_random_intercept(GLMFamilyState(**kw), n),
+        family_state=fs,
     )
     return _freeze_null_intercept(data, state)
 
 
+def _clip_step(W, step, limit=4.0):
+    """Damp a Newton step on the nuisance factor so the linear predictor moves by at most
+    `limit` on any row (max_i |w_i' step| <= limit). For the ones column this is the scalar
+    clip to [-limit, limit] the intercept solves always used; for a covariate block it
+    scales the whole step (keeping the Newton direction) rather than clipping coordinates,
+    so an unscaled covariate with a large coefficient is not throttled per coordinate."""
+    amax = jnp.max(jnp.abs(W @ step))
+    return step * jnp.where(amax > limit, limit / amax, 1.0)
+
+
+def _nuisance_hessian(W, w, inv_tau):
+    """W' diag(w) W + I/tau, plus the 1e-8 ridge that is the matrix form of the scalar
+    solves' precision floor."""
+    return (W * w[:, None]).T @ W + (inv_tau + 1e-8) * jnp.eye(W.shape[1])
+
+
 @partial(jax.jit, static_argnames=("response", "n_iter", "tol"))
-def _intercept_gaussian_solve(total_mean, aux_o, nodes, wts, inv_tau, m0_init,
+def _intercept_gaussian_solve(W, total_mean, aux_o, nodes, wts, inv_tau, m_init,
                               response, n_iter, tol):
-    """Gaussian-intercept CAVI Newton solve, hoisted under `@jax.jit` so the `while_loop`
-    has a stable, shape-keyed compilation cache. `_intercept_gaussian` builds `aux_o`
-    eagerly (the CF table needs a concrete ntau, so it cannot itself be jitted) and calls
-    this once per sweep; as a bare eager `while_loop` closing over the per-sweep arrays it
-    re-traced and re-compiled at the same shapes every sweep. Here the per-sweep-varying
-    arrays (`total_mean`, `aux_o`, `inv_tau`, `m0_init`) enter as traced arguments, so it
-    compiles once per shape and then hits cache. Returns `(m0, v0)`."""
-    def smoothed(m0, v0):
-        sd = jnp.sqrt(2.0 * jnp.maximum(v0, 0.0))
-        shft = (total_mean + m0)[None, :] + sd * nodes[:, None]  # (order, n)
+    """Gaussian shared-factor CAVI Newton solve over the nuisance design `W = [1 | Z]`,
+    hoisted under `@jax.jit` so the `while_loop` has a stable, shape-keyed compilation
+    cache. `_intercept_gaussian` builds `aux_o` eagerly (the CF table needs a concrete
+    ntau, so it cannot itself be jitted) and calls this once per sweep; as a bare eager
+    `while_loop` closing over the per-sweep arrays it re-traced and re-compiled at the same
+    shapes every sweep. Here the per-sweep-varying arrays (`total_mean`, `aux_o`,
+    `inv_tau`, `m_init`) enter as traced arguments, so it compiles once per shape and then
+    hits cache.
+
+    Row i sees the factor only through the scalar w_i' (b0, gamma) ~ N(w_i' m, w_i' V w_i),
+    so the expectation over q = N(m, V) is a one-dimensional GH integral per row with
+    sd_i = sqrt(w_i' V w_i) (the intercept alone is the constant-sd case). Returns
+    `(m, V)`: the (d,) mean solving the GH-averaged + prior score and the (d, d) covariance
+    V = (W' diag(E w) W + I/tau)^-1. V is seeded at the unsmoothed Laplace covariance."""
+    def smoothed(m, V):
+        rv = jnp.sum((W @ V) * W, axis=1)  # (n,) w_i' V w_i
+        sd = jnp.sqrt(2.0 * jnp.maximum(rv, 0.0))
+        shft = (total_mean + W @ m)[None, :] + sd[None, :] * nodes[:, None]  # (order, n)
         _, g, w = response.terms(shft, aux_o)
-        W = wts[:, None]
-        return jnp.sum(W * g, 0), jnp.sum(W * w, 0)  # (n,)
+        Wt = wts[:, None]
+        return jnp.sum(Wt * g, 0), jnp.sum(Wt * w, 0)  # (n,)
 
     def body(s):
-        m0, v0, _, it = s
-        g, w = smoothed(m0, v0)
-        prec = jnp.maximum(jnp.sum(w) + inv_tau, 1e-8)
-        step = jnp.clip((jnp.sum(g) - inv_tau * m0) / prec, -4.0, 4.0)
-        return m0 + step, 1.0 / prec, jnp.abs(step), it + 1
+        m, V, _, it = s
+        g, w = smoothed(m, V)
+        H = _nuisance_hessian(W, w, inv_tau)
+        step = _clip_step(W, jnp.linalg.solve(H, W.T @ g - inv_tau * m))
+        return m + step, jnp.linalg.inv(H), jnp.max(jnp.abs(step)), it + 1
 
-    m0, v0, _, _ = jax.lax.while_loop(
+    d = W.shape[1]
+    _, w0 = smoothed(m_init, jnp.zeros((d, d)))
+    V0 = jnp.linalg.inv(_nuisance_hessian(W, w0, inv_tau))
+    m, V, _, _ = jax.lax.while_loop(
         lambda s: (s[3] < n_iter) & (s[2] > tol),
         body,
-        (m0_init, jnp.asarray(1.0), jnp.inf, 0),
+        (m_init, V0, jnp.inf, 0),
     )
-    return m0, v0
+    return m, V
 
 
 def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
-    """Intercept strategy -- CAVI in Q2 (kernel='vi_gh'): b0 as a unit-ones-column Gaussian
-    factor q(b0) = N(m0, v0), with a diffuse N(0, tau) prior (tau =
-    fs.intercept_prior_variance). Symmetric with the effect updates: the offset is ALL L
-    effects' Gaussian mixture, integrated into the cumulant table (`_intercept_offset_aux`),
-    and b0 is integrated by GH over N(m0, v0). Returns (m0, v0) with m0 solving the
-    GH-averaged + prior score and 1/v0 = sum_i E_{b0}[weight] + 1/tau. The Newton solve
+    """Shared-factor strategy -- CAVI in Q2 (kernel='vi_gh'): (b0, gamma) as ONE Gaussian
+    factor q = N(m, V) over the nuisance design W = [1 | Z] (the intercept alone: the
+    unit-ones column), with a diffuse N(0, tau I) prior (tau = fs.intercept_prior_variance).
+    Symmetric with the effect updates: the offset is ALL L effects' Gaussian mixture,
+    integrated into the cumulant table (`_intercept_offset_aux`), and the factor is
+    integrated by per-row GH over N(w_i' m, w_i' V w_i). Returns (m, V). The Newton solve
     itself lives in the jitted `_intercept_gaussian_solve` (stable compile cache)."""
     fs = state.family_state
-    inv_tau = 1.0 / fs.intercept_prior_variance  # diffuse Gaussian prior N(0, tau) on b0
+    W, has_icpt = _nuisance_design(data, fs)
+    inv_tau = 1.0 / fs.intercept_prior_variance  # diffuse Gaussian prior N(0, tau I)
     response = fs.response
     aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
-    # offset mean s: effects' mean + glm_offset + the random intercept mean (m_i rides in eta)
+    # offset mean s: effects' mean + glm_offset + the random intercept mean (m_i rides in eta);
+    # the factor's own mean W m is added inside the solve.
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
     nodes_np, logw_np = _gh_rule(order)
     nodes = jnp.asarray(nodes_np)
     wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
     aux_o = jax.tree_util.tree_map(lambda a: a[None, ...], aux)  # open GH-node axis
-    m0, v0 = _intercept_gaussian_solve(
-        total_mean, aux_o, nodes, wts, jnp.asarray(inv_tau),
-        jnp.asarray(fs.intercept_value), response, n_iter, tol,
+    return _intercept_gaussian_solve(
+        W, total_mean, aux_o, nodes, wts, jnp.asarray(inv_tau),
+        _nuisance_init(fs, has_icpt), response, n_iter, tol,
     )
-    return float(m0), float(v0)
 
 
 def _intercept_point(data, state):
-    """Intercept strategy -- plug-in point/Laplace (classic gIBSS), kernel-agnostic. Concave
-    MAP Newton for the scalar b0 on the aggregate-message-integrated cumulant (max_{b0} sum_i
-    loglik_i(mean + b0) + log N(b0; 0, tau)); v0 = 1/(sum_i w_i + 1/tau) is the Laplace
-    variance of the factor q(b0)=N(b0,v0). The diffuse prior N(0, tau) (tau =
-    fs.intercept_prior_variance) is applied ONLY to the shared variational intercept; the
-    "null" score fit and non-GLM callers (linear/cox/legacy family_states, which lack the
-    field) stay FLAT (inv_tau=0) -- so the null MLE is preserved exactly. Expectations use
-    the EFFECTS' variance only (mean-field: own factor excluded from ov). Under the jj kernel
-    the tilt is re-tuned each iterate (xi^2 = eta^2 + ov). Returns (b0, v0)."""
+    """Shared-factor strategy -- plug-in point/Laplace (classic gIBSS), kernel-agnostic.
+    Concave MAP Newton for (b0, gamma) over the nuisance design W = [1 | Z] on the
+    aggregate-message-integrated cumulant (max_m sum_i loglik_i(mean_i + w_i' m) + log
+    N(m; 0, tau I)); V = (W' diag(w) W + I/tau)^-1 is the Laplace covariance of the factor
+    q = N(m, V). The diffuse prior (tau = fs.intercept_prior_variance) is applied ONLY to
+    the shared variational factor; the "null" score fit and non-GLM callers (linear / cox /
+    legacy family_states, which lack the field) stay FLAT (inv_tau=0) -- so the null MLE is
+    preserved exactly. Expectations use the EFFECTS' variance only (mean-field: own factor
+    excluded from ov). Under the jj kernel the tilt is re-tuned each iterate (xi^2 = eta^2 +
+    ov). Returns (m, V); the intercept alone is the d = 1 case."""
     fs = state.family_state
+    W, has_icpt = _nuisance_design(data, fs)
     _tau = getattr(fs, "intercept_prior_variance", None)
     inv_tau = (1.0 / _tau) if (_tau is not None and fs.intercept == "shared") else 0.0
     response = fs.response
@@ -861,26 +1061,25 @@ def _intercept_point(data, state):
     else:
         aux = _aux(data, state, include_intercept_var=False)
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
-    b0, v0 = _intercept_point_solve(
-        total_mean, aux, jnp.asarray(inv_tau), jnp.asarray(fs.intercept_value),
+    return _intercept_point_solve(
+        W, total_mean, aux, jnp.asarray(inv_tau), _nuisance_init(fs, has_icpt),
         response, fs.kernel == "jj",
     )
-    return float(b0), float(v0)
 
 
 @partial(jax.jit, static_argnames=("response", "jj", "n_iter"))
 def _intercept_point_solve(
-    total_mean, aux, inv_tau, b0_init, response, jj, n_iter=50, tol=1e-10
+    W, total_mean, aux, inv_tau, m_init, response, jj, n_iter=50, tol=1e-10
 ):
-    """The point-intercept Newton solve of `_intercept_point`, hoisted under `@jax.jit`
+    """The point shared-factor Newton solve of `_intercept_point`, hoisted under `@jax.jit`
     (like `_intercept_gaussian_solve`): as a bare eager `while_loop` closing over the
     per-sweep arrays it re-traced and re-compiled at the same shapes before EVERY effect
     update -- the dominant cost of a plug-in (gIBSS) sweep at moderate n. Stops at
     `n_iter` or once a step is below `tol` (it runs before every effect update, warm from
-    the previous b0, so it usually needs a few steps, not the full budget). Returns
-    `(b0, v0)`."""
-    def terms_at(b0):
-        eta = total_mean + b0
+    the previous m, so it usually needs a few steps, not the full budget). Returns
+    `(m, V)` over the nuisance design `W = [1 | Z]`."""
+    def terms_at(m):
+        eta = total_mean + W @ m
         if jj:
             y, ov = aux
             xi = jnp.sqrt(eta**2 + ov)
@@ -888,24 +1087,25 @@ def _intercept_point_solve(
         return response.terms(eta, aux)
 
     def body(s):
-        b0, _, it = s
-        _, g, w = terms_at(b0)
-        step = (jnp.sum(g) - inv_tau * b0) / jnp.maximum(jnp.sum(w) + inv_tau, 1e-8)
-        step = jnp.clip(step, -4.0, 4.0)
-        return b0 + step, jnp.abs(step), it + 1
+        m, _, it = s
+        _, g, w = terms_at(m)
+        H = _nuisance_hessian(W, w, inv_tau)
+        step = _clip_step(W, jnp.linalg.solve(H, W.T @ g - inv_tau * m))
+        return m + step, jnp.max(jnp.abs(step)), it + 1
 
-    b0, _, _ = jax.lax.while_loop(
-        lambda s: (s[2] < n_iter) & (s[1] > tol), body, (b0_init, jnp.inf, 0)
+    m, _, _ = jax.lax.while_loop(
+        lambda s: (s[2] < n_iter) & (s[1] > tol), body, (m_init, jnp.inf, 0)
     )
-    v0 = 1.0 / jnp.maximum(jnp.sum(terms_at(b0)[2]) + inv_tau, 1e-8)
-    return b0, v0
+    V = jnp.linalg.inv(_nuisance_hessian(W, terms_at(m)[2], inv_tau))
+    return m, V
 
 
 def estimate_intercept(data, state):
-    """The shared, cross-module intercept: the plug-in point/Laplace strategy
-    (`_intercept_point`). Used by linear / twogroup / globaljj and the null-score fit;
-    kernel-agnostic and CAVI-agnostic by design. The exact-CAVI intercepts (Gaussian /
-    free-form) are internal and dispatched by `estimate_intercept_step`. Returns (b0, v0)."""
+    """The shared, cross-module nuisance factor: the plug-in point/Laplace strategy
+    (`_intercept_point`). Used by globaljj and the null-score fit; kernel-agnostic and
+    CAVI-agnostic by design. The exact-CAVI factors (Gaussian / free-form) are internal and
+    dispatched by `estimate_intercept_step`. Returns (m, V) over W = [1 | Z]; without
+    covariates m = (b0,) and V = ((v0,),)."""
     return _intercept_point(data, state)
 
 
@@ -967,7 +1167,6 @@ def _estimate_shared_intercept(data, state):
     profiled fit (`reference_intercept_step`) -- both want the same global b0 given the
     effects, so they route identically."""
     fs = state.family_state
-    tau = fs.intercept_prior_variance
     mode = _cavi_mode(fs)
     if mode == "q1":
         # keep b0's full (non-Gaussian) posterior: the value in eta is the posterior MEAN,
@@ -976,11 +1175,10 @@ def _estimate_shared_intercept(data, state):
         m0, v0, b0n, lw0, kl = _intercept_freeform(data, state, order=fs.quadrature_order)
         return dict(intercept_value=m0, intercept_var=v0, intercept_kl=kl,
                     intercept_b_nodes=b0n, intercept_log_node_weight=lw0)
-    # Gaussian q(b0) = N(m0, v0): closed-form KL(N(m0, v0) || N(0, tau)).
+    # Gaussian q(b0, gamma) = N(m, V) over W = [1 | Z]: closed-form KL against N(0, tau I).
     fit = _intercept_gaussian if mode == "q2" else _intercept_point
-    m0, v0 = fit(data, state)
-    kl = 0.5 * (v0 / tau + m0 * m0 / tau - 1.0 + math.log(tau / v0))
-    return dict(intercept_value=m0, intercept_var=v0, intercept_kl=kl)
+    m, V = fit(data, state)
+    return _nuisance_fields(data, fs, m, V)
 
 
 def estimate_intercept_step(data, state):
@@ -988,7 +1186,7 @@ def estimate_intercept_step(data, state):
     is per-feature inside the kernel and gets a post-hoc reference in `reference_intercept_step`;
     null: frozen since init -- neither refits here.)"""
     fs = state.family_state
-    if fs.intercept != "shared" or not fs.estimate_intercept:
+    if fs.intercept != "shared" or not (fs.estimate_intercept or _has_covariates(fs)):
         return state
     return replace(state, family_state=replace(fs, **_estimate_shared_intercept(data, state)))
 
@@ -1170,7 +1368,7 @@ def update_row_param_step(data, state):
         )
     else:
         param = fs.response.smoother.row_param(
-            mean, ov, fs.intercept_value + fs.glm_offset  # every non-effect part of eta
+            mean, ov, _nuisance_mean(fs) + fs.glm_offset  # every non-effect part of eta
         )
     return replace(state, family_state=replace(fs, row_param=param))
 
@@ -1179,7 +1377,7 @@ def _effect_offset(fs, state):
     """The fixed offset an effect update sees: LOO message mean + glm_offset, plus
     the shared intercept on the non-profiled kernels, plus the random intercept mean m_i
     (a per-row offset, always in eta when the random intercept is on)."""
-    base = fs.glm_offset if fs.intercept == "profiled" else fs.glm_offset + fs.intercept_value
+    base = fs.glm_offset if fs.intercept == "profiled" else fs.glm_offset + _nuisance_mean(fs)
     return base + _ri_mean(fs) + state.total_message.mean
 
 
@@ -1232,6 +1430,12 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
     # (0.5 v0 sum_i A''(eta_i)) while the intercept KL is still charged -- a ~0.5-nat ELBO
     # inflation. During fitting a shared intercept always has nodes (Q1 CAVI sets them), so
     # the synthesized-node branch only runs when scoring a point-intercept state.
+    if include_intercept and _has_covariates(fs):
+        raise NotImplementedError(
+            "the self-normalized (Q1) offset fold folds the shared intercept as a single "
+            "all-ones effect; a covariate block (per-row variance w_i' V w_i) has no seam "
+            "here yet."
+        )
     have_icpt = (
         include_intercept
         and not isinstance(state.total_message, MeanMessage)

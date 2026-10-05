@@ -112,9 +112,11 @@ def _predictor_mean(data, state):
     """The full posterior mean of the linear predictor `E[eta] = sum_l X(alpha_l mu_l) +
     b0 + glm_offset` (n,). The effects' mean is the aggregate message; the intercept enters
     at its posterior mean (its spread, when integrated, is folded into the offset table)."""
+    from .glm import _nuisance_mean  # circular-import guard
+
     fs = state.family_state
     eta = jnp.asarray(state.total_message.mean)
-    eta = eta + jnp.asarray(fs.glm_offset) + float(fs.intercept_value)
+    eta = eta + jnp.asarray(fs.glm_offset) + _nuisance_mean(fs)  # b0 (+ Z gamma)
     ri_mean = getattr(fs, "random_intercept_mean", None)
     if getattr(fs, "random_intercept", False) and ri_mean is not None:
         eta = eta + jnp.asarray(ri_mean)  # per-row random intercept mean m_i
@@ -216,7 +218,7 @@ def compute_elbo(
         raise ValueError("compute_elbo: state has no single effects to score.")
 
     # circular-import guard: glm imports response/engine, and elbo is a leaf consumer
-    from .glm import _build_offset_table, _response_aux, _selfnorm_fold_aux
+    from .glm import _build_offset_table, _nuisance_var, _response_aux, _selfnorm_fold_aux
 
     y = _response_aux(data)  # observation leaf: y, or (y, n_trials) for Binomial
     n = data.X.shape[0]
@@ -232,7 +234,10 @@ def compute_elbo(
     integrate_b0 = fs.intercept == "shared" or (
         fs.intercept == "profiled" and float(getattr(fs, "intercept_var", 0.0)) > 0.0
     )
-    intercept_var = float(getattr(fs, "intercept_var", 0.0)) if integrate_b0 else 0.0
+    # With covariates the shared factor is q(b0, gamma) and its spread is per-row
+    # (w_i' V w_i, from `_nuisance_var`); intercept-only it is the scalar v0. Either folds
+    # into the offset table as a zero-mean Gaussian, exactly like the random intercept's v_i.
+    intercept_var = _nuisance_var(fs) if integrate_b0 else 0.0
     intercept_kl = float(getattr(fs, "intercept_kl", 0.0)) if integrate_b0 else 0.0
 
     # The random intercept is another zero-mean Gaussian offset (per-row v_i): its mean is
@@ -326,17 +331,15 @@ def _q2_gaussian_pieces(data, state, *, score_intercept=None):
             "free-form Q1 effect has no closed-form transform here -- score it with "
             "compute_elbo."
         )
-    eta = _predictor_mean(data, state)  # always folds the intercept MEAN m0 (a plug-in)
+    from .glm import _nuisance_kl, _nuisance_var  # circular-import guard
+
+    eta = _predictor_mean(data, state)  # always folds the factor MEAN (a plug-in)
     mode = score_intercept if score_intercept is not None else fs.intercept
     integrate_b0 = mode == "shared"
-    intercept_var = float(getattr(fs, "intercept_var", 0.0)) if integrate_b0 else 0.0
-    if integrate_b0:
-        m0 = float(getattr(fs, "intercept_value", 0.0))
-        tau = float(getattr(fs, "intercept_prior_variance", 1e6))
-        v0 = max(intercept_var, 1e-300)
-        intercept_kl = float(0.5 * (v0 / tau + m0 * m0 / tau - 1.0 + jnp.log(tau / v0)))
-    else:
-        intercept_kl = 0.0
+    # the shared factor's spread: scalar v0 (intercept only) or per-row w_i' V w_i (with
+    # covariates); its KL is the joint Gaussian KL, recomputed from the posterior.
+    intercept_var = _nuisance_var(fs) if integrate_b0 else 0.0
+    intercept_kl = _nuisance_kl(fs) if integrate_b0 else 0.0
     ri_on = getattr(fs, "random_intercept", False)
     _ri_var = getattr(fs, "random_intercept_var", None)
     ri_var = jnp.asarray(_ri_var) if (ri_on and _ri_var is not None) else 0.0

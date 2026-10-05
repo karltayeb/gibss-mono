@@ -237,7 +237,8 @@ def test_glm_vi_kernel_recovers():
 
 
 def test_glm_intercept_variance_is_curvature():
-    # estimate_intercept returns (b0, v0) with v0 = 1/(sum w + 1/tau) = the inverse MAP
+    # estimate_intercept returns (m, V) over the nuisance design W = [1 | Z]; intercept only
+    # that is m = (b0,), V = ((v0,),) with v0 = 1/(sum w + 1/tau) = the inverse MAP
     # curvature of the loglik + the diffuse N(0, tau) intercept prior (tau huge, so ~ the
     # inverse observed curvature); checked against autodiff of the summed Bernoulli loglik.
     import jax
@@ -260,7 +261,9 @@ def test_glm_intercept_variance_is_curvature():
         family_state = glm.GLMFamilyState(response=Bernoulli())
         total_message = M()
 
-    b0, v0 = glm.estimate_intercept(d, S())
+    m, V = glm.estimate_intercept(d, S())
+    assert m.shape == (1,) and V.shape == (1, 1)
+    b0, v0 = float(m[0]), float(V[0, 0])
 
     def ll(b):
         eta = jnp.asarray(off) + b

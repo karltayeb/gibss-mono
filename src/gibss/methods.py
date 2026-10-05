@@ -276,6 +276,7 @@ def fit_glm_susie(
     # cumulant scales per trial, so a Binomial fit equals the Bernoulli fit on the
     # row-expanded data.
     offset=0.0,  # fixed per-row offset (Poisson exposure, etc.)
+    covariates=None,  # fixed (n, k) covariates Z, fit jointly with the intercept (see below)
     prior_variance=1.0,
     estimate_prior_variance=True,
     prior_variance_scale=None,  # half-normal(sigma; s) hyperprior on the prior sd (damps runaway, keeps ARD)
@@ -321,6 +322,14 @@ def fit_glm_susie(
         hist = History()
         state = fit_glm_susie(X, y, method="cf_cavi", record=hist)
         hist.states  # full resumable GIBSSState at each recorded step
+
+    Pass `covariates=Z` (dense (n, k)) to adjust for fixed covariates: eta = b0 + Z gamma
+    + sum_l X b_l. (b0, gamma) is ONE Gaussian nuisance factor with a diffuse prior, fit
+    like the shared intercept (its mean rides in eta, its per-row spread in the effect
+    offset variance -- dropped by the plug-in modes, integrated by exact Q2 CAVI). Shared
+    intercept only (not intercept='profiled', not the free-form Q1 intercept). Do not
+    include a constant column. `state.family_state.covariate_mean` / `.nuisance_cov` hold
+    the posterior; `summarize_fit` reports it.
 
     Pass `initial_state=<a prior GIBSSState>` to WARM START: the fit resumes from
     that state's per-effect posterior q (its `mu`/`var`/`alpha`), while EVERY other
@@ -444,7 +453,7 @@ def fit_glm_susie(
                 f"center=False, or densify X."
             )
 
-    data = glm.prep_data(X, y, center=center, n_trials=trials)
+    data = glm.prep_data(X, y, center=center, n_trials=trials, covariates=covariates)
     init = (
         glm.initialize_state_mean_message if cfg["_mean_message"] else glm.initialize_state
     )

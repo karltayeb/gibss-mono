@@ -44,6 +44,8 @@ class FitSummary:
     intercept_sd: float
     coverage: float
     random_intercept: str | None = None
+    # fixed covariates (if any): one row per column of Z -- posterior mean and sd of gamma.
+    covariates: pl.DataFrame | None = None
 
     def __repr__(self) -> str:
         head = [
@@ -54,6 +56,12 @@ class FitSummary:
         ]
         if self.random_intercept is not None:
             head.append(f"  random intercept: {self.random_intercept}")
+        if self.covariates is not None:
+            cov = "  ".join(
+                f"{r['covariate']}={r['mean']:.3g} +/- {r['sd']:.3g}"
+                for r in self.covariates.iter_rows(named=True)
+            )
+            head.append(f"  covariates: {cov}")
         return "\n".join(head) + "\n" + str(self.table)
 
 
@@ -85,6 +93,26 @@ def _purity(X, cs: Sequence[int]) -> float:
     return float(off.min()) if off.size else 1.0
 
 
+def _covariate_table(fs, names: Sequence[str] | None) -> pl.DataFrame | None:
+    """Posterior mean / sd of each fixed covariate's coefficient gamma_j (None if the fit
+    has no covariates). The sd is the marginal of the joint (b0, gamma) covariance."""
+    gamma = getattr(fs, "covariate_mean", None)
+    if gamma is None:
+        return None
+    gamma = np.asarray(gamma, dtype=float)
+    k = gamma.shape[0]
+    V = getattr(fs, "nuisance_cov", None)
+    if V is None:
+        sd = np.full(k, np.nan)
+    else:
+        V = np.asarray(V, dtype=float)
+        sd = np.sqrt(np.maximum(np.diag(V)[V.shape[0] - k:], 0.0))
+    labels = list(names) if names is not None else [f"z{j}" for j in range(k)]
+    if len(labels) != k:
+        raise ValueError(f"covariate_names has {len(labels)} entries for {k} covariates.")
+    return pl.DataFrame({"covariate": labels, "mean": gamma, "sd": sd})
+
+
 def _random_intercept_header(fs) -> str | None:
     if not getattr(fs, "random_intercept", False):
         return None
@@ -106,6 +134,7 @@ def summarize_fit(
     purity: bool | None = None,
     exponentiate: bool = False,
     min_ser_log_bf: float | None = None,
+    covariate_names: Sequence[str] | None = None,
 ) -> FitSummary:
     """Summarize a fitted `GIBSSState`, one row per single effect (SER component).
 
@@ -222,6 +251,7 @@ def summarize_fit(
         intercept_sd=float(np.sqrt(max(float(getattr(fs, "intercept_var", 0.0)), 0.0))),
         coverage=coverage,
         random_intercept=_random_intercept_header(fs),
+        covariates=_covariate_table(fs, covariate_names),
     )
 
 

@@ -107,7 +107,8 @@ class CoxPoissonData(LinearData):
     sparse_static: SparseCoxStaticContext | None = None
 
 
-def prep_data(X, y=None, *, event_time=None, event_type=None, center=None, time_bins=None):
+def prep_data(X, y=None, *, event_time=None, event_type=None, center=None, time_bins=None,
+              covariates=None):
     """Package (X, survival response) for the glm engine. The design is handled
     exactly like `glm.prep_data` (dense pre-centering etc.); the survival response is
     `y = (n, 2) [time, event]` or `event_time=`/`event_type=`, as in `cox.prep_data`.
@@ -117,13 +118,16 @@ def prep_data(X, y=None, *, event_time=None, event_type=None, center=None, time_
         y, event_time=event_time, event_type=event_type
     )
     event_time = coarsen_event_time(event_time, time_bins)
-    ld = glm.prep_data(X, jnp.asarray(event_type, dtype=float), center=center)
+    ld = glm.prep_data(
+        X, jnp.asarray(event_type, dtype=float), center=center, covariates=covariates
+    )
     fixed = prepare_fixed_cox_context(event_time, event_type)
     return CoxPoissonData(
         X=ld.X,
         y=ld.y,
         obs_variance=ld.obs_variance,
         column_center=ld.column_center,
+        covariates=ld.covariates,
         fixed=fixed,
         sparse_static=(
             prepare_sparse_cox_static_context(ld.X, fixed) if _is_bcoo(ld.X) else None
@@ -387,6 +391,7 @@ def fit_cox_susie(
     offset_integration="none",
     offset_quadrature_points=15,
     center=None,
+    covariates=None,  # fixed (n, k) covariates Z (poisson only): eta = Z gamma + sum_l X b_l
     schedule=None,
 ):
     """One-call Cox proportional-hazards SuSiE. Returns the fitted `GIBSSState`.
@@ -405,7 +410,9 @@ def fit_cox_susie(
       only, so `baseline` / `offset_integration` do not apply.
 
     Survival response as `y=(n, 2)` [time, event] or `event_time=`/`event_type=`, as
-    in `cox.prep_data`. `center` (poisson only) pre-centers the design.
+    in `cox.prep_data`. `center` (poisson only) pre-centers the design. `covariates`
+    (poisson only) adjusts for fixed covariates Z: gamma is the shared nuisance factor
+    (no intercept column -- the Breslow baseline absorbs it), fit like the glm engine's.
     """
     from . import cox  # cox does not import cox_poisson: safe
 
@@ -424,7 +431,7 @@ def fit_cox_susie(
                 f"unknown offset_integration {offset_integration!r}; use 'none' or 'gh'"
             )
         data = prep_data(X, y, event_time=event_time, event_type=event_type,
-                         center=center, time_bins=time_bins)
+                         center=center, time_bins=time_bins, covariates=covariates)
         state = initialize_state(
             data, L=L_alloc, response=response, prior_variance=prior_variance,
             family_state_kwargs=fs_kwargs,

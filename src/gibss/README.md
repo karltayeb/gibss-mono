@@ -6,6 +6,9 @@
 >   / Poisson / linear GLM SuSiE and the named variants (localjj, globaljj, irls,
 >   score, ...); see `gibss.methods.PRESETS`. Binomial(n_i, p_i) responses: pass the
 >   success counts as `y` and the trial counts as `trials=` (every method applies).
+>   Fixed covariates: `covariates=Z` (dense (n, k)) adjusts for Z with one Gaussian
+>   nuisance factor over (intercept, gamma) -- shared-intercept mode, plug-in and
+>   exact Q2 CAVI, dense and sparse X; also on `cox_poisson.fit_cox_susie`.
 > - `gibss.glm` -- the generic response-model engine (`GLMFamilyState(response=...,
 >   kernel=..., intercept=...)`) any `gibss.response.ResponseModel` runs through.
 > - `gibss.twogroup.fit(X, bhat, se, f0=, f1=, ...)` -- two-group enrichment SuSiE

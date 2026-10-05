@@ -83,6 +83,9 @@ class LinearData:
     # eagerly and this stays None. For sparse (BCOO) X we keep X sparse and store
     # the means here so methods can center implicitly (X@coef - <coef,cbar>, etc.).
     column_center: Any = None
+    # Fixed covariates Z (n, k), dense: the design of the shared nuisance factor's
+    # covariate block (q(b0, gamma) over W = [1 | Z] in the GLM engine). None = none.
+    covariates: Any = None
 
     @property
     def op(self):
@@ -108,12 +111,17 @@ def _column_means(X) -> Any:
 
 
 def prep_data(
-    X, y, center: bool | None = None, obs_variance=None, n_trials=None
+    X, y, center: bool | None = None, obs_variance=None, n_trials=None, covariates=None
 ) -> LinearData:
     """Prepare data for the SER engines.
 
     `n_trials` (Binomial only): per-row trial counts, (n,) or a scalar broadcast to every
     row; `y` is then the success count, 0 <= y_i <= n_i. Leave None for every other family.
+
+    `covariates` (GLM engine): a dense (n, k) matrix Z of fixed covariates to adjust for,
+    fit jointly with the intercept as one Gaussian nuisance factor (unpenalized, diffuse
+    prior). Not centered or scaled here (the joint factor carries the b0-gamma
+    correlation); do NOT include a constant column (the intercept is fit by the model).
 
     Pre-centering (default for dense X): center each column by its unweighted
     mean, once. This decouples the shared intercept from the features so the
@@ -150,8 +158,30 @@ def prep_data(
         if not bool(jnp.all((y >= 0) & (y <= n_trials))):
             raise ValueError("Binomial response needs 0 <= y_i <= n_trials_i on every row")
     return LinearData(
-        X=X, y=y, obs_variance=obs_variance, n_trials=n_trials, column_center=column_center
+        X=X, y=y, obs_variance=obs_variance, n_trials=n_trials, column_center=column_center,
+        covariates=_prep_covariates(covariates, y.shape[0]),
     )
+
+
+def _prep_covariates(Z, n):
+    """Validate a fixed-covariate matrix: dense, finite, (n, k) (an (n,) vector is one
+    column). None (or zero columns) means no covariates."""
+    if Z is None:
+        return None
+    if is_bcoo(Z):
+        Z = Z.todense()
+    Z = jnp.asarray(Z, dtype=float)
+    if Z.ndim == 1:
+        Z = Z[:, None]
+    if Z.ndim != 2 or Z.shape[0] != n:
+        raise ValueError(
+            f"covariates must be an (n, k) matrix with n={n} rows; got shape {tuple(Z.shape)}."
+        )
+    if Z.shape[1] == 0:
+        return None
+    if not bool(jnp.all(jnp.isfinite(Z))):
+        raise ValueError("covariates must be finite (no NaN / inf).")
+    return Z
 
 
 def reject_sparse_precenter(data) -> None:
