@@ -98,9 +98,11 @@ from .response import (
     Bernoulli,
     ResponseModel,
     Smoother,
+    _rows,
     _table_plugin_terms,
     _table_residual_terms,
     _table_terms,
+    _tmap,
 )
 
 __all__ = [
@@ -495,7 +497,7 @@ def smoothed_nodes(
     `cache` memoize the per-effect factors across tables (see `_FactorCache`)."""
     if not isinstance(base, Bernoulli):
         raise TypeError(
-            "cf_offset.smoothed_nodes supports only the Bernoulli (logistic) base; "
+            "cf_offset.smoothed_nodes supports only the logistic (Bernoulli / Binomial) base; "
             f"got {type(base).__name__}."
         )
     if n is None:
@@ -571,7 +573,10 @@ def _atilde_from_cf(phi, V, tau, wq, psi, hw, M):
 def _fit_table(y, znodes, At0, At1, At2, hw, M):
     """Compress-style aux `(y, obar, center, halfwidth, coef_ll, coef_g, coef_w)` from the
     node values: degree-M Chebyshev fits of the plug-in residuals `(A - Atilde, A' -
-    Atilde', Atilde'' - A'')` on `[-hw, hw]`, `obar = center = 0`."""
+    Atilde', Atilde'' - A'')` on `[-hw, hw]`, `obar = center = 0`. The residual is per
+    TRIAL (the unit logistic cumulant); `_table_residual_terms` scales it by the response's
+    per-row trial count on evaluation (1 for Bernoulli). `y` is the observation leaf as
+    the kernels receive it (`y`, or `(y, n_trials)` for Binomial), passed through."""
     _, Vinv_np = _cheb_fit_matrix(M)
     Vinv = jnp.asarray(Vinv_np)
     fit = lambda vals: vals @ Vinv.T  # noqa: E731  (n, M+1) samples -> coeffs
@@ -588,9 +593,9 @@ def build_aux(base, y, effects, M=48, **kwargs):
     the degree-M Chebyshev fits of the plug-in residuals `(A - Atilde, A' - Atilde',
     Atilde'' - A'')` on `[-hw, hw]` -- exactly what `CharFnOffset.terms` adds back to the
     base. `effects` is the leave-one-out set (all effects except the one being fit)."""
-    y = jnp.asarray(y)
+    y = _tmap(jnp.asarray, y)
     znodes, At0, At1, At2, hw, s, V = smoothed_nodes(
-        effects, M, base=base, n=y.shape[0], **kwargs
+        effects, M, base=base, n=_rows(y), **kwargs
     )
     return _fit_table(y, znodes, At0, At1, At2, hw, M)
 
@@ -752,7 +757,7 @@ def smoothed_nodes_sparse(
     baseline+support split in `offset_cf_sparse` -- no densification."""
     if not isinstance(base, Bernoulli):
         raise TypeError(
-            "cf_offset sparse path supports only the Bernoulli (logistic) base; "
+            "cf_offset sparse path supports only the logistic (Bernoulli / Binomial) base; "
             f"got {type(base).__name__}."
         )
     n = X.shape[0]
@@ -778,7 +783,7 @@ def smoothed_nodes_sparse(
 def build_aux_sparse(base, y, X, effects, M=48, entry_chunk=1 << 15, **kwargs):
     """Compress-style aux for the sparse path -- same contract as `build_aux`, with the
     offset CF folded over the shared BCOO design `X` and `effects = [(alpha, mu, var)]`."""
-    y = jnp.asarray(y)
+    y = _tmap(jnp.asarray, y)
     znodes, At0, At1, At2, hw, s, V = smoothed_nodes_sparse(
         X, effects, M, base=base, entry_chunk=entry_chunk, **kwargs
     )
@@ -839,7 +844,7 @@ class CharFnOffset(Smoother):
     def validate(self, base):
         if not isinstance(base, Bernoulli):
             raise TypeError(
-                "CharFnOffset supports only the Bernoulli (logistic) base; "
+                "CharFnOffset supports only the logistic (Bernoulli / Binomial) base; "
                 f"got {type(base).__name__}."
             )
 
@@ -874,7 +879,7 @@ class CharFnOffset(Smoother):
         return _table_plugin_terms(base, eta, aux)
 
     def residual_terms(self, base: ResponseModel, eta, aux):
-        return _table_residual_terms(eta, aux)
+        return _table_residual_terms(base, eta, aux)
 
     def terms(self, base: ResponseModel, eta, aux):
         return _table_terms(base, eta, aux)
@@ -1021,8 +1026,8 @@ def _table_from_items(y, items, M, *, tol, Tmax, ntau, kappa, T, safety, min_nta
     `factor_fn(tau) -> phi (n, ntau) or (ntau,)`. Moments size the grid, the memoized
     factors are multiplied, the mean is centered out (it lives in eta), and the
     psi-tamed transform + Chebyshev fit give the table."""
-    y = jnp.asarray(y)
-    n = y.shape[0]
+    y = _tmap(jnp.asarray, y)
+    n = _rows(y)
     moms = []
     for slot, refs, mom, _ in items:
         moms.append(mom() if cache is None or slot is None else cache.moments(slot, refs, mom))
@@ -1101,7 +1106,7 @@ class CharFnSelfNorm(Smoother):
     def validate(self, base):
         if not isinstance(base, Bernoulli):
             raise TypeError(
-                "CharFnSelfNorm supports only the Bernoulli (logistic) base; "
+                "CharFnSelfNorm supports only the logistic (Bernoulli / Binomial) base; "
                 f"got {type(base).__name__}."
             )
 
@@ -1123,8 +1128,8 @@ class CharFnSelfNorm(Smoother):
         the array objects whose IDENTITY validates the memo (default: the node arrays
         as passed; the engine passes the effect's stored `(b_nodes, log_node_weight)`,
         since the transposed views it hands in are fresh objects every call)."""
-        y = jnp.asarray(y)
-        n = y.shape[0]
+        y = _tmap(jnp.asarray, y)
+        n = _rows(y)
         keys = [None] * len(effects) if keys is None else list(keys)
         refs = [None] * len(effects) if refs is None else list(refs)
         items = []
@@ -1154,8 +1159,8 @@ class CharFnSelfNorm(Smoother):
         """Sparse (BCOO) build: `X` shared, `effects = [(b_nodes (p, Q), logW (p, Q))]`,
         `colmean` (p,) treats `X` as centered via the baseline+support split. `keys` /
         `refs` as in `build_aux_nodes`."""
-        y = jnp.asarray(y)
-        n = y.shape[0]
+        y = _tmap(jnp.asarray, y)
+        n = _rows(y)
         op = BCOOOperator(X)
         c_arr = None if colmean is None else jnp.asarray(colmean)
         keys = [None] * len(effects) if keys is None else list(keys)
@@ -1182,7 +1187,7 @@ class CharFnSelfNorm(Smoother):
         return _table_plugin_terms(base, eta, aux)
 
     def residual_terms(self, base: ResponseModel, eta, aux):
-        return _table_residual_terms(eta, aux)
+        return _table_residual_terms(base, eta, aux)
 
     def terms(self, base: ResponseModel, eta, aux):
         return _table_terms(base, eta, aux)

@@ -8,7 +8,9 @@ weight)`. `order=1` recovers the Laplace evidence.
 This is the generic form of the logistic `quadrature_ser`: with `Bernoulli` it
 reproduces it. Offset integration is NOT a kernel option: wrap the family in
 `response.Smoothed` and pass `aux = (y, offset_var)`. `aux` may therefore be any
-pytree of per-row arrays; the kernels broadcast it leaf-wise and never look inside.
+pytree of per-row arrays; the kernels broadcast it leaf-wise and never look inside. The
+observation `y` is itself a leaf-wise pytree (a bare array, or `(y, n_trials)` for the
+Binomial family), so the kernels that unpack `(y, ov)` still broadcast `y` with `_tmap`.
 """
 
 from __future__ import annotations
@@ -589,11 +591,11 @@ def glm_jj_ser(
             f"exact only for a bound quadratic in eta; got {response!r}."
         )
     y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
-    y = jnp.asarray(y)
+    y = _tmap(jnp.asarray, y)
     offset = jnp.asarray(offset)
     ov = jnp.asarray(ov)
     x = op.entry_x
-    y_e = op.broadcast_rows(y)
+    y_e = _tmap(op.broadcast_rows, y)
     off_e = op.broadcast_rows(offset)
     ov_e = op.broadcast_rows(ov) if ov.ndim else ov
     inv_pv = 1.0 / prior_variance
@@ -660,7 +662,7 @@ def _jj_center_sums(response, offset, y, ov, a_g, b_g, with_ll):
     lead = (-1,) + (1,) * a_g.ndim
     off_b = offset.reshape(lead)
     ov_b = ov.reshape(lead) if ov.ndim else ov
-    y_b = y.reshape(lead)
+    y_b = _tmap(lambda a: a.reshape(lead), y)
     em = off_b - a_g[None, ...]
     xi = jnp.sqrt(jnp.maximum(em**2 + b_g[None, ...] + ov_b, 1e-12))
     _, g, w = response.terms(jnp.broadcast_to(off_b, xi.shape), (y_b, ov_b, xi))
@@ -753,12 +755,12 @@ def glm_jj_center_ser(
             f"(Smoothed(Bernoulli(), JJFixed())); got {response!r}."
         )
     y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
-    y = jnp.asarray(y)
+    y = _tmap(jnp.asarray, y)
     offset = jnp.asarray(offset)
     ov = jnp.asarray(ov)
     c = jnp.asarray(center)
     x = op.entry_x
-    y_e = op.broadcast_rows(y)
+    y_e = _tmap(op.broadcast_rows, y)
     off_e = op.broadcast_rows(offset)
     ov_e = op.broadcast_rows(ov) if ov.ndim else ov
     c_e = op.broadcast_cols(c)
@@ -986,11 +988,11 @@ def glm_vi_ser(
             f"and receives the per-entry variance x^2 v + ov; got {response!r}."
         )
     y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
-    y = jnp.asarray(y)
+    y = _tmap(jnp.asarray, y)
     offset = jnp.asarray(offset)
     ov = jnp.asarray(ov)
     x = op.entry_x
-    y_e = op.broadcast_rows(y)
+    y_e = _tmap(op.broadcast_rows, y)
     off_e = op.broadcast_rows(offset)
     ov_e = op.broadcast_rows(ov) if ov.ndim else ov
     inv_pv = 1.0 / prior_variance
@@ -1360,12 +1362,12 @@ def glm_vi_profile_ser(
             f"and receives the per-entry variance x^2 v + ov; got {response!r}."
         )
     y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
-    y = jnp.asarray(y)
+    y = _tmap(jnp.asarray, y)
     offset = jnp.asarray(offset)
     ov = jnp.broadcast_to(jnp.asarray(ov), offset.shape)  # uniform per-row leaves
     aux_row = (y, ov)
     x = op.entry_x
-    y_e = op.broadcast_rows(y)
+    y_e = _tmap(op.broadcast_rows, y)
     off_e = op.broadcast_rows(offset)
     ov_e = op.broadcast_rows(ov)
     inv_pv = 1.0 / prior_variance

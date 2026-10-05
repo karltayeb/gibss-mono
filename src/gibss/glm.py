@@ -3,7 +3,8 @@
 `response_ser.glm_ser` fits a per-column SER for an arbitrary per-observation
 likelihood; this module wraps it as a `gibss` engine family so a full SuSiE runs on
 *any* `ResponseModel`. Logistic SuSiE is `GLM(Bernoulli())`, Poisson SuSiE is
-`GLM(Poisson())` -- the same code path, only the response differs.
+`GLM(Poisson())`, Binomial(n_i, p_i) SuSiE is `GLM(Binomial())` with the trial counts on
+`data.n_trials` -- the same code path, only the response differs.
 
 The two-group enrichment model has its own module (`twogroup`) because it needs an
 outer f0/f1 M-step and the special after-effects intercept ordering (its intercept is
@@ -41,7 +42,14 @@ from .linear import (  # noqa: F401 (prep_data re-export)
     update_prior_variance_index_step,
 )
 from .operators import CenteredOperator, DenseOperator, as_operator
-from .response import Bernoulli, Compress, CompressSelfNorm, ResponseModel, Smoothed
+from .response import (
+    Bernoulli,
+    Binomial,
+    Compress,
+    CompressSelfNorm,
+    ResponseModel,
+    Smoothed,
+)
 from .response_ser import (
     _profile_null,
     build_ser_state,
@@ -281,12 +289,38 @@ def _offset_var(state, include_intercept_var=True, include_ri_var=True):
     return ov
 
 
+def _response_aux(data):
+    """The per-row observation leaf the kernels receive as `aux` (or as its first leaf):
+    `y` for a plain-observation family, the pair `(y, n_trials)` for Binomial. Follows the
+    data: a `n_trials` field on `data` selects the pair (`initialize_state` checks that it
+    matches the response). Everything downstream broadcasts it leaf-wise."""
+    y = jnp.asarray(data.y)
+    n_trials = getattr(data, "n_trials", None)
+    return y if n_trials is None else (y, jnp.asarray(n_trials))
+
+
+def _check_trials(data, response):
+    """A Binomial response needs `data.n_trials`; any other response must not carry it."""
+    base = response.base if isinstance(response, Smoothed) else response
+    has = getattr(data, "n_trials", None) is not None
+    if isinstance(base, Binomial) and not has:
+        raise ValueError(
+            "Binomial response needs per-row trial counts: prep_data(X, y, n_trials=...) "
+            "(front door: fit_glm_susie(X, y, trials=...))."
+        )
+    if has and not isinstance(base, Binomial):
+        raise ValueError(
+            f"data carries n_trials but the response is {type(base).__name__}; use the "
+            "Binomial response (family='binomial') or drop the trial counts."
+        )
+
+
 def _aux(data, state, include_intercept_var=True, include_ri_var=True):
     """Kernel aux: y; a Smoothed response adds the offset variance (and, for
     row-parameterized schemes under the quadrature/profile kernels, the per-row
     parameter tuned by update_row_param_step -- the jj kernel builds its own
     per-entry tilt instead)."""
-    y = jnp.asarray(data.y)
+    y = _response_aux(data)
     fs = state.family_state
     if not isinstance(fs.response, Smoothed):
         return y
@@ -349,8 +383,8 @@ def _build_offset_table(data, state, effects, offset_var, keys=None):
     fs = state.family_state
     smoother, base = fs.response.smoother, fs.response.base
     X = data.X
-    y = jnp.asarray(data.y)
-    n = y.shape[0]
+    y = _response_aux(data)
+    n = X.shape[0]
 
     if isinstance(smoother, PoissonLogNormalOffset):
         # Analytic Poisson: the offset-integrated cumulant is closed form, so the aux is
@@ -617,7 +651,8 @@ def _null_row_param_solve(mean, ov, y, base, response, profiled, n_iter=200, tol
     scheme's null value with its parameter TIGHT at the null (JJ: a bound tight at xi;
     Taylor: the expansion exact at its anchor)."""
     smoother = response.smoother
-    mean, ov, y, base = (jnp.asarray(mean), jnp.asarray(ov), jnp.asarray(y), jnp.asarray(base))
+    mean, ov, base = jnp.asarray(mean), jnp.asarray(ov), jnp.asarray(base)
+    y = jax.tree_util.tree_map(jnp.asarray, y)  # observation leaf: y, or (y, n_trials)
 
     def tune(c):
         return smoother.row_param(mean, ov, base + c)
@@ -712,6 +747,7 @@ def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_st
     p = data.X.shape[1]
     n = data.X.shape[0]
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
+    _check_trials(data, response)
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=Message(jnp.zeros(n), jnp.zeros(n)),
@@ -733,6 +769,7 @@ def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli
     p = data.X.shape[1]
     n = data.X.shape[0]
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
+    _check_trials(data, response)
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
         total_message=MeanMessage(jnp.zeros(n)),
@@ -820,7 +857,7 @@ def _intercept_point(data, state):
         response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset)
     ):
         response = response.base
-        aux = jnp.asarray(data.y)
+        aux = _response_aux(data)
     else:
         aux = _aux(data, state, include_intercept_var=False)
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
@@ -890,7 +927,7 @@ def _intercept_freeform(data, state, order=15):
     offset = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)  # effects + ri
     ones = DenseOperator(jnp.ones((n, 1)))
     fold_aux = _selfnorm_fold_aux(
-        data, state, fs.response.smoother, base, jnp.asarray(data.y), n,
+        data, state, fs.response.smoother, base, _response_aux(data), n,
         state.single_effects, include_intercept=False,
         keys=list(range(len(state.single_effects))),
     )
@@ -1015,7 +1052,7 @@ def _random_intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
         step = jnp.clip((g - inv_s2 * m) / prec, -4.0, 4.0)
         return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
 
-    n = jnp.asarray(data.y).shape[0]
+    n = data.X.shape[0]
     m0 = _ri_mean(fs)
     m0 = jnp.zeros(n) if jnp.ndim(m0) == 0 else jnp.asarray(m0)
     v0 = fs.random_intercept_var
@@ -1036,7 +1073,7 @@ def _random_intercept_point(data, state, n_iter=50, tol=1e-8):
     s2 = jnp.asarray(fs.random_intercept_prior_variance)  # scalar or per-row (n,)
     inv_s2 = 1.0 / s2
     base = fs.response.base if isinstance(fs.response, Smoothed) else fs.response
-    y = jnp.asarray(data.y)
+    y = _response_aux(data)
     offset = jnp.asarray(state.total_message.mean) + fs.glm_offset + fs.intercept_value
 
     def body(s):
@@ -1046,7 +1083,7 @@ def _random_intercept_point(data, state, n_iter=50, tol=1e-8):
         step = jnp.clip((g - inv_s2 * m) / prec, -4.0, 4.0)
         return m + step, jnp.max(jnp.abs(step)), it + 1
 
-    n = y.shape[0]
+    n = data.X.shape[0]
     m0 = _ri_mean(fs)
     m0 = jnp.zeros(n) if jnp.ndim(m0) == 0 else jnp.asarray(m0)
     m, _, _ = jax.lax.while_loop(
@@ -1129,7 +1166,7 @@ def update_row_param_step(data, state):
     ov = _offset_var(state)  # message variance + intercept variance
     if fs.intercept == "profiled":
         _, param, _ = _null_row_param_solve(
-            mean, ov, jnp.asarray(data.y), fs.glm_offset, fs.response, True
+            mean, ov, _response_aux(data), fs.glm_offset, fs.response, True
         )
     else:
         param = fs.response.smoother.row_param(
@@ -1294,7 +1331,7 @@ def _selfnorm_effect_aux(data, state, l):
     others = [state.single_effects[i] for i in keys]
     return _selfnorm_fold_aux(
         data, state, fs.response.smoother, fs.response.base,
-        jnp.asarray(data.y), data.X.shape[0], others, keys=keys,
+        _response_aux(data), data.X.shape[0], others, keys=keys,
     )
 
 

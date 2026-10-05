@@ -4,7 +4,8 @@
 > are being updated. The current entry points are:
 > - `gibss.methods.fit_glm_susie(X, y, method=...)` -- one front door for logistic
 >   / Poisson / linear GLM SuSiE and the named variants (localjj, globaljj, irls,
->   score, ...); see `gibss.methods.PRESETS`.
+>   score, ...); see `gibss.methods.PRESETS`. Binomial(n_i, p_i) responses: pass the
+>   success counts as `y` and the trial counts as `trials=` (every method applies).
 > - `gibss.glm` -- the generic response-model engine (`GLMFamilyState(response=...,
 >   kernel=..., intercept=...)`) any `gibss.response.ResponseModel` runs through.
 > - `gibss.twogroup.fit(X, bhat, se, f0=, f1=, ...)` -- two-group enrichment SuSiE

@@ -9,10 +9,12 @@ ResponseModel exposes it as three functions of the linear predictor:
       grad   : d loglik / d eta            -- the working residual (gradient)
       weight : Newton/Laplace curvature >0 -- Fisher / MM majorizer (Hessian)
 
-`aux` is the per-observation auxiliary data (y for Bernoulli/Poisson, the
-log-likelihood ratio `llr` for the two-group marginal; the smoother's contract for
-`Smoothed`). Responses are stateless frozen dataclasses -> hashable -> usable as jit
-static args.
+`aux` is the per-observation auxiliary data (y for Bernoulli/Poisson, the pair
+`(y, n_trials)` for Binomial, the log-likelihood ratio `llr` for the two-group marginal;
+the smoother's contract for `Smoothed`). It may be any pytree of per-row arrays: the
+kernels and smoothers broadcast it leaf-wise and never look inside, so a family that
+needs two per-row arrays (Binomial) rides through unchanged. Responses are stateless
+frozen dataclasses -> hashable -> usable as jit static args.
 
 Offset integration follows the Ahat framework (notes/ser random offset.md): for a
 zero-mean random offset `o ~ N(0, ov)` only the cumulant changes, `A -> Atilde =
@@ -57,10 +59,19 @@ __all__ = [
     "JJFixed",
     "Smoothed",
     "Bernoulli",
+    "Binomial",
     "TwoGroupMarginal",
     "Poisson",
     "Gaussian",
 ]
+
+
+_tmap = jax.tree_util.tree_map
+
+
+def _rows(aux):
+    """Row count of a per-row aux pytree (its first leaf's leading axis)."""
+    return jax.tree_util.tree_leaves(aux)[0].shape[0]
 
 
 class ResponseModel:
@@ -81,6 +92,27 @@ class ResponseModel:
 
     def terms(self, eta, aux):
         raise NotImplementedError
+
+    def unpack(self, aux):
+        """`(y, scale)`: the observation and the per-row multiplier of the cumulant, so that
+        for an exponential family `terms(eta, aux)[0] = y*eta - scale*A(eta)`. Default: `aux`
+        IS the observation and the scale is 1; `Binomial` returns `(y, n_trials)`. Used by the
+        schemes that write the cumulant out by hand (the JJ bound, the Taylor correction) and
+        by the offset tables, which hold the UNIT (per-trial) residual and scale it on
+        evaluation."""
+        return aux, 1.0
+
+    def cumulant_terms(self, eta):
+        """The y-free UNIT cumulant in `terms` sign convention, `(-A, -A', A'')` at scale 1:
+        what `terms(eta, 0)` is for a plain-observation family. The Compress / CF offset
+        tables fold this (per trial) and apply the per-row scale when evaluated."""
+        return self.terms(eta, jnp.zeros_like(eta))
+
+    def unit_aux(self, template):
+        """An aux for the UNIT cumulant (observation 0, scale 1) shaped like `template` -- a
+        per-row aux of this family, or a bare array. For smoothers that need a full aux to
+        fold the y-free cumulant (MixtureGH / SelfNormQuad inside the Compress builders)."""
+        return _tmap(jnp.zeros_like, template)
 
 
 class ExponentialFamily(ResponseModel):
@@ -177,7 +209,7 @@ class GH(Smoother):
         wts = jnp.asarray(wts_np / np.sqrt(np.pi)).reshape(lead)  # sum to 1
         sd = jnp.sqrt(2.0 * jnp.maximum(jnp.asarray(ov), 0.0))
         shft = eta[None, ...] + sd[None, ...] * nodes  # (order, *eta.shape)
-        ll, g, w = base.terms(shft, jnp.asarray(y)[None, ...])
+        ll, g, w = base.terms(shft, _tmap(lambda a: jnp.asarray(a)[None, ...], y))
         return jnp.sum(wts * ll, 0), jnp.sum(wts * g, 0), jnp.sum(wts * w, 0)
 
 
@@ -214,11 +246,11 @@ class MixtureGH(Smoother):
         # axis. Open a trailing K slot on the K-free leaves (eta, y) so every array
         # shares one rank, then broadcast to (order, *eta, K) and reduce both away.
         eta_k = eta[..., None]
-        y_k = jnp.asarray(y)[..., None]
+        y_k = _tmap(lambda a: jnp.asarray(a)[..., None], y)
         m = eta_k.ndim
         node = jnp.asarray(nodes_np).reshape((self.order,) + (1,) * m)
         shift = eta_k[None] + jnp.asarray(means)[None] + sd[None] * node  # (order, *eta, K)
-        ll, g, w = base.terms(shift, y_k[None])
+        ll, g, w = base.terms(shift, _tmap(lambda a: a[None], y_k))
         W = wj.reshape((self.order,) + (1,) * m) * pi[None]  # (order, *eta, K)
         red = lambda t: jnp.sum(W * t, axis=(0, -1))  # noqa: E731
         return red(ll), red(g), red(w)
@@ -268,7 +300,7 @@ class SelfNormQuad(Smoother):
     def terms(self, base, eta, aux):
         y, x, b_nodes, logW = aux
         eta = jnp.asarray(eta)
-        y = jnp.asarray(y)
+        y = _tmap(lambda a: jnp.asarray(a)[:, None, None], y)
         x = jnp.asarray(x)
         b_nodes = jnp.asarray(b_nodes)
         # shared self-normalized weights over ALL (C, Q); rows differ only via x.
@@ -281,7 +313,7 @@ class SelfNormQuad(Smoother):
             all0, ag0, aw0 = acc
             xc, bc, Wc = comp  # (n,), (Q,), (Q,)
             shift = eta[:, :, None] + xc[:, None, None] * bc[None, None, :]  # (n, Z, Q)
-            ll, g, w = base.terms(shift, y[:, None, None])
+            ll, g, w = base.terms(shift, y)
             Wc_ = Wc[None, None, :]
             return (all0 + jnp.sum(Wc_ * ll, -1),
                     ag0 + jnp.sum(Wc_ * g, -1),
@@ -328,7 +360,7 @@ def _fold_over_components(
             o = mk[:, None] + sd[:, None] * xgh[None, :]
             pts = znodes[:, :, None] + o[:, None, :]
             Wk = pk[:, None, None] * wgh[None, None, :]
-            nll = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))[0]
+            nll = base.cumulant_terms(pts + s_prev[:, None, None])[0]
             t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
             return (EA0 - jnp.sum(Wk * nll, -1),
                     Er0 + jnp.sum(Wk * _clenshaw_batched(cr0[:, None, None, :], t), -1)), None
@@ -342,7 +374,7 @@ def _fold_over_components(
         o = mk[:, None] + sd[:, None] * xgh[None, :]  # (n, Q)
         pts = znodes[:, :, None] + o[:, None, :]  # (n, Z, Q)
         Wk = pk[:, None, None] * wgh[None, None, :]  # (n, 1, Q)
-        nll, ng, nw = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))
+        nll, ng, nw = base.cumulant_terms(pts + s_prev[:, None, None])
         EA0 = EA0 - jnp.sum(Wk * nll, -1)  # E_o[A]  (reduce Q)
         EA1 = EA1 - jnp.sum(Wk * ng, -1)  # E_o[A']
         EA2 = EA2 + jnp.sum(Wk * nw, -1)  # E_o[A'']
@@ -379,7 +411,7 @@ def _fold_selfnorm_components(
             o = xc[:, None] * bc[None, :]  # (n, Q)
             pts = znodes[:, :, None] + o[:, None, :]  # (n, Z, Q)
             Wc_ = Wc[None, None, :]  # (1, 1, Q), shared across rows
-            nll = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))[0]
+            nll = base.cumulant_terms(pts + s_prev[:, None, None])[0]
             t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
             return (EA0 - jnp.sum(Wc_ * nll, -1),
                     Er0 + jnp.sum(Wc_ * _clenshaw_batched(cr0[:, None, None, :], t), -1)), None
@@ -392,7 +424,7 @@ def _fold_selfnorm_components(
         o = xc[:, None] * bc[None, :]  # (n, Q)
         pts = znodes[:, :, None] + o[:, None, :]  # (n, Z, Q)
         Wc_ = Wc[None, None, :]
-        nll, ng, nw = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))
+        nll, ng, nw = base.cumulant_terms(pts + s_prev[:, None, None])
         EA0 = EA0 - jnp.sum(Wc_ * nll, -1)
         EA1 = EA1 - jnp.sum(Wc_ * ng, -1)
         EA2 = EA2 + jnp.sum(Wc_ * nw, -1)
@@ -433,7 +465,7 @@ def _fold_selfnorm_background(
             o = (-cc) * bc  # (Q,) row-independent off-support node
             pts = znodes[:, :, None] + o[None, None, :]  # (n, Z, Q)
             Wc_ = Wc[None, None, :]
-            nll = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))[0]
+            nll = base.cumulant_terms(pts + s_prev[:, None, None])[0]
             t = jnp.clip((pts - center_prev[:, None, None]) / hw_prev[:, None, None], -1., 1.)
             return (EA0 - jnp.sum(Wc_ * nll, -1),
                     Er0 + jnp.sum(Wc_ * _clenshaw_batched(cr0[:, None, None, :], t), -1)), None
@@ -446,7 +478,7 @@ def _fold_selfnorm_background(
         o = (-cc) * bc  # (Q,)
         pts = znodes[:, :, None] + o[None, None, :]  # (n, Z, Q)
         Wc_ = Wc[None, None, :]
-        nll, ng, nw = base.terms(pts + s_prev[:, None, None], jnp.zeros_like(pts))
+        nll, ng, nw = base.cumulant_terms(pts + s_prev[:, None, None])
         EA0 = EA0 - jnp.sum(Wc_ * nll, -1)
         EA1 = EA1 - jnp.sum(Wc_ * ng, -1)
         EA2 = EA2 + jnp.sum(Wc_ * nw, -1)
@@ -476,6 +508,11 @@ class Compress(Smoother):
     carries the dominant shape and convexity; the residual
 
         R_i(eta) = inner.terms(eta) - base.terms(eta + obar_i)   (per term: ll, g, w)
+
+    The tables hold the residual of the UNIT (per-trial) cumulant, folded y-free through
+    `base.cumulant_terms` / `base.unit_aux`; `_table_residual_terms` multiplies it by the
+    response's per-row scale (`base.unpack`: 1 for Bernoulli, the trial count for Binomial)
+    on evaluation, so a seed table and the stages folded on top of it agree.
 
     is a small, smooth, exponentially-localized bump (its g/w components vanish at both
     ends; the ll component tends to the constant -y*obar). We interpolate each of the
@@ -519,13 +556,13 @@ class Compress(Smoother):
         return _table_plugin_terms(base, eta, aux)
 
     def residual_terms(self, base, eta, aux):
-        return _table_residual_terms(eta, aux)
+        return _table_residual_terms(base, eta, aux)
 
     def build_aux(self, base, y, means, vars_, log_pi):
         """Precompute the compressed aux from a per-row Gaussian-mixture offset law
         `o_i ~ sum_k pi_ik N(means_ik, vars_ik)` (shapes (n, K), same as `MixtureGH`).
         Runs once per SER fit, out of the hot loop, so `inner.order` can be large."""
-        y = jnp.asarray(y)
+        y = _tmap(jnp.asarray, y)
         means, vars_ = jnp.asarray(means), jnp.asarray(vars_)
         log_pi = jnp.asarray(log_pi)
         pi = jax.nn.softmax(log_pi, axis=-1)  # (n, K)
@@ -544,15 +581,17 @@ class Compress(Smoother):
         znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
 
         # exact smoothed terms at the nodes; reshape mixture leaves to (n, 1, K) so the
-        # (M+1) node axis is the "columns" slot inner.terms broadcasts over.
+        # (M+1) node axis is the "columns" slot inner.terms broadcasts over. The fold is
+        # y-free (unit aux: the y*eta terms cancel in the residual anyway) so the table is
+        # the per-trial residual.
         inner_aux = (
-            y[:, None],
+            _tmap(lambda a: a[:, None], base.unit_aux(y)),
             means[:, None, :],
             vars_[:, None, :],
             log_pi[:, None, :],
         )
         sll, sg, sw = self.inner.terms(base, znodes, inner_aux)  # each (n, M+1)
-        bll, bg, bw = base.terms(znodes + obar[:, None], y[:, None])  # plug-in at shift
+        bll, bg, bw = base.cumulant_terms(znodes + obar[:, None])  # plug-in at shift
         fit = lambda vals: vals @ Vinv.T  # (n, M+1) samples -> (n, M+1) coeffs  # noqa: E731
         coef_ll = fit(sll - bll)
         coef_g = fit(sg - bg)
@@ -575,7 +614,7 @@ class Compress(Smoother):
         computed from the component extremes without forming the tensor. Emits `(y, obar,
         center, halfwidth, coef_ll, coef_g, coef_w)` -- the same contract `Compress.terms`
         consumes, so the hot loop is untouched. Runs once per SER fit, out of the loop."""
-        y = jnp.asarray(y)
+        y = _tmap(jnp.asarray, y)
         x = jnp.asarray(x)
         b_nodes = jnp.asarray(b_nodes)
         W = jax.nn.softmax(jnp.asarray(logW).reshape(-1)).reshape(b_nodes.shape)  # (C, Q)
@@ -594,8 +633,9 @@ class Compress(Smoother):
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
         znodes = center[:, None] + halfwidth[:, None] * xnodes[None, :]  # (n, M+1)
-        sll, sg, sw = SelfNormQuad().terms(base, znodes, (y, x, b_nodes, logW))
-        bll, bg, bw = base.terms(znodes + obar[:, None], y[:, None])  # plug-in at shift
+        yu = base.unit_aux(y)  # y-free fold: the per-trial residual
+        sll, sg, sw = SelfNormQuad().terms(base, znodes, (yu, x, b_nodes, logW))
+        bll, bg, bw = base.cumulant_terms(znodes + obar[:, None])  # plug-in at shift
         fit = lambda vals: vals @ Vinv.T  # noqa: E731
         return y, obar, center, halfwidth, fit(sll - bll), fit(sg - bg), fit(sw - bw)
 
@@ -607,16 +647,17 @@ class Compress(Smoother):
         `(cr0, cr1, cr2, V0)`. Used to fold the shared intercept's non-Gaussian posterior
         before the sparse X-effects (the self-normalized analogue of the Gaussian `N(0, iv)`
         seed). `x` (n, C), `b_nodes`/`logW` (C, Q); the caller passes CENTERED nodes."""
-        y = jnp.asarray(y)
+        y = _tmap(jnp.asarray, y)
         x = jnp.asarray(x)
         b_nodes = jnp.asarray(b_nodes)
-        n = y.shape[0]
+        n = _rows(y)
         hw = jnp.broadcast_to(self.T + self.kappa * jnp.sqrt(jnp.asarray(V0)), (n,))
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
         znodes = hw[:, None] * xnodes[None, :]  # center 0 (n, M+1)
-        sll, sg, sw = SelfNormQuad().terms(base, znodes, (y, x, b_nodes, logW))
-        bll, bg, bw = base.terms(znodes, y[:, None])  # plug-in at obar=0 (mean in eta)
+        yu = base.unit_aux(y)  # y-free fold: the per-trial residual
+        sll, sg, sw = SelfNormQuad().terms(base, znodes, (yu, x, b_nodes, logW))
+        bll, bg, bw = base.cumulant_terms(znodes)  # plug-in at obar=0 (mean in eta)
         fit = lambda vals: vals @ Vinv.T  # noqa: E731
         # cumulant residuals cr = A^(1) - A(z); aux stores (-cr0, -cr1, cr2), so
         # cr0 = -fit(sll - bll) matches the Gaussian init convention (init = (cr0,cr1,cr2,V0)).
@@ -642,8 +683,8 @@ class Compress(Smoother):
         if derivatives not in ("differentiate", "fit"):
             raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
         value_only = derivatives == "differentiate"
-        y = jnp.asarray(y)
-        n = y.shape[0]
+        y = _tmap(jnp.asarray, y)
+        n = _rows(y)
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
         fit = lambda vals: vals @ Vinv.T  # noqa: E731
@@ -676,14 +717,14 @@ class Compress(Smoother):
                     base, znodes, s_prev, x, b_nodes, W,
                     cr0, cr1, cr2, center_prev, hw_prev, value_only=True,
                 )
-                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                pll = base.cumulant_terms(znodes + s[:, None])[0]
                 cr0 = fit((EA0 + pll) + Er0)
             else:
                 EA0, EA1, EA2, Er0, Er1, Er2 = _fold_selfnorm_components(
                     base, znodes, s_prev, x, b_nodes, W,
                     cr0, cr1, cr2, center_prev, hw_prev,
                 )
-                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                pll, pg, pw = base.cumulant_terms(znodes + s[:, None])
                 cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 
         if value_only:
@@ -707,7 +748,7 @@ class Compress(Smoother):
         if derivatives not in ("differentiate", "fit"):
             raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
         value_only = derivatives == "differentiate"
-        y = jnp.asarray(y)
+        y = _tmap(jnp.asarray, y)
         idx = X.indices
         rows_all, cols_all = idx[:, 0], idx[:, 1]
         vals_all = X.data
@@ -781,21 +822,21 @@ class Compress(Smoother):
                 def body(carry, ent):
                     EA0, Er0 = carry
                     a_arg, tt, Wc, ss = _pts_and_t(ent)
-                    nll = base.terms(a_arg, jnp.zeros_like(a_arg))[0]
+                    nll = base.cumulant_terms(a_arg)[0]
                     return (EA0 + ss(-jnp.sum(Wc * nll, -1)),
                             Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[ent[0]][:, None, None, :], tt), -1))), None
                 z2 = (jnp.zeros((n, self.M + 1)), jnp.zeros((n, self.M + 1)))
                 (EA0, Er0), _ = jax.lax.scan(body, z2, (rr, vv, bb, ww))
-                znll = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))[0]
+                znll = base.cumulant_terms(znodes + s_prev[:, None])[0]
                 EA0 = EA0 + pi0[:, None] * (-znll)
                 Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
-                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                pll = base.cumulant_terms(znodes + s[:, None])[0]
                 cr0 = fit((EA0 + pll) + Er0)
             else:
                 def body(carry, ent):
                     EA0, EA1, EA2, Er0, Er1, Er2 = carry
                     a_arg, tt, Wc, ss = _pts_and_t(ent)
-                    nll, ng, nw = base.terms(a_arg, jnp.zeros_like(a_arg))
+                    nll, ng, nw = base.cumulant_terms(a_arg)
                     rc = ent[0]
                     return (
                         EA0 + ss(-jnp.sum(Wc * nll, -1)),
@@ -807,14 +848,14 @@ class Compress(Smoother):
                     ), None
                 zero6 = tuple(jnp.zeros((n, self.M + 1)) for _ in range(6))
                 (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, zero6, (rr, vv, bb, ww))
-                znll, zng, znw = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))
+                znll, zng, znw = base.cumulant_terms(znodes + s_prev[:, None])
                 EA0 = EA0 + pi0[:, None] * (-znll)
                 EA1 = EA1 + pi0[:, None] * (-zng)
                 EA2 = EA2 + pi0[:, None] * znw
                 Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
                 Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
                 Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
-                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                pll, pg, pw = base.cumulant_terms(znodes + s[:, None])
                 cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 
         if value_only:
@@ -856,7 +897,7 @@ class Compress(Smoother):
         if derivatives not in ("differentiate", "fit"):
             raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
         value_only = derivatives == "differentiate"
-        y = jnp.asarray(y)
+        y = _tmap(jnp.asarray, y)
         c = jnp.asarray(c)
         idx = X.indices
         rows_all, cols_all = idx[:, 0], idx[:, 1]
@@ -941,15 +982,15 @@ class Compress(Smoother):
                     EA0, Er0 = carry
                     a_sp, a_bg, t_sp, t_bg, Wc, ss = _entry(ent)
                     # support MINUS background (the background is already in EA0/Er0)
-                    nll_sp = base.terms(a_sp, jnp.zeros_like(a_sp))[0]
-                    nll_bg = base.terms(a_bg, jnp.zeros_like(a_bg))[0]
+                    nll_sp = base.cumulant_terms(a_sp)[0]
+                    nll_bg = base.cumulant_terms(a_bg)[0]
                     cr = cr0_p[ent[0]][:, None, None, :]
                     dEr = _clenshaw_batched(cr, t_sp) - _clenshaw_batched(cr, t_bg)
                     return (EA0 + ss(-jnp.sum(Wc * (nll_sp - nll_bg), -1)),
                             Er0 + ss(jnp.sum(Wc * dEr, -1))), None
 
                 (EA0, Er0), _ = jax.lax.scan(body, (EA0, Er0), (rr, vv, cvec, bb, ww))
-                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                pll = base.cumulant_terms(znodes + s[:, None])[0]
                 cr0 = fit((EA0 + pll) + Er0)
             else:
                 EA0, EA1, EA2, Er0, Er1, Er2 = _fold_selfnorm_background(*bg_args)
@@ -957,8 +998,8 @@ class Compress(Smoother):
                 def body(carry, ent):
                     EA0, EA1, EA2, Er0, Er1, Er2 = carry
                     a_sp, a_bg, t_sp, t_bg, Wc, ss = _entry(ent)
-                    nll_sp, ng_sp, nw_sp = base.terms(a_sp, jnp.zeros_like(a_sp))
-                    nll_bg, ng_bg, nw_bg = base.terms(a_bg, jnp.zeros_like(a_bg))
+                    nll_sp, ng_sp, nw_sp = base.cumulant_terms(a_sp)
+                    nll_bg, ng_bg, nw_bg = base.cumulant_terms(a_bg)
                     rc = ent[0]
                     cr0c, cr1c, cr2c = (cr0_p[rc][:, None, None, :],
                                         cr1_p[rc][:, None, None, :],
@@ -978,7 +1019,7 @@ class Compress(Smoother):
                 init6 = (EA0, EA1, EA2, Er0, Er1, Er2)
                 (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(
                     body, init6, (rr, vv, cvec, bb, ww))
-                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                pll, pg, pw = base.cumulant_terms(znodes + s[:, None])
                 cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 
         if value_only:
@@ -1024,8 +1065,8 @@ class Compress(Smoother):
         if derivatives not in ("differentiate", "fit"):
             raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
         value_only = derivatives == "differentiate"
-        y = jnp.asarray(y)
-        n = y.shape[0]
+        y = _tmap(jnp.asarray, y)
+        n = _rows(y)
         xgh_np, logw_np = _gh_rule(self.inner.order)
         xgh = jnp.asarray(xgh_np)
         wgh = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))  # sum to 1
@@ -1063,14 +1104,14 @@ class Compress(Smoother):
                     base, znodes, s_prev, means, vars_, pi, xgh, wgh,
                     cr0, cr1, cr2, center_prev, hw_prev, value_only=True,
                 )
-                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                pll = base.cumulant_terms(znodes + s[:, None])[0]
                 cr0 = fit((EA0 + pll) + Er0)  # F0 = E_o[A] - A(z+s), A(z+s) = -pll
             else:
                 EA0, EA1, EA2, Er0, Er1, Er2 = _fold_over_components(
                     base, znodes, s_prev, means, vars_, pi, xgh, wgh,
                     cr0, cr1, cr2, center_prev, hw_prev,
                 )
-                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                pll, pg, pw = base.cumulant_terms(znodes + s[:, None])
                 cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 
         if value_only:  # derivatives of the value interpolant, on the final interval
@@ -1103,7 +1144,7 @@ class Compress(Smoother):
         if derivatives not in ("differentiate", "fit"):
             raise ValueError(f"derivatives must be 'differentiate' or 'fit'; got {derivatives!r}")
         value_only = derivatives == "differentiate"
-        y = jnp.asarray(y)
+        y = _tmap(jnp.asarray, y)
         idx = X.indices
         rows_all, cols_all = idx[:, 0], idx[:, 1]
         vals_all = X.data
@@ -1179,21 +1220,21 @@ class Compress(Smoother):
                 def body(carry, ent):
                     EA0, Er0 = carry
                     a_arg, tt, Wc, ss = _pts_and_t(ent)
-                    nll = base.terms(a_arg, jnp.zeros_like(a_arg))[0]
+                    nll = base.cumulant_terms(a_arg)[0]
                     return (EA0 + ss(-jnp.sum(Wc * nll, -1)),
                             Er0 + ss(jnp.sum(Wc * _clenshaw_batched(cr0_p[ent[0]][:, None, None, :], tt), -1))), None
                 z2 = (jnp.zeros((n, self.M + 1)), jnp.zeros((n, self.M + 1)))
                 (EA0, Er0), _ = jax.lax.scan(body, z2, (rr, me, sde, we))
-                znll = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))[0]
+                znll = base.cumulant_terms(znodes + s_prev[:, None])[0]
                 EA0 = EA0 + pi0[:, None] * (-znll)
                 Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
-                pll = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))[0]
+                pll = base.cumulant_terms(znodes + s[:, None])[0]
                 cr0 = fit((EA0 + pll) + Er0)
             else:
                 def body(carry, ent):
                     EA0, EA1, EA2, Er0, Er1, Er2 = carry
                     a_arg, tt, Wc, ss = _pts_and_t(ent)
-                    nll, ng, nw = base.terms(a_arg, jnp.zeros_like(a_arg))
+                    nll, ng, nw = base.cumulant_terms(a_arg)
                     rc = ent[0]
                     return (
                         EA0 + ss(-jnp.sum(Wc * nll, -1)),
@@ -1205,14 +1246,14 @@ class Compress(Smoother):
                     ), None
                 zero6 = tuple(jnp.zeros((n, self.M + 1)) for _ in range(6))
                 (EA0, EA1, EA2, Er0, Er1, Er2), _ = jax.lax.scan(body, zero6, (rr, me, sde, we))
-                znll, zng, znw = base.terms(znodes + s_prev[:, None], jnp.zeros_like(znodes))
+                znll, zng, znw = base.cumulant_terms(znodes + s_prev[:, None])
                 EA0 = EA0 + pi0[:, None] * (-znll)
                 EA1 = EA1 + pi0[:, None] * (-zng)
                 EA2 = EA2 + pi0[:, None] * znw
                 Er0 = Er0 + pi0[:, None] * _clenshaw_batched(cr0_p[:, None, :], tz)
                 Er1 = Er1 + pi0[:, None] * _clenshaw_batched(cr1_p[:, None, :], tz)
                 Er2 = Er2 + pi0[:, None] * _clenshaw_batched(cr2_p[:, None, :], tz)
-                pll, pg, pw = base.terms(znodes + s[:, None], jnp.zeros_like(znodes))
+                pll, pg, pw = base.cumulant_terms(znodes + s[:, None])
                 cr0, cr1, cr2 = fit(EA0 + pll + Er0), fit(EA1 + pg + Er1), fit(EA2 - pw + Er2)
 
         if value_only:
@@ -1230,19 +1271,22 @@ def _table_plugin_terms(base, eta, aux):
     return base.terms(eta + obar, y)
 
 
-def _table_residual_terms(eta, aux):
+def _table_residual_terms(base, eta, aux):
     """The residual half of a Chebyshev offset table: the three degree-M Clenshaw series
     `(A - Atilde, A' - Atilde', Atilde'' - A'')` on `[center - hw, center + hw]`, clamped
-    to the endpoint value outside (where the residual has decayed). The expensive part of
-    the in-loop evaluation (two series per entry-node in the Newton loop, ~5-10x the
-    base sigmoid); the vi_gh kernels integrate it over b on fewer GH nodes than the base
-    when the smoother sets `residual_order`."""
-    _, _, center, halfwidth, coef_ll, coef_g, coef_w = aux
+    to the endpoint value outside (where the residual has decayed), times the response's
+    per-row cumulant scale (`base.unpack`: 1 for a plain observation, the trial count for
+    Binomial -- the table holds the per-trial residual). The expensive part of the in-loop
+    evaluation (two series per entry-node in the Newton loop, ~5-10x the base sigmoid);
+    the vi_gh kernels integrate it over b on fewer GH nodes than the base when the
+    smoother sets `residual_order`."""
+    y, _, center, halfwidth, coef_ll, coef_g, coef_w = aux
+    _, scale = base.unpack(y)
     t = jnp.clip((eta - center) / halfwidth, -1.0, 1.0)
     return (
-        _clenshaw_batched(coef_ll, t),
-        _clenshaw_batched(coef_g, t),
-        _clenshaw_batched(coef_w, t),
+        scale * _clenshaw_batched(coef_ll, t),
+        scale * _clenshaw_batched(coef_g, t),
+        scale * _clenshaw_batched(coef_w, t),
     )
 
 
@@ -1250,7 +1294,7 @@ def _table_terms(base, eta, aux):
     """`plug-in base + Clenshaw residual` = `(y*eta - Atilde, y - Atilde', Atilde'')`,
     with the assembled weight floored at 0 (convex; Atilde'' >= 0 anyway)."""
     bll, bg, bw = _table_plugin_terms(base, eta, aux)
-    rll, rg, rw = _table_residual_terms(eta, aux)
+    rll, rg, rw = _table_residual_terms(base, eta, aux)
     return bll + rll, bg + rg, jnp.maximum(bw + rw, 0.0)
 
 
@@ -1289,9 +1333,10 @@ class Taylor(Smoother):
     def terms(self, base, eta, aux):
         y, ov = aux
         ll, g, w = base.terms(eta, y)
+        _, scale = base.unpack(y)  # cumulant_derivs are per unit; terms carry the scale
         a3, a4 = base.cumulant_derivs(eta)
         hv = 0.5 * jnp.asarray(ov)
-        return ll - hv * w, g - hv * a3, w + hv * a4
+        return ll - hv * w, g - hv * scale * a3, w + hv * scale * a4
 
 
 @dataclass(frozen=True)
@@ -1344,7 +1389,9 @@ class TaylorFixed(Smoother):
     def terms(self, base, eta, aux):
         y, ov, zhat = aux
         ll0, g0, w0 = base.terms(zhat, y)  # y*z - A(z), y - A'(z), A''(z)
+        _, scale = base.unpack(y)  # cumulant_derivs are per unit; terms carry the scale
         a3, a4 = base.cumulant_derivs(zhat)
+        a3, a4 = scale * a3, scale * a4
         hv = 0.5 * jnp.asarray(ov)
         ll_s, g_s, w_s = ll0 - hv * w0, g0 - hv * a3, w0 + hv * a4  # smoothed at z
         d = eta - zhat
@@ -1360,7 +1407,8 @@ class _JJBase(Smoother):
     `y*eta - Ahat` is a certified evidence lower bound; it is tight at
     xi^2 = eta^2 + ov. Both return weight = 2 lambda(xi): the JJ/MM majorizer
     (monotone Newton), NOT Ahat''. The bound is on softplus, so the base must be
-    the logistic (Bernoulli) cumulant."""
+    the logistic cumulant (Bernoulli, or Binomial: the bound holds per trial, so
+    `n * Ahat` bounds `n * softplus` and everything scales by the trial count)."""
 
     certified = True
 
@@ -1385,10 +1433,11 @@ class JJEnvelope(_JJBase):
 
     def terms(self, base, eta, aux):
         y, ov = aux
+        y, s = base.unpack(y)  # s: per-row trial count (1 for Bernoulli)
         xi = jnp.sqrt(eta**2 + jnp.asarray(ov))
         lam = _jj_lambda(xi)
         ahat = 0.5 * eta - 0.5 * xi + jax.nn.softplus(xi)
-        return y * eta - ahat, y - (0.5 + 2.0 * lam * eta), 2.0 * lam
+        return y * eta - s * ahat, y - s * (0.5 + 2.0 * lam * eta), s * 2.0 * lam
 
 
 @dataclass(frozen=True)
@@ -1408,6 +1457,7 @@ class JJFixed(_JJBase):
 
     def terms(self, base, eta, aux):
         y, ov, xi = aux
+        y, s = base.unpack(y)  # s: per-row trial count (1 for Bernoulli)
         lam = _jj_lambda(xi)
         ahat = (
             0.5 * eta
@@ -1415,7 +1465,7 @@ class JJFixed(_JJBase):
             + jax.nn.softplus(xi)
             - 0.5 * xi
         )
-        return y * eta - ahat, y - (0.5 + 2.0 * lam * eta), 2.0 * lam
+        return y * eta - s * ahat, y - s * (0.5 + 2.0 * lam * eta), s * 2.0 * lam
 
 
 @dataclass(frozen=True)
@@ -1463,6 +1513,38 @@ class Bernoulli(ExponentialFamily):
         s = jax.nn.sigmoid(eta)
         v = s * (1.0 - s)
         return v * (1.0 - 2.0 * s), v * (1.0 - 6.0 * v)  # A''', A''''
+
+
+@dataclass(frozen=True)
+class Binomial(Bernoulli):
+    """Binomial counts with the logit link: y_i successes in n_i trials. aux = (y, n), both
+    per-row ((n,) arrays; n may be a scalar). loglik = y*eta - n*softplus(eta) -- the
+    logistic cumulant scaled per row by the trial count -- so grad = y - n s and
+    weight = n s(1-s). Equivalent to n_i Bernoulli rows sharing row i of the design, so
+    a Binomial fit equals the Bernoulli fit on that expanded data for every kernel.
+
+    Subclassing `Bernoulli` is a capability statement: every scheme that bounds or
+    transforms the logistic cumulant (the JJ bound, the CF offset tables) applies per
+    trial and scales linearly by n, so the `isinstance(base, Bernoulli)` gates accept it.
+    `Bernoulli` is the n = 1 case with the scale left implicit (aux = y). `terms` with a
+    bare `y` raises: the trial count is required."""
+
+    def terms(self, eta, aux):
+        y, n = aux
+        s = jax.nn.sigmoid(eta)
+        return y * eta - n * jax.nn.softplus(eta), y - n * s, n * s * (1.0 - s)
+
+    def unpack(self, aux):
+        y, n = aux
+        return y, n
+
+    def cumulant_terms(self, eta):
+        return Bernoulli.terms(self, eta, jnp.zeros_like(eta))  # per trial
+
+    def unit_aux(self, template):
+        t = template[0] if isinstance(template, tuple) else template
+        z = jnp.zeros_like(jnp.asarray(t))
+        return z, jnp.ones_like(z)
 
 
 @dataclass(frozen=True)

@@ -58,6 +58,7 @@ from .poisson_offset import (
 )
 from .response import (
     Bernoulli,
+    Binomial,
     Compress,
     CompressSelfNorm,
     Gaussian,
@@ -89,9 +90,14 @@ class ELBOBreakdown:
 
 def _base_measure(base: ResponseModel, y) -> float:
     """The eta-free additive constant `c(y)` that turns `terms()[0] = y*eta - A(eta)` into
-    the full log-likelihood `log p(y | eta)`. Bernoulli: 0. Poisson: `-sum log(y!)`.
-    Gaussian: `-n/2 log(2 pi sigma^2)`. Unknown families: 0 (the ELBO is then correct only
-    up to an additive constant -- fine for comparing two fits on the SAME data)."""
+    the full log-likelihood `log p(y | eta)`. Bernoulli: 0. Binomial: `sum log C(n, y)`.
+    Poisson: `-sum log(y!)`. Gaussian: `-n/2 log(2 pi sigma^2)`. Unknown families: 0 (the
+    ELBO is then correct only up to an additive constant -- fine for comparing two fits on
+    the SAME data). `y` is the observation leaf (`(y, n_trials)` for Binomial)."""
+    if isinstance(base, Binomial):  # before Bernoulli: Binomial subclasses it
+        y, n = jnp.asarray(y[0]), jnp.asarray(y[1])
+        gl = jax.scipy.special.gammaln
+        return float(jnp.sum(gl(n + 1.0) - gl(y + 1.0) - gl(n - y + 1.0)))
     y = jnp.asarray(y)
     if isinstance(base, Bernoulli):
         return 0.0
@@ -210,10 +216,10 @@ def compute_elbo(
         raise ValueError("compute_elbo: state has no single effects to score.")
 
     # circular-import guard: glm imports response/engine, and elbo is a leaf consumer
-    from .glm import _build_offset_table, _selfnorm_fold_aux
+    from .glm import _build_offset_table, _response_aux, _selfnorm_fold_aux
 
-    y = jnp.asarray(data.y)
-    n = y.shape[0]
+    y = _response_aux(data)  # observation leaf: y, or (y, n_trials) for Binomial
+    n = data.X.shape[0]
     eta = _predictor_mean(data, state)  # (n,) posterior mean of the predictor (b0 mean in)
 
     # A shared intercept is a genuine q(b0) whose spread must be integrated. A profiled fit
@@ -366,12 +372,12 @@ def compute_elbo_gaussian(
 
     Returns the ELBO as a float, or an `ELBOBreakdown` (`is_q1=False`).
     """
-    from .glm import _build_offset_table  # circular-import guard (glm imports response/engine)
+    from .glm import _build_offset_table, _response_aux  # circular-import guard
 
     base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects = _q2_gaussian_pieces(
         data, state, score_intercept=score_intercept
     )
-    y = jnp.asarray(data.y)
+    y = _response_aux(data)  # observation leaf: y, or (y, n_trials) for Binomial
     fs = state.family_state
     if isinstance(base, Poisson):
         # analytic log-normal MGF (the CF at t = -i): identical to compute_elbo's Poisson path.
@@ -422,7 +428,8 @@ def compute_elbo_jj(
 
     `Var[eta_i]` is the full predictor variance: the effects' aggregate message variance plus
     the shared intercept's `v0` and the random intercept's `v_i`. The JJ ELBO subtracts the
-    same per-effect / intercept / random-intercept KLs as `compute_elbo`.
+    same per-effect / intercept / random-intercept KLs as `compute_elbo`. A Binomial base
+    scales the per-trial bound by the trial count n_i (the bound holds per trial).
 
     Because the JJ bound is a LOWER bound to the exact log-likelihood, this is `<=` the exact
     ELBO of the SAME `q` (`compute_elbo` / `compute_elbo_gaussian`) -- it is the objective
@@ -440,13 +447,16 @@ def compute_elbo_jj(
             "compute_elbo_jj is defined for the Bernoulli (logistic) base only (the JJ bound "
             f"is logistic-specific); got {type(base).__name__}."
         )
-    y = jnp.asarray(data.y)
+    from .glm import _response_aux  # circular-import guard
+
+    leaf = _response_aux(data)  # observation leaf: y, or (y, n_trials) for Binomial
+    y, scale = base.unpack(leaf)  # scale: trial count (1 for Bernoulli)
     # full predictor variance Var[eta_i] = sum-of-effect vars + shared intercept v0 + ri v_i.
     v_eta = jnp.asarray(state.total_message.var) + intercept_var + jnp.asarray(ri_var)
     xi = jnp.sqrt(jnp.maximum(eta**2 + v_eta, 0.0))  # optimal tilt xi_i^2 = E[eta_i^2]
     # JJ lower bound at the optimal tilt (the quadratic term lambda(xi)(E[eta^2]-xi^2) is 0).
-    jj_ll = y * eta - jax.nn.softplus(xi) - 0.5 * (eta - xi)
-    base_measure = _base_measure(base, y) if include_base_measure else 0.0  # 0 for Bernoulli
+    jj_ll = y * eta - scale * (jax.nn.softplus(xi) + 0.5 * (eta - xi))
+    base_measure = _base_measure(base, leaf) if include_base_measure else 0.0
     expected_loglik = float(jnp.sum(jj_ll)) + base_measure
     elbo = expected_loglik - kl - intercept_kl - ri_kl
     if return_breakdown:

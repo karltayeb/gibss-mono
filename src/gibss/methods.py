@@ -25,6 +25,7 @@ from .linear import is_bcoo
 from .response import (
     GH,
     Bernoulli,
+    Binomial,
     Compress,
     CompressSelfNorm,
     Gaussian,
@@ -43,6 +44,7 @@ __all__ = ["PRESETS", "fit_glm_susie"]
 
 _FAMILIES = {
     "logistic": Bernoulli(),
+    "binomial": Binomial(),  # y_i successes in trials_i; pass trials= (selects it by default)
     "poisson": Poisson(),
     "gaussian": Gaussian(),
 }
@@ -269,6 +271,10 @@ def fit_glm_susie(
     background=None,
     # plain values (no preset interaction, ordinary defaults)
     center=None,  # pre-center columns; None = on wherever supported (see below)
+    trials=None,  # Binomial: per-row trial counts n_i (y_i = successes); selects family=
+    # 'binomial' unless a family is named. Every method/kernel applies: the logistic
+    # cumulant scales per trial, so a Binomial fit equals the Bernoulli fit on the
+    # row-expanded data.
     offset=0.0,  # fixed per-row offset (Poisson exposure, etc.)
     prior_variance=1.0,
     estimate_prior_variance=True,
@@ -297,6 +303,7 @@ def fit_glm_susie(
 
         fit_glm_susie(X, y)                          # logistic SuSiE
         fit_glm_susie(X, y, method="localjj")        # classic localjj
+        fit_glm_susie(X, y, trials=n)                # Binomial(n_i, p_i) SuSiE
         fit_glm_susie(X, y, family="poisson",
                       intercept="profiled")          # profiled Poisson SuSiE
         fit_glm_susie(X, y, family=Smoothed(Bernoulli(), GH(5)))  # object escape
@@ -353,8 +360,22 @@ def fit_glm_susie(
         **(PRESETS[method] if method else {}),
         **explicit,
     }
+    family_named = "family" in explicit or (method is not None and "family" in PRESETS[method])
+    if trials is not None and not family_named:
+        cfg["family"] = "binomial"  # trials= means Binomial unless the family is spelled out
 
     response, kernel = _resolve(cfg)
+    base = response.base if isinstance(response, Smoothed) else response
+    if isinstance(base, Binomial) and trials is None:
+        raise ValueError(
+            "family='binomial' needs trials= (per-row trial counts n_i; y_i are the successes)."
+        )
+    if trials is not None and not isinstance(base, Binomial):
+        raise ValueError(
+            f"trials= is the Binomial trial count, but the resolved family is "
+            f"{type(base).__name__}; use family='binomial' (the default when trials= is "
+            f"given) or drop trials=."
+        )
 
     if random_intercept:
         # random_intercept_variance is a scalar sigma^2 (homogeneous, optionally EM-estimated)
@@ -423,7 +444,7 @@ def fit_glm_susie(
                 f"center=False, or densify X."
             )
 
-    data = glm.prep_data(X, y, center=center)
+    data = glm.prep_data(X, y, center=center, n_trials=trials)
     init = (
         glm.initialize_state_mean_message if cfg["_mean_message"] else glm.initialize_state
     )

@@ -73,6 +73,10 @@ class LinearData:
     # Per-observation error variance v_i (Var(y_i) = residual_variance * v_i).
     # None / ones => homoskedastic. Precision weight is tau_i = 1/(sigma^2 v_i).
     obs_variance: Any = None
+    # Binomial trial counts n_i (y_i successes in n_i trials), (n,) or None for a
+    # single-observation family (Bernoulli y in {0,1}, Poisson counts, Gaussian). The GLM
+    # engine packs `(y, n_trials)` as the kernels' observation leaf when set.
+    n_trials: Any = None
     # Pre-centering (unweighted column means), applied ONCE up front. This is a
     # fixed reparameterization -- distinct from the per-iteration *weighted*
     # centering (family_state `center`). For dense X the columns are centered
@@ -103,8 +107,13 @@ def _column_means(X) -> Any:
     return jnp.mean(X, axis=0)
 
 
-def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData:
+def prep_data(
+    X, y, center: bool | None = None, obs_variance=None, n_trials=None
+) -> LinearData:
     """Prepare data for the SER engines.
+
+    `n_trials` (Binomial only): per-row trial counts, (n,) or a scalar broadcast to every
+    row; `y` is then the success count, 0 <= y_i <= n_i. Leave None for every other family.
 
     Pre-centering (default for dense X): center each column by its unweighted
     mean, once. This decouples the shared intercept from the features so the
@@ -134,7 +143,15 @@ def prep_data(X, y, center: bool | None = None, obs_variance=None) -> LinearData
         obs_variance = jnp.ones_like(y)
     else:
         obs_variance = jnp.asarray(obs_variance)
-    return LinearData(X=X, y=y, obs_variance=obs_variance, column_center=column_center)
+    if n_trials is not None:
+        n_trials = jnp.broadcast_to(jnp.asarray(n_trials, dtype=y.dtype), y.shape)
+        if not bool(jnp.all(n_trials > 0)):
+            raise ValueError("n_trials must be positive on every row")
+        if not bool(jnp.all((y >= 0) & (y <= n_trials))):
+            raise ValueError("Binomial response needs 0 <= y_i <= n_trials_i on every row")
+    return LinearData(
+        X=X, y=y, obs_variance=obs_variance, n_trials=n_trials, column_center=column_center
+    )
 
 
 def reject_sparse_precenter(data) -> None:
