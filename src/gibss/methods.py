@@ -24,6 +24,7 @@ from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
 from .response import (
     GH,
+    Adjusted,
     Bernoulli,
     Binomial,
     Compress,
@@ -61,6 +62,10 @@ _SMOOTHERS = {
     "compress_selfnorm": lambda cfg: CompressSelfNorm(M=cfg["compress_degree"]),
     "taylor2": lambda cfg: Taylor(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
+    # adjusted gIBSS: the family's own GLM with response/offset shifted per row to match
+    # the Taylor-smoothed score and curvature at the current predictor (re-anchored each
+    # effect update). Non-quadratic, so it runs in the free-form quad kernel.
+    "adjusted": lambda cfg: Adjusted(),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
     # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).
@@ -100,6 +105,7 @@ PRESETS = {
     # offset integration; the effect b is Gaussian-VI-integrated (glm_vi_gh_ser, plain base).
     "gibss_gaussian": {"variational_family": "gaussian", "offset_integration": "none"},
     "globaljj": {"offset_integration": "jj_fixed"},
+    "adjusted": {"offset_integration": "adjusted"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
         "offset_integration": "taylor_fixed",

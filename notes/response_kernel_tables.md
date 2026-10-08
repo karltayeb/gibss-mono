@@ -63,10 +63,11 @@ JJEnvelope under quad/profile).
 | Smoothed(B, Taylor())    | delta-smoothed (oi="taylor") | profiled delta                | x                    | x              | x              | Gaussian VI, delta (new) | profiled, delta (new) |
 | Smoothed(B, TaylorFixed("update")) [q] | x           | x                                | IRLS (irls module)   | profiled IRLS  | x              | x               | x          |
 | Smoothed(B, TaylorFixed("null")) [q]   | x           | x                                | score mode (new)     | profiled score (new) | x        | x               | x          |
+| Smoothed(B, Adjusted())  | adjusted gIBSS (new): own GLM at y+delta, offset+nu | profiled adjusted (new) | x | x | x | x | x |
 | Smoothed(B, JJEnvelope()) [c] | envelope + GH tail (new, tightest JJ) | profiled envelope (new) | x        | x              | x              | == classic localjj | == centered localjj |
 | Smoothed(B, JJFixed()) [q][c] | x                     | x                                | globaljj (globaljj module) | profiled globaljj | classic localjj | x     | x          |
 
-21/49 valid. Coincidences (parity-tested at <= 1e-7): vi+JJEnvelope == jj+JJFixed
+23/56 valid. Coincidences (parity-tested at <= 1e-7): vi+JJEnvelope == jj+JJFixed
 == localjj_ser(variational=True); vi_profile+JJEnvelope == localjj_centered_ser;
 linear kernels == quad/profile kernels on quadratic responses (the parity tests
 call the permissive kernel functions directly). Every old logistic module has a cell (quadrature_ser,
@@ -81,10 +82,11 @@ cells.
 | Poisson()                | Poisson SuSiE     | profiled Poisson      | x             | x              | x  | x                   | x                    |
 | Smoothed(P, GH(k))       | offset-integrated | profiled + offset-int.| x             | x              | x  | Gaussian VI, GH E_q | profiled Gaussian VI |
 | Smoothed(P, Taylor())    | delta-smoothed    | profiled delta        | x             | x              | x  | Gaussian VI, delta  | profiled, delta      |
+| Smoothed(P, Adjusted())  | == offset-integrated (nu = ov/2, delta = 0) | profiled | x | x | x | x | x |
 | Smoothed(P, TaylorFixed("update")) [q] | x   | x                     | Poisson IRLS  | profiled IRLS  | x  | x                   | x                    |
 | Smoothed(P, TaylorFixed("null")) [q]   | x   | x                     | Poisson score | profiled score | x  | x                   | x                    |
 
-14/25 valid. Notes:
+16/30 valid. Notes:
 - The jj column is STRUCTURALLY empty: A = exp admits no quadratic upper bound
   (outgrows every quadratic), so Poisson has no certified cell at all; a certified
   Poisson ELBO would need a different bound family, not a tilt.

@@ -57,6 +57,7 @@ __all__ = [
     "TaylorFixed",
     "JJEnvelope",
     "JJFixed",
+    "Adjusted",
     "Smoothed",
     "Bernoulli",
     "Binomial",
@@ -1396,6 +1397,91 @@ class TaylorFixed(Smoother):
         ll_s, g_s, w_s = ll0 - hv * w0, g0 - hv * a3, w0 + hv * a4  # smoothed at z
         d = eta - zhat
         return ll_s + g_s * d - 0.5 * w_s * d * d, g_s - w_s * d, w_s
+
+
+@dataclass(frozen=True)
+class Adjusted(Smoother):
+    """Adjusted gIBSS: the offset-smoothed loglik replaced by a GLM of the SAME family with
+    a per-row adjusted response y + delta and offset shift nu,
+
+        y*eta - Atilde(eta)  ~=  (y + delta)*eta - A(eta + nu) + C,
+
+    with (delta, nu, C) chosen so the surrogate matches the 2nd-order Taylor smoothed
+    value, score and curvature at the per-row anchor z: aux = (y, ov, z), z tuned by the
+    engine at the current full predictor (glm.update_row_param_step, like TaylorFixed's
+    "update" anchor). IRLS matches score and Hessian with a quadratic surrogate by moving
+    the response and the weights; this moves the response and the offset and keeps the
+    family's own cumulant. Plain gIBSS is delta = nu = 0.
+
+    Linearizing A''(z + nu) and A'(z + nu) gives a triangular system:
+        nu    = 1/2 ov A''''(z) / A'''(z)       (curvature)
+        delta = A''(z) nu - 1/2 ov A'''(z)      (score)
+    Gaussian: A''' = A'''' = 0, so nu = delta = 0 (plain gIBSS, already exact).
+    Poisson: A'' = A''' = A'''' = e^z, so nu = ov/2 and delta = 0 -- the score and
+    curvature of the smoothed cumulant E_o e^(eta + o) = e^(eta + ov/2) at EVERY eta, not
+    just the anchor, so the per-feature posteriors equal the GH-smoothed fit.
+
+    The ratio A''''/A''' has a pole wherever A''' changes sign with A'''' != 0 (logistic at
+    p = 1/2: the curvature A'' peaks there and no offset shift raises it). The
+    linearization behind nu holds only while the linear term of
+    A''(z + nu) = A'' + A''' nu + 1/2 A'''' nu^2 dominates the quadratic one, i.e.
+    |nu| <= 2|A'''/A''''|, so nu is clipped to that interval:
+
+        nu = 1/2 ov A''' A'''' / max(A'''^2, 1/4 A''''^2 ov).
+
+    The clip is continuous through A''' = 0 (nu -> 0 there: plain gIBSS on that row, with
+    the curvature off by 1/2 A'''' ov), bounded by |nu| <= sqrt(ov), and 0/0 -> 0 covers a
+    quadratic cumulant. Poisson is never clipped while ov <= 4. delta always uses the
+    clipped nu, so the score matches to first order on every row. The constant C makes
+    the value at the anchor equal the Taylor value L(z) - 1/2 ov A''(z) exactly (for
+    Poisson that per-row constant keeps the Taylor value's O(ov^2) error; the posterior
+    and alpha do not see it).
+
+    The surrogate weight is the family's own A''(eta + nu) >= 0, so unlike Taylor /
+    TaylorFixed the per-feature fit stays log-concave at any ov (convex). Not a bound.
+    Requires an ExponentialFamily base (closed-form A''', A'''').
+    """
+
+    takes_row_param = True
+
+    def validate(self, base):
+        if not isinstance(base, ExponentialFamily):
+            raise TypeError(
+                f"Adjusted needs an ExponentialFamily base (closed-form A''', A''''); "
+                f"{type(base).__name__} returns a majorized/custom weight -- "
+                f"use GH instead."
+            )
+
+    def row_param(self, effect_mean, effect_var, base):
+        return jnp.asarray(effect_mean) + base
+
+    @staticmethod
+    def adjustment(base, zhat, ov):
+        """Per-unit `(delta, nu)` at anchor `zhat` for offset variance `ov` (multiply
+        `delta` by the per-row cumulant scale, e.g. the Binomial trial count)."""
+        a2 = base.cumulant_terms(zhat)[2]
+        a3, a4 = base.cumulant_derivs(zhat)
+        ov = jnp.maximum(jnp.asarray(ov), 0.0)
+        hv = 0.5 * ov
+        den = jnp.maximum(a3 * a3, 0.25 * a4 * a4 * ov)
+        pos = den > 0.0
+        nu = jnp.where(pos, hv * a3 * a4 / jnp.where(pos, den, 1.0), 0.0)
+        return a2 * nu - hv * a3, nu
+
+    def terms(self, base, eta, aux):
+        y, ov, zhat = aux
+        _, scale = base.unpack(y)
+        delta, nu = self.adjustment(base, zhat, ov)
+        delta = scale * delta
+        ll0, _, w0 = base.terms(zhat, y)
+        ll_shift = base.terms(zhat + nu, y)[0]
+        ll, g, w = base.terms(eta + nu, y)
+        # C: the surrogate's value at the anchor is the Taylor value L(z) - 1/2 ov A''(z)
+        # exactly. A first-order match (C = -L'(z) nu - ...) leaves 1/2 A'' nu^2 per row,
+        # which is O(ov) inside the clip band and biased the absolute log marginal by a
+        # few tenths of a nat at n = 600.
+        const = ll0 - ll_shift - 0.5 * jnp.asarray(ov) * w0
+        return ll + delta * (eta - zhat) + const, g + delta, w
 
 
 class _JJBase(Smoother):
