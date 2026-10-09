@@ -69,7 +69,7 @@ from jax.ops import segment_sum
 from jax.scipy.special import logsumexp
 
 from .cf_offset import _is_binary_design
-from .response import Poisson, ResponseModel, Smoother
+from .response import Poisson, ResponseModel, Smoother, log_link_shift_sums
 
 __all__ = [
     "log_kappa_dense",
@@ -573,6 +573,11 @@ class PoissonLogNormalOffset(Smoother):
         y, logk = aux
         return _poisson_terms(y, eta, logk)
 
+    def shift_sums(self, base, offset, aux, op=None):
+        """Log-link row sums at a common shift, closed form (`log_link_shift_sums`)."""
+        y, logk = aux
+        return log_link_shift_sums(y, offset, offset + logk, cap=_LOGRATE_CAP, op=op)
+
 
 @dataclass(frozen=True)
 class PoissonSelfNormOffset(Smoother):
@@ -657,6 +662,11 @@ class PoissonSelfNormOffset(Smoother):
         only the `logkappa` builder (node MGF vs Gaussian-mixture MGF) differs."""
         y, logk = aux
         return _poisson_terms(y, eta, logk)
+
+    def shift_sums(self, base, offset, aux, op=None):
+        """Log-link row sums at a common shift, closed form (`log_link_shift_sums`)."""
+        y, logk = aux
+        return log_link_shift_sums(y, offset, offset + logk, cap=_LOGRATE_CAP, op=op)
 
 
 # --------------------------------------------------------------------------------------

@@ -114,6 +114,20 @@ class ResponseModel:
         fold the y-free cumulant (MixtureGH / SelfNormQuad inside the Compress builders)."""
         return _tmap(jnp.zeros_like, template)
 
+    def shift_sums(self, offset, aux, op=None):
+        """Closed form for the row sums at a common shift, if the family has one.
+
+        Returns a function `s -> (sum_i weight, sum_i grad, sum_i loglik)` evaluated at
+        `eta_i = offset_i + s` (any shape of `s`, summed over rows i only), built from
+        O(n) work done once; or None, in which case callers sum or interpolate over rows
+        (`response_ser._background`). A log-link family factors `e^{offset_i + s} =
+        e^s e^{offset_i}`, so its sums are a few row-independent scalars.
+
+        With a design operator `op`, the sums run over the OFF-support rows of each column
+        j (rows with x_ij = 0) and `s` is per column, shape (..., p): the fill-in of a
+        sparse centered fit, without touching the support entries."""
+        return None
+
 
 class ExponentialFamily(ResponseModel):
     """Canonical-link exponential-family GLM: `loglik = aux*eta - A(eta)` (up to an
@@ -187,6 +201,10 @@ class Smoother:
 
     def terms(self, base, eta, aux):
         raise NotImplementedError
+
+    def shift_sums(self, base, offset, aux, op=None):
+        """`ResponseModel.shift_sums` for `Smoothed(base, self)`; None = no closed form."""
+        return None
 
 
 @dataclass(frozen=True)
@@ -1500,6 +1518,9 @@ class Smoothed(ResponseModel):
     def terms(self, eta, aux):
         return self.smoother.terms(self.base, eta, aux)
 
+    def shift_sums(self, offset, aux, op=None):
+        return self.smoother.shift_sums(self.base, offset, aux, op)
+
 
 @dataclass(frozen=True)
 class Bernoulli(ExponentialFamily):
@@ -1576,6 +1597,37 @@ class Poisson(ExponentialFamily):
     def cumulant_derivs(self, eta):
         lam = jnp.exp(eta)
         return lam, lam  # A''' = A'''' = exp(eta)
+
+    def shift_sums(self, offset, aux, op=None):
+        return log_link_shift_sums(aux, offset, offset, op=op)
+
+
+def log_link_shift_sums(y, offset, log_rate, cap=None, op=None):
+    """`s -> (sum_i rate_i, sum_i (y_i - rate_i), sum_i (y_i (offset_i + s) - rate_i))` with
+    `rate_i = e^{log_rate_i + s}`: the log-link row sums in closed form, from the three
+    totals `sum_i e^{log_rate_i}`, `sum_i y_i`, `sum_i y_i offset_i`. `cap`, if given, caps
+    the log of the summed rate (the offset smoothers' overflow guard).
+
+    With `op`, each total is restricted to the off-support rows of column j (all rows
+    minus `op.local_moment(0, .)` over the support), so the sums are per column (p,)."""
+    y = jnp.asarray(y)
+    offset = jnp.broadcast_to(jnp.asarray(offset), y.shape)
+    log_rate = jnp.broadcast_to(jnp.asarray(log_rate), y.shape)
+    top = jnp.max(log_rate)
+    k = jnp.exp(log_rate - top)  # scaled rates, no overflow
+    K, Y, YO = jnp.sum(k), jnp.sum(y), jnp.sum(y * offset)
+    if op is not None:
+        K = jnp.maximum(K - op.local_moment(0, op.broadcast_rows(k)), 0.0)
+        Y = Y - op.local_moment(0, op.broadcast_rows(y))
+        YO = YO - op.local_moment(0, op.broadcast_rows(y * offset))
+    logK = top + jnp.log(jnp.maximum(K, 1e-300))
+
+    def at(s):
+        z = logK + s
+        rate = jnp.where(K > 0.0, jnp.exp(z if cap is None else jnp.minimum(z, cap)), 0.0)
+        return rate, Y - rate, YO + s * Y - rate
+
+    return at
 
 
 @dataclass(frozen=True)

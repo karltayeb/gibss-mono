@@ -213,10 +213,17 @@ def _background(response, offset, aux, c, mode: str = "exact", degree: int = 40)
     it is shared across features/nodes. `mode="exact"` sums directly O(n*p); "chebyshev"
     fits a 1-D surrogate of c -> sum_i f(offset_i + c) once (O(n*D)) then evaluates at c
     (O(D*p)) -- the win when the intercept is re-profiled per feature/node on sparse.
+    A response with a closed form for these sums (`ResponseModel.shift_sums`, e.g. the
+    log link, where `e^{offset_i + c}` factors) uses it regardless of `mode`: exact, and
+    O(n) once plus O(1) per c.
     """
     offset = jnp.asarray(offset)
     aux = _tmap(jnp.asarray, aux)
     c = jnp.asarray(c)
+    shift_sums = getattr(response, "shift_sums", None)  # a _TermsView has none
+    closed = shift_sums(offset, aux, None) if shift_sums is not None else None
+    if closed is not None:
+        return closed(c)
     if mode == "chebyshev":
         xnodes_np, P_np = _cheb_fit_matrix(degree)
         xnodes, P = jnp.asarray(xnodes_np), jnp.asarray(P_np)
@@ -1560,29 +1567,39 @@ def _glm_center_ser_impl(
     xc_e = x_e - c_e  # (x_ij - c_j) at support entries
     inv_pv = 1.0 / prior_variance
 
+    # Off-support fill-in per column j at shift s_j = -c_j b: rows with x_ij = 0 sit at
+    # offset + s_j. A family with closed-form shifted sums (`ResponseModel.shift_sums`,
+    # the log link) gives them directly, exact and O(p) per call. Otherwise: the all-rows
+    # `_background` sum minus the support rows re-evaluated at the shift (O(nnz)).
+    shift_sums = getattr(response, "shift_sums", None)
+    off_sums = shift_sums(offset, aux, op) if shift_sums is not None else None
+
     def _bg(s):
         return _background(response, offset, aux, s, background, degree)
 
+    def _off_support(b, which):
+        """Off-support (weight, grad, loglik) sums per column at b, (..., p); `which`
+        selects the entries needed (the generic path skips evaluating the rest)."""
+        if off_sums is not None:
+            return off_sums(-c * b)
+        b_e = op.broadcast_cols(b)
+        terms_bg = response.terms(off_e - c_e * b_e, aux_e)  # support rows at the shift
+        bg = _bg(-c * b)
+        out = [None, None, None]
+        for k in which:
+            # _background returns (w, g, ll); terms returns (ll, g, w)
+            out[k] = bg[k] - op.local_moment(0, terms_bg[2 - k])
+        return tuple(out)
+
     def _grad_curv(b):
         # exact all-rows score/curvature of the centered single-effect fit: support
-        # entries carry (x_ij - c_j); the off-support fill-in is (-c_j)^k [B - support].
+        # entries carry (x_ij - c_j); the off-support fill-in is (-c_j)^k [off sums].
         b_e = op.broadcast_cols(b)
-        s = -c * b  # (p,) off-support scalar shift
         eta_e = off_e + xc_e * b_e  # support predictor
-        eta_bg_e = off_e - c_e * b_e  # offset + s at support rows (correction)
         _, g_e, w_e = response.terms(eta_e, aux_e)
-        _, g_bg_e, w_bg_e = response.terms(eta_bg_e, aux_e)
-        BGw, BGg, _ = _bg(s)
-        grad = (
-            op.local_moment(0, xc_e * g_e)
-            - c * (BGg - op.local_moment(0, g_bg_e))
-            - inv_pv * b
-        )
-        curv = (
-            op.local_moment(0, xc_e**2 * w_e)
-            + c**2 * (BGw - op.local_moment(0, w_bg_e))
-            + inv_pv
-        )
+        OFFw, OFFg, _ = _off_support(b, (0, 1))
+        grad = op.local_moment(0, xc_e * g_e) - c * OFFg - inv_pv * b
+        curv = op.local_moment(0, xc_e**2 * w_e) + c**2 * OFFw + inv_pv
         return grad, curv
 
     def body(state):
@@ -1606,13 +1623,17 @@ def _glm_center_ser_impl(
     nodes_np, log_w_np = _gh_rule(order)
     nodes, log_w = jnp.asarray(nodes_np), jnp.asarray(log_w_np)
     b_nodes = b[None, :] + jnp.sqrt(2.0) * sigma[None, :] * nodes[:, None]  # (order, p)
-    _, _, BGll = _bg(-c[None, :] * b_nodes)  # (order, p) background loglik per node
+    if off_sums is not None:
+        OFFll = off_sums(-c[None, :] * b_nodes)[2]  # (order, p) off-support loglik
+    else:
+        OFFll = _bg(-c[None, :] * b_nodes)[2]  # all-rows; support rows removed per node
 
-    def node_term(node, lw, bb, bgll):
+    def node_term(node, lw, bb, offll):
         b_e = op.broadcast_cols(bb)
         ll_e = response.terms(off_e + xc_e * b_e, aux_e)[0]
-        ll_bg_e = response.terms(off_e - c_e * b_e, aux_e)[0]
-        ll_all = op.local_moment(0, ll_e) + (bgll - op.local_moment(0, ll_bg_e))
+        if off_sums is None:
+            offll = offll - op.local_moment(0, response.terms(off_e - c_e * b_e, aux_e)[0])
+        ll_all = op.local_moment(0, ll_e) + offll
         dll = ll_all - ll_null  # node loglik relative to the b=0 fit at offset
         logint = (
             lw
@@ -1623,7 +1644,7 @@ def _glm_center_ser_impl(
         )
         return logint, dll
 
-    logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, BGll)
+    logint, dll_nodes = jax.vmap(node_term)(nodes, log_w, b_nodes, OFFll)
     mu, var, log_bf, coefficient_kl = _posterior_moments(logint, b_nodes, dll_nodes)
     var = _laplace_var_at_order_one(var, curv, order)
     return mu, var, log_bf, coefficient_kl, b_nodes, logint

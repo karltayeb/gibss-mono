@@ -46,7 +46,13 @@ from gibss.poisson_offset import (
     log_kappa_sparse,
 )
 from gibss.response import GH, Bernoulli, CompressSelfNorm, Poisson, Smoothed
-from gibss.response_ser import glm_vi_gh_center_ser, glm_vi_gh_ser
+from gibss.response_ser import (
+    _background,
+    _TermsView,
+    glm_center_ser_nodes,
+    glm_vi_gh_center_ser,
+    glm_vi_gh_ser,
+)
 
 
 def _poisson_data(rng, n, p, idx, val, b0=0.2):
@@ -899,3 +905,60 @@ def test_poisson_vi_gh_routes_to_closed_form_kernel():
     assert got[1] is logk
     assert _poisson_vi_aux(Bernoulli(), y) is None
     assert _poisson_vi_aux(Smoothed(Poisson(), GH()), (y, logk)) is None
+
+
+# ------------------------------------------------- closed-form shifted sums (log link)
+_LOG_LINK = [
+    (Poisson(), False),
+    (Smoothed(Poisson(), PoissonSelfNormOffset()), True),
+    (Smoothed(Poisson(), PoissonLogNormalOffset()), True),
+]
+
+
+@pytest.mark.parametrize("response, smoothed", _LOG_LINK)
+def test_shift_sums_match_row_sums(response, smoothed):
+    """`shift_sums` (e^{offset_i + s} = e^s e^{offset_i}) equals the brute row sums of
+    `terms` at offset + s: over all rows (what `_background` returns for any mode), and
+    per column over the OFF-support rows of a sparse design (the centered fill-in)."""
+    rng = np.random.default_rng(91)
+    n, p = 60, 12
+    y = jnp.asarray(rng.poisson(2.0, n), float)
+    off = jnp.asarray(rng.normal(0.0, 1.0, n))
+    aux = (y, jnp.asarray(rng.gamma(1.0, 0.2, n))) if smoothed else y
+    s = jnp.asarray(rng.normal(0.0, 2.0, (5, p)))
+    brute = _background(_TermsView(response.terms), off, aux, s, "exact")
+    for mode in ("exact", "chebyshev"):
+        got = _background(response, off, aux, s, mode)
+        for a, b in zip(got, brute):
+            assert np.max(np.abs(np.asarray(a - b)) / (1 + np.abs(np.asarray(b)))) < 1e-12
+    Xd = (rng.uniform(size=(n, p)) < 0.3) * rng.gamma(2.0, 1.0, (n, p))
+    op = as_operator(jsp.BCOO.fromdense(jnp.asarray(Xd)))
+    got = response.shift_sums(off, aux, op)(s)
+    eta = np.asarray(off)[:, None, None] + np.asarray(s)[None]  # (n, 5, p)
+    aux_b = jax.tree.map(lambda a: jnp.asarray(a)[:, None, None], aux)
+    ll, g, w = (np.asarray(t) for t in response.terms(jnp.asarray(eta), aux_b))
+    offm = (Xd == 0)[:, None, :]
+    for a, b in zip(got, ((w * offm).sum(0), (g * offm).sum(0), (ll * offm).sum(0))):
+        assert np.max(np.abs(np.asarray(a) - b) / (1 + np.abs(b))) < 1e-12
+
+
+def test_centered_quad_kernel_closed_form_matches_exact_background():
+    """The sparse-centered quad kernel on Poisson uses the closed-form off-support sums (no
+    second support pass, no Chebyshev); it equals the generic path run with an EXACT
+    all-rows background (a response view without the hook)."""
+    rng = np.random.default_rng(92)
+    n, p = 200, 25
+    Xd = (rng.uniform(size=(n, p)) < 0.2) * rng.gamma(2.0, 0.8, (n, p))
+    y = jnp.asarray(rng.poisson(np.exp(0.2 + 0.4 * Xd[:, 0])), float)
+    off = jnp.asarray(rng.normal(0.0, 0.3, n))
+    op = as_operator(jsp.BCOO.fromdense(jnp.asarray(Xd)))
+    c = jnp.asarray(Xd.mean(0))
+
+    class NoHook(Poisson):  # same terms, no closed form -> generic path
+        def shift_sums(self, offset, aux, op=None):
+            return None
+
+    got = glm_center_ser_nodes(op, y, off, c, 1.0, Poisson(), order=15)
+    ref = glm_center_ser_nodes(op, y, off, c, 1.0, NoHook(), order=15, background="exact")
+    for a, b in zip(got, ref):
+        assert np.max(np.abs(np.asarray(a) - np.asarray(b)) / (1 + np.abs(np.asarray(b)))) < 1e-10
