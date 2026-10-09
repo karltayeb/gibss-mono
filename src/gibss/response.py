@@ -132,6 +132,10 @@ class ExponentialFamily(ResponseModel):
         """(A'''(eta), A''''(eta)) -- 3rd/4th derivatives of the cumulant A."""
         raise NotImplementedError
 
+    def cumulant_deriv5(self, eta):
+        """A^(5)(eta) -- needed only by Adjusted's third-derivative condition."""
+        raise NotImplementedError
+
 
 def _jj_lambda(xi):
     """JJ curvature lambda(xi) = tanh(xi/2)/(4 xi), safely -> 1/8 as xi -> 0."""
@@ -1399,50 +1403,88 @@ class TaylorFixed(Smoother):
         return ll_s + g_s * d - 0.5 * w_s * d * d, g_s - w_s * d, w_s
 
 
+def _matched_shift(lo, hi, ov):
+    """Offset shift nu solving the linearized condition `lo * nu = 1/2 ov hi`, clipped to
+    |nu| <= 2|lo/hi| (where the linear term of the Taylor step dominates the quadratic
+    one): `nu = 1/2 ov lo hi / max(lo^2, 1/4 hi^2 ov)`, with 0/0 -> 0."""
+    den = jnp.maximum(lo * lo, 0.25 * hi * hi * ov)
+    pos = den > 0.0
+    return jnp.where(pos, 0.5 * ov * lo * hi / jnp.where(pos, den, 1.0), 0.0)
+
+
 @dataclass(frozen=True)
 class Adjusted(Smoother):
     """Adjusted gIBSS: the offset-smoothed loglik replaced by a GLM of the SAME family with
-    a per-row adjusted response y + delta and offset shift nu,
+    a per-row data shift delta, offset shift nu and ridge kappa about the anchor z,
 
-        y*eta - Atilde(eta)  ~=  (y + delta)*eta - A(eta + nu) + C,
+        y*eta - Atilde(eta)  ~=  (y + delta)*eta - A(eta + nu) - kappa (eta - z)^2 + C,
 
-    with (delta, nu, C) chosen so the surrogate matches the 2nd-order Taylor smoothed
-    value, score and curvature at the per-row anchor z: aux = (y, ov, z), z tuned by the
-    engine at the current full predictor (glm.update_row_param_step, like TaylorFixed's
-    "update" anchor). IRLS matches score and Hessian with a quadratic surrogate by moving
-    the response and the weights; this moves the response and the offset and keeps the
-    family's own cumulant. Plain gIBSS is delta = nu = 0.
+    tuned so the surrogate matches the 2nd-order Taylor smoothed loglik
+    (Atilde^(k) ~= A^(k) + 1/2 ov A^(k+2)) at z: aux = (y, ov, z), z tuned by the engine at
+    the current full predictor (glm.update_row_param_step, like TaylorFixed's "update"
+    anchor). IRLS matches score and Hessian with a quadratic surrogate by moving the
+    response and the weights; this keeps the family's own cumulant. The flags `data`,
+    `offset`, `ridge` switch delta, nu, kappa on; all off is plain gIBSS.
 
-    Linearizing A''(z + nu) and A'(z + nu) gives a triangular system:
-        nu    = 1/2 ov A''''(z) / A'''(z)       (curvature)
-        delta = A''(z) nu - 1/2 ov A'''(z)      (score)
-    Gaussian: A''' = A'''' = 0, so nu = delta = 0 (plain gIBSS, already exact).
-    Poisson: A'' = A''' = A'''' = e^z, so nu = ov/2 and delta = 0 -- the score and
-    curvature of the smoothed cumulant E_o e^(eta + o) = e^(eta + ov/2) at EVERY eta, not
-    just the anchor, so the per-feature posteriors equal the GH-smoothed fit.
+    Each switched-on parameter takes one matching condition, lowest order first: delta
+    the score, kappa the curvature (neither touches the higher derivatives), and nu the
+    lowest condition left over -- the score if `data` is off, else the curvature if
+    `ridge` is off, else the THIRD derivative. Matching derivative k with nu, linearized,
+    is A^(k+1)(z) nu = 1/2 ov A^(k+2)(z); delta and kappa then absorb the score and
+    curvature residuals left by nu:
+        delta = A'' nu - 1/2 ov A'''              (score)
+        kappa = 1/2 (1/2 ov A'''' - A''' nu)       (curvature)
 
-    The ratio A''''/A''' has a pole wherever A''' changes sign with A'''' != 0 (logistic at
-    p = 1/2: the curvature A'' peaks there and no offset shift raises it). The
-    linearization behind nu holds only while the linear term of
-    A''(z + nu) = A'' + A''' nu + 1/2 A'''' nu^2 dominates the quadratic one, i.e.
-    |nu| <= 2|A'''/A''''|, so nu is clipped to that interval:
+      (data, offset, ridge)   nu matches   pole of nu        convex
+      (1, 0, 0)               -            -                 yes
+      (0, 1, 0)               score        none (A'' > 0)    yes
+      (1, 1, 0)  [default]    curvature    A''' = 0          yes
+      (1, 0, 1)               -            -                 no
+      (0, 1, 1)               score        none (A'' > 0)    no
+      (1, 1, 1)               3rd deriv.   A'''' = 0         no
 
-        nu = 1/2 ov A''' A'''' / max(A'''^2, 1/4 A''''^2 ov).
+    Gaussian: A''' = A'''' = A^(5) = 0, so every case is plain gIBSS (already exact).
+    Poisson: every derivative is e^z, so nu = ov/2 and delta = kappa = 0 in every case
+    with the offset on -- the score and curvature of E_o e^(eta + o) = e^(eta + ov/2) at
+    EVERY eta, not just the anchor, so the per-feature posteriors equal the GH-smoothed
+    fit.
 
-    The clip is continuous through A''' = 0 (nu -> 0 there: plain gIBSS on that row, with
-    the curvature off by 1/2 A'''' ov), bounded by |nu| <= sqrt(ov), and 0/0 -> 0 covers a
-    quadratic cumulant. Poisson is never clipped while ov <= 4. delta always uses the
-    clipped nu, so the score matches to first order on every row. The constant C makes
-    the value at the anchor equal the Taylor value L(z) - 1/2 ov A''(z) exactly (for
-    Poisson that per-row constant keeps the Taylor value's O(ov^2) error; the posterior
-    and alpha do not see it).
+    Poles: the ratio A^(k+2)/A^(k+1) blows up where A^(k+1) changes sign (logistic:
+    A''' = 0 at p = 1/2, A'''' = 0 at p ~ 0.21, 0.79). The linearization behind nu holds
+    only while the linear term of A^(k)(z + nu) = A^(k) + A^(k+1) nu + 1/2 A^(k+2) nu^2
+    dominates the quadratic one, i.e. |nu| <= 2|A^(k+1)/A^(k+2)|, so nu is clipped there:
 
-    The surrogate weight is the family's own A''(eta + nu) >= 0, so unlike Taylor /
-    TaylorFixed the per-feature fit stays log-concave at any ov (convex). Not a bound.
-    Requires an ExponentialFamily base (closed-form A''', A'''').
+        nu = 1/2 ov A^(k+1) A^(k+2) / max(A^(k+1)^2, 1/4 A^(k+2)^2 ov).
+
+    The clip is continuous through the pole (nu = 0 there), bounded by |nu| <= sqrt(ov),
+    and 0/0 -> 0 covers a quadratic cumulant; Poisson is never clipped while ov <= 4.
+    delta and kappa always use the clipped nu, so the score and curvature still match to
+    first order. The constant C makes the value at the anchor equal the Taylor value
+    L(z) - 1/2 ov A''(z) exactly (for Poisson that per-row constant keeps the Taylor
+    value's O(ov^2) error; the posterior and alpha do not see it).
+
+    Without the ridge the surrogate weight is the family's own A''(eta + nu) >= 0, so the
+    per-feature fit stays log-concave at any ov. The ridge adds 2 kappa, negative wherever
+    smoothing flattens the cumulant (logistic near p = 1/2), so like Taylor the weight can
+    turn negative at large ov (convex False). Not a bound. Requires an ExponentialFamily
+    base; (1, 1, 1) also needs its 5th cumulant derivative.
     """
 
+    data: bool = True
+    offset: bool = True
+    ridge: bool = False
     takes_row_param = True
+
+    @property
+    def convex(self):
+        return not self.ridge
+
+    @property
+    def nu_order(self):
+        """Derivative order nu matches (1 score, 2 curvature, 3 third); 0 = no shift."""
+        if not self.offset:
+            return 0
+        return 1 if not self.data else (2 if not self.ridge else 3)
 
     def validate(self, base):
         if not isinstance(base, ExponentialFamily):
@@ -1451,28 +1493,44 @@ class Adjusted(Smoother):
                 f"{type(base).__name__} returns a majorized/custom weight -- "
                 f"use GH instead."
             )
+        if self.nu_order == 3:
+            try:
+                base.cumulant_deriv5(jnp.zeros(()))
+            except NotImplementedError:
+                raise TypeError(
+                    f"Adjusted(data, offset, ridge) matches the third derivative and "
+                    f"needs A^(5); {type(base).__name__} does not supply cumulant_deriv5."
+                ) from None
 
     def row_param(self, effect_mean, effect_var, base):
         return jnp.asarray(effect_mean) + base
 
-    @staticmethod
-    def adjustment(base, zhat, ov):
-        """Per-unit `(delta, nu)` at anchor `zhat` for offset variance `ov` (multiply
-        `delta` by the per-row cumulant scale, e.g. the Binomial trial count)."""
+    def adjustment(self, base, zhat, ov):
+        """Per-unit `(delta, nu, kappa)` at anchor `zhat` for offset variance `ov`
+        (multiply `delta` and `kappa` by the per-row cumulant scale, e.g. the Binomial
+        trial count)."""
+        ov = jnp.maximum(jnp.asarray(ov), 0.0)
         a2 = base.cumulant_terms(zhat)[2]
         a3, a4 = base.cumulant_derivs(zhat)
-        ov = jnp.maximum(jnp.asarray(ov), 0.0)
-        hv = 0.5 * ov
-        den = jnp.maximum(a3 * a3, 0.25 * a4 * a4 * ov)
-        pos = den > 0.0
-        nu = jnp.where(pos, hv * a3 * a4 / jnp.where(pos, den, 1.0), 0.0)
-        return a2 * nu - hv * a3, nu
+        k = self.nu_order
+        if k == 0:
+            nu = jnp.zeros_like(a2 * ov)
+        elif k == 1:
+            nu = _matched_shift(a2, a3, ov)
+        elif k == 2:
+            nu = _matched_shift(a3, a4, ov)
+        else:
+            nu = _matched_shift(a4, base.cumulant_deriv5(zhat), ov)
+        zero = jnp.zeros_like(nu)
+        delta = a2 * nu - 0.5 * ov * a3 if self.data else zero
+        kappa = 0.5 * (0.5 * ov * a4 - a3 * nu) if self.ridge else zero
+        return delta, nu, kappa
 
     def terms(self, base, eta, aux):
         y, ov, zhat = aux
         _, scale = base.unpack(y)
-        delta, nu = self.adjustment(base, zhat, ov)
-        delta = scale * delta
+        delta, nu, kappa = self.adjustment(base, zhat, ov)
+        delta, kappa = scale * delta, scale * kappa
         ll0, _, w0 = base.terms(zhat, y)
         ll_shift = base.terms(zhat + nu, y)[0]
         ll, g, w = base.terms(eta + nu, y)
@@ -1481,7 +1539,12 @@ class Adjusted(Smoother):
         # which is O(ov) inside the clip band and biased the absolute log marginal by a
         # few tenths of a nat at n = 600.
         const = ll0 - ll_shift - 0.5 * jnp.asarray(ov) * w0
-        return ll + delta * (eta - zhat) + const, g + delta, w
+        d = eta - zhat
+        return (
+            ll + delta * d - kappa * d * d + const,
+            g + delta - 2.0 * kappa * d,
+            w + 2.0 * kappa,
+        )
 
 
 class _JJBase(Smoother):
@@ -1600,6 +1663,11 @@ class Bernoulli(ExponentialFamily):
         v = s * (1.0 - s)
         return v * (1.0 - 2.0 * s), v * (1.0 - 6.0 * v)  # A''', A''''
 
+    def cumulant_deriv5(self, eta):
+        s = jax.nn.sigmoid(eta)
+        v = s * (1.0 - s)
+        return v * (1.0 - 2.0 * s) * (1.0 - 12.0 * v)
+
 
 @dataclass(frozen=True)
 class Binomial(Bernoulli):
@@ -1663,6 +1731,9 @@ class Poisson(ExponentialFamily):
         lam = jnp.exp(eta)
         return lam, lam  # A''' = A'''' = exp(eta)
 
+    def cumulant_deriv5(self, eta):
+        return jnp.exp(eta)
+
 
 @dataclass(frozen=True)
 class Gaussian(ExponentialFamily):
@@ -1685,3 +1756,6 @@ class Gaussian(ExponentialFamily):
     def cumulant_derivs(self, eta):
         z = jnp.zeros_like(eta)
         return z, z  # cumulant is quadratic: A''' = A'''' = 0
+
+    def cumulant_deriv5(self, eta):
+        return jnp.zeros_like(eta)

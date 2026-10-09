@@ -63,7 +63,7 @@ JJEnvelope under quad/profile).
 | Smoothed(B, Taylor())    | delta-smoothed (oi="taylor") | profiled delta                | x                    | x              | x              | Gaussian VI, delta (new) | profiled, delta (new) |
 | Smoothed(B, TaylorFixed("update")) [q] | x           | x                                | IRLS (irls module)   | profiled IRLS  | x              | x               | x          |
 | Smoothed(B, TaylorFixed("null")) [q]   | x           | x                                | score mode (new)     | profiled score (new) | x        | x               | x          |
-| Smoothed(B, Adjusted())  | adjusted gIBSS (new): own GLM at y+delta, offset+nu | profiled adjusted (new) | x | x | x | x | x |
+| Smoothed(B, Adjusted(d, o, r)) | adjusted gIBSS (new): own GLM at y+delta, offset+nu, ridge kappa; 6 cases (adjusted_d/o/do/dr/or/dor) | profiled adjusted (new) | x | x | x | x | x |
 | Smoothed(B, JJEnvelope()) [c] | envelope + GH tail (new, tightest JJ) | profiled envelope (new) | x        | x              | x              | == classic localjj | == centered localjj |
 | Smoothed(B, JJFixed()) [q][c] | x                     | x                                | globaljj (globaljj module) | profiled globaljj | classic localjj | x     | x          |
 
@@ -82,7 +82,7 @@ cells.
 | Poisson()                | Poisson SuSiE     | profiled Poisson      | x             | x              | x  | x                   | x                    |
 | Smoothed(P, GH(k))       | offset-integrated | profiled + offset-int.| x             | x              | x  | Gaussian VI, GH E_q | profiled Gaussian VI |
 | Smoothed(P, Taylor())    | delta-smoothed    | profiled delta        | x             | x              | x  | Gaussian VI, delta  | profiled, delta      |
-| Smoothed(P, Adjusted())  | == offset-integrated (nu = ov/2, delta = 0) | profiled | x | x | x | x | x |
+| Smoothed(P, Adjusted(d, o, r)) | == offset-integrated whenever o is on (nu = ov/2, delta = kappa = 0) | profiled | x | x | x | x | x |
 | Smoothed(P, TaylorFixed("update")) [q] | x   | x                     | Poisson IRLS  | profiled IRLS  | x  | x                   | x                    |
 | Smoothed(P, TaylorFixed("null")) [q]   | x   | x                     | Poisson score | profiled score | x  | x                   | x                    |
 

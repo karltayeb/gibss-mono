@@ -82,7 +82,7 @@ def test_logistic_pole_clipped_continuous_and_bounded(ov):
     """A''' = 0 at z = 0 with A'''' = -1/8: the raw ratio has a pole there. The clipped nu
     is finite, bounded by sqrt(ov), exactly 0 at the pole, and continuous through it."""
     z = jnp.linspace(-1.0, 1.0, 20001)  # contains z = 0 exactly
-    delta, nu = Adjusted.adjustment(Bernoulli(), z, ov)
+    delta, nu, _ = Adjusted().adjustment(Bernoulli(), z, ov)
     nu, delta = np.asarray(nu), np.asarray(delta)
     assert np.all(np.isfinite(nu)) and np.all(np.isfinite(delta))
     assert np.max(np.abs(nu)) <= np.sqrt(ov) * (1 + 1e-12)
@@ -93,7 +93,7 @@ def test_logistic_pole_clipped_continuous_and_bounded(ov):
 
 def test_quadratic_cumulant_gives_zero_adjustment():
     z = jnp.linspace(-3, 3, 11)
-    delta, nu = Adjusted.adjustment(Gaussian(), z, 0.5)  # A''' = A'''' = 0: 0/0 -> 0
+    delta, nu, _ = Adjusted().adjustment(Gaussian(), z, 0.5)  # A''' = A'''' = 0: 0/0 -> 0
     assert np.all(np.asarray(nu) == 0.0) and np.all(np.asarray(delta) == 0.0)
 
 
@@ -164,3 +164,126 @@ def test_logistic_closer_to_exact_cavi_than_gibss(seed):
     lm_a, pip_a = gaps(out["adjusted"])
     assert lm_a < 0.25 * lm_g
     assert pip_a <= pip_g + 1e-3
+
+
+# ---- the six (data, offset, ridge) cases ----------------------------------------------
+
+_CASES = [
+    (True, False, False),
+    (False, True, False),
+    (True, True, False),
+    (True, False, True),
+    (False, True, True),
+    (True, True, True),
+]
+
+
+@pytest.mark.parametrize("flags", _CASES)
+def test_case_matches_its_conditions_to_second_order(flags):
+    """Each switched-on parameter takes one condition (delta: score, kappa: curvature, nu:
+    the lowest one left). At the anchor the value is the Taylor value exactly, and every
+    matched derivative agrees with the Taylor target up to O(ov^2): halving ov quarters
+    the error. Off the clip bands (z = 1.5 keeps p away from 1/2, 0.21 and 0.79)."""
+    import jax
+
+    sm = Adjusted(*flags)
+    base = Bernoulli()
+    z = jnp.asarray([1.5, 1.5])
+    y = jnp.asarray([0.0, 1.0])
+    matched = set()
+    if sm.data:
+        matched.add(1)
+    if sm.ridge:
+        matched.add(2)
+    if sm.nu_order:
+        matched.add(sm.nu_order)
+
+    def derivs(fn, ov):
+        # loglik derivatives 1..3 at the anchor: grad, -weight, -d weight / d eta
+        aux = (y, jnp.full((2,), ov), z)
+        g = fn(z, aux)[1]
+        w = fn(z, aux)[2]
+        dw = jax.vmap(jax.grad(lambda e, i: fn(jnp.full((2,), e), aux)[2][i]))(z, jnp.arange(2))
+        return g, -w, -dw
+
+    def target(ov):
+        a2 = base.cumulant_terms(z)[2]
+        a3, a4 = base.cumulant_derivs(z)
+        a5 = base.cumulant_deriv5(z)
+        h = 0.5 * ov
+        return (y - jax.nn.sigmoid(z) - h * a3, -(a2 + h * a4), -(a3 + h * a5))
+
+    def err(ov):
+        fn = Smoothed(base, sm).terms
+        ll = fn(z, (y, jnp.full((2,), ov), z))[0]
+        tl = Smoothed(base, Taylor()).terms(z, (y, jnp.full((2,), ov)))[0]
+        np.testing.assert_allclose(ll, tl, atol=1e-12)
+        got, want = derivs(fn, ov), target(ov)
+        return {k: float(jnp.max(jnp.abs(got[k - 1] - want[k - 1]))) for k in matched}
+
+    e1, e2 = err(0.02), err(0.01)
+    for k in matched:
+        assert e2[k] <= 0.3 * e1[k] + 1e-13, (k, e1[k], e2[k])
+
+
+@pytest.mark.parametrize("flags", _CASES)
+def test_case_poisson_exact_with_offset(flags):
+    """Every Poisson derivative is e^z, so any case with the offset on has nu = ov/2 and
+    delta = kappa = 0: the smoothed score and curvature at every eta."""
+    r, eta, z, ov = _rows(3)
+    y = jnp.asarray(r.poisson(2.0, eta.shape[0]).astype(float))
+    delta, nu, kappa = Adjusted(*flags).adjustment(Poisson(), z, ov)
+    if not flags[1]:
+        return
+    np.testing.assert_allclose(nu, ov / 2, atol=1e-12)
+    np.testing.assert_allclose(delta, 0.0, atol=1e-12)
+    np.testing.assert_allclose(kappa, 0.0, atol=1e-12)
+    _, g, w = Smoothed(Poisson(), Adjusted(*flags)).terms(eta, (y, ov, z))
+    lam = jnp.exp(eta + ov / 2)
+    np.testing.assert_allclose(g, y - lam, atol=1e-12)
+    np.testing.assert_allclose(w, lam, atol=1e-12)
+
+
+@pytest.mark.parametrize("flags", _CASES)
+def test_case_gaussian_reduces_to_taylor(flags):
+    r, eta, z, ov = _rows(4)
+    y = jnp.asarray(r.normal(size=eta.shape[0]))
+    base = Gaussian(variance=0.7)
+    got = Smoothed(base, Adjusted(*flags)).terms(eta, (y, ov, z))
+    want = Smoothed(base, Taylor()).terms(eta, (y, ov))
+    for a, b in zip(got, want):
+        np.testing.assert_allclose(a, b, atol=1e-12)
+
+
+@pytest.mark.parametrize("flags", [(False, True, False), (True, True, True)])
+def test_case_shift_finite_and_continuous(flags):
+    """Score-matched nu divides by A'' > 0 (no pole); third-derivative nu has a pole at
+    A'''' = 0 (logistic p ~ 0.21, 0.79), clipped continuously like the curvature case."""
+    ov = 0.5
+    z = jnp.linspace(-3.0, 3.0, 60001)
+    delta, nu, kappa = Adjusted(*flags).adjustment(Bernoulli(), z, ov)
+    for a in (delta, nu, kappa):
+        assert np.all(np.isfinite(np.asarray(a)))
+    assert np.max(np.abs(np.asarray(nu))) <= np.sqrt(ov) * (1 + 1e-12)
+    assert np.max(np.abs(np.diff(np.asarray(nu)))) < 50 * float(z[1] - z[0])
+
+
+def test_third_condition_needs_fifth_derivative():
+    from gibss.response import ExponentialFamily
+
+    class NoFifth(ExponentialFamily):
+        def terms(self, eta, aux):
+            return Poisson().terms(eta, aux)
+
+        def cumulant_derivs(self, eta):
+            return Poisson().cumulant_derivs(eta)
+
+    Smoothed(NoFifth(), Adjusted(True, True, False))  # fine: curvature case
+    with pytest.raises(TypeError, match="A\\^\\(5\\)"):
+        Smoothed(NoFifth(), Adjusted(True, True, True))
+
+
+def test_ridge_cases_flagged_nonconvex():
+    assert Adjusted(True, True, False).convex
+    assert not Adjusted(True, True, True).convex
+    assert not Adjusted(False, True, True).convex
