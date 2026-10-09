@@ -1,13 +1,14 @@
 """Fixed normal scale mixtures of the logistic law as offset smoothers.
 
 `ProbitMixture` (Stefanski's probit mixture of the logistic CDF) and `PGMixture`
-(Polya-Gamma atoms) replace the logistic cumulant with a mixture whose Gaussian
-convolution is closed form, so `Smoothed(Bernoulli(), ProbitMixture(K)).terms(eta,
-(y, ov))` integrates the random offset exactly and the only error is the table's
-sup-norm approximation error. Checked here: the stored tables meet their documented
-sup error on a fine grid, the smoothed terms match a dense-GH reference within that
-error at every offset variance, grad/weight are the derivatives of loglik, the
-Binomial scale rides through, and the front door resolves the scheme names.
+(Polya-Gamma atoms, sign-split at u = 0 with the bivariate normal orthant for Ahat)
+replace the logistic cumulant with a mixture whose Gaussian convolution is closed form,
+so `Smoothed(Bernoulli(), ProbitMixture(K)).terms(eta, (y, ov))` integrates the random
+offset exactly and the only error is the table's sup-norm approximation error. Checked
+here: the stored tables meet their documented sup error on a fine grid, the smoothed
+terms match a dense reference within that error at every offset variance, PGMixture
+is exact for its own sigma-hat, grad/weight are the derivatives of loglik, the Binomial
+scale rides through, and the front door resolves the scheme names.
 """
 
 import jax
@@ -92,19 +93,48 @@ def test_probit_terms_match_dense_gh_within_table_error(order, ov):
 
 
 @pytest.mark.parametrize("order", [3, 5])
-@pytest.mark.parametrize("ov", [0.0, 1.0, 4.0, 10.0])
-def test_pg_terms_error_grows_with_offset_variance(order, ov):
-    # the reflection is taken at the sign of eta, not eta + o: the wrong-side tail of o
-    # is weighted by e^{u/2}, so the error bound carries a factor (1 + e^{ov/2})
+@pytest.mark.parametrize("ov", [0.0, 1.0, 4.0, 10.0, 25.0])
+def test_pg_terms_match_dense_reference_within_table_error(order, ov):
+    # the split at the sign of u = eta + o is exact (truncated Gaussians + the bivariate
+    # normal orthant), so the error is the table's sup error at EVERY ov, like probit
     eta = jnp.linspace(-15, 15, 241)
     y = jnp.zeros_like(eta)
     ovv = jnp.full_like(eta, ov)
     ll, g, w = Smoothed(Bernoulli(), PGMixture(order)).terms(eta, (y, ovv))
     ll_r, g_r, w_r = _reference(eta, y, ovv)
-    bound = _PG_MIXTURES[order][2] * (1.0 + np.exp(ov / 2))
-    assert float(jnp.max(jnp.abs(g - g_r))) <= 1.1 * bound
-    assert float(jnp.max(jnp.abs(ll - ll_r))) <= 5.0 * bound
-    assert float(jnp.max(jnp.abs(w - w_r))) <= 5.0 * bound
+    err = _PG_MIXTURES[order][2]
+    assert float(jnp.max(jnp.abs(g - g_r))) <= 1.1 * err
+    assert float(jnp.max(jnp.abs(ll - ll_r))) <= 5.0 * err
+    assert float(jnp.max(jnp.abs(w - w_r))) <= 5.0 * err
+
+
+def _sigma_hat(t, order):
+    """PGMixture's own sigma-hat: the atom form on t <= 0, its reflection on t > 0."""
+    w, p, _ = _PG_MIXTURES[order]
+    m = np.exp(-0.5 * np.outer(t**2, w)) @ np.asarray(p)
+    neg = 0.5 * np.exp(-np.abs(t) / 2) * m
+    return np.where(t <= 0, neg, 1 - neg)
+
+
+@pytest.mark.parametrize("ov", [0.5, 4.0, 25.0])
+def test_pg_terms_are_exact_for_sigma_hat(ov):
+    # integrate sigma-hat, its derivative and its antiderivative over u ~ N(eta, ov) by
+    # the trapezoid rule: the closed form must agree to the trapezoid's own accuracy
+    eta = np.linspace(-10, 10, 41)
+    sd = np.sqrt(ov)
+    tt = np.linspace(-60, 60, 240001)
+    dt = tt[1] - tt[0]
+    sh = _sigma_hat(tt, 5)
+    ah = np.concatenate([[0.0], np.cumsum(0.5 * (sh[1:] + sh[:-1]) * dt)])
+    dsh = np.gradient(sh, dt)
+    wts = np.exp(-0.5 * ((tt[None, :] - eta[:, None]) / sd) ** 2) / (sd * np.sqrt(2 * np.pi)) * dt
+    ll, g, w = Smoothed(Bernoulli(), PGMixture(5)).terms(
+        jnp.asarray(eta), (jnp.zeros(41), jnp.full(41, ov))
+    )
+    # the trapezoid's own error on the C^1 kink of sigma-hat at 0 is ~5e-9 at this dt
+    assert np.max(np.abs(-np.asarray(g) - wts @ sh)) < 1e-10
+    assert np.max(np.abs(-np.asarray(ll) - wts @ ah)) < 3e-8
+    assert np.max(np.abs(np.asarray(w) - wts @ dsh)) < 3e-8
 
 
 @pytest.mark.parametrize("smoother", [ProbitMixture(3), ProbitMixture(max(_PROBIT_MIXTURES)), PGMixture(5)])

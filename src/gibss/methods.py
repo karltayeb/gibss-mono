@@ -68,8 +68,9 @@ _SMOOTHERS = {
     # fixed normal scale mixtures of the logistic law (Bernoulli/Binomial only): the
     # offset integrates in closed form against each Gaussian component, so the error is
     # the table's sup error (4e-5 at 3 components, 4e-6 at 5) at ANY offset variance,
-    # where "gh" needs more nodes as the variance grows. probit_mixture is the one to
-    # use; pg_mixture (Polya-Gamma atoms) degrades past ov ~ 4 and is kept for comparison.
+    # where "gh" needs more nodes as the variance grows. probit_mixture costs one erfc
+    # and one exp per component; pg_mixture (Polya-Gamma atoms) has the same guarantee
+    # but needs two bivariate normal orthants per component, ~10x the cost.
     "probit_mixture": lambda cfg: ProbitMixture(order=cfg["mixture_order"]),
     "pg_mixture": lambda cfg: PGMixture(order=cfg["mixture_order"]),
     # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).

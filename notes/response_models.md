@@ -385,7 +385,7 @@ reference on eta in [-15, 15]:
 
 (max |Ahat' error|; the Ahat error is 3-4x the sup error, the Ahat'' error smaller.)
 Not a bound (certified False), convex, costs one erfc and one exp per component per
-entry. End to end this shows where the offset variance is large. With a per-row random
+entry (14 ms on the 2000x300 call at K=5; GH15 26 ms). End to end this shows where the offset variance is large. With a per-row random
 intercept of variance 9 (1500 x 200, L=5, 15 sweeps, reference GH with 91 nodes), the
 per-feature log BF error and wall time:
 
@@ -397,13 +397,34 @@ per-feature log BF error and wall time:
 so the 5-component table matches 31-node GH at a third of the cost, and at the cost of
 5-node GH it is 10^4 times closer. On an ordinary fit (small message variance) every
 pointwise scheme agrees with exact Q2 CAVI to the same ~3e-2 nats, the Gaussian-moment
-approximation of the offset law, and the table buys nothing. `PGMixture` is the Polya-Gamma counterpart, `sech(t/2) ~ sum_k p_k
-e^{-w_k t^2/2}` so `sigma(t) ~ 1/2 e^{t/2} sum_k p_k e^{-w_k t^2/2}`: a finite atom
-mixture is Gaussian in t and cannot follow the e^{-|t|/2} tail once the e^{t/2}
-factor is applied, so the table is fitted on t <= 0 and the other half is the
-reflection `1 - sigma(-t)`. Under a random offset the reflection is taken at the sign
-of eta, not of eta + o, so its error grows like e^{ov/2} (4e-3 by ov=10 at K=3);
-kept for comparison, use the probit table. The tables live in
+approximation of the offset law, and the table buys nothing.
+
+`PGMixture` is the Polya-Gamma counterpart: `sech(t/2) = E_w e^{-w t^2/2}` replaced by
+K atoms `m(t)`, so `sigma(t) ~ 1/2 e^{t/2} m(t)`. A finite atom mixture is Gaussian in
+t and cannot follow the e^{-|t|/2} tail once the e^{t/2} factor is applied (at K=5 the
+atom form gives 0.73 for sigma(10) and 0.03 for sigma(20)), so the representation only
+holds on t <= 0, where the table is fitted (sup error 1.9e-5 at K=3, 1.4e-6 at K=5,
+a better pointwise fit than probit at the same K); t > 0 is the reflection
+`1 - sigma(-t)`, and the two halves meet in value and slope. Under the offset the split
+is at the sign of u = eta + o, which is random, so every expectation is a pair of
+truncated Gaussians: closed form in Phi for Ahat' and Ahat'', and for Ahat the
+expectation of the antiderivative `1/2 sum p_k c_k Phi(sqrt(w_k) u - b_k)` over a
+half line, a bivariate normal orthant per component and side. `_numerics.bvn_cdf`
+evaluates it through Owen's T on a 12-node Gauss-Legendre rule (2e-14 absolute, checked
+against scipy in tests/test_bvn.py). The result is exact for sigma-hat (5e-12 against a
+trapezoid integral of it) and the error against the logistic is the table's sup error
+at every ov, like probit:
+
+    ov        0.3     1       4      10      25     cost
+    PG5     1.2e-6  1.0e-6  6.7e-7  4.3e-7  1.1e-6   176 ms
+
+The price is the orthants: two per component per entry, each two Owen's T (24 exps)
+and a few erfc, about 10x the probit table and 7x GH15. In the random-intercept
+benchmark above pg5 is the most accurate scheme, 6.9e-6 nats (its table is 2.7x
+tighter than probit's at K=5), at 50 s against probit5's 3.9 s. A cheaper variant that takes the reflection at the sign of eta instead of u is
+closed form in Phi alone but its error grows like e^{ov/2} (3e-2 by ov=25); it was
+tried and dropped. The probit representation never needs a split because Phi has the
+same tail shape as sigma on both sides. The tables live in
 `response._PROBIT_MIXTURES` / `_PG_MIXTURES` (scales, weights, sup error) and
 `tests/test_logistic_mixtures.py` checks every row on a fine grid and (slow) re-derives
 one by the LP-in-weights / Nelder-Mead-in-scales fit (Nelder-Mead on the LP value is

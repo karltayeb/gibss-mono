@@ -42,29 +42,31 @@ from ._numerics import (
     _cheb_fit_matrix,
     _clenshaw_batched,
     _gh_rule,
+    _ndtr,
+    bvn_cdf,
 )
 
 __all__ = [
-    "ResponseModel",
-    "ExponentialFamily",
-    "Smoother",
     "GH",
-    "MixtureGH",
-    "SelfNormQuad",
-    "Compress",
-    "CompressSelfNorm",
-    "Taylor",
-    "TaylorFixed",
-    "JJEnvelope",
-    "JJFixed",
-    "ProbitMixture",
-    "PGMixture",
-    "Smoothed",
     "Bernoulli",
     "Binomial",
-    "TwoGroupMarginal",
-    "Poisson",
+    "Compress",
+    "CompressSelfNorm",
+    "ExponentialFamily",
     "Gaussian",
+    "JJEnvelope",
+    "JJFixed",
+    "MixtureGH",
+    "PGMixture",
+    "Poisson",
+    "ProbitMixture",
+    "ResponseModel",
+    "SelfNormQuad",
+    "Smoothed",
+    "Smoother",
+    "Taylor",
+    "TaylorFixed",
+    "TwoGroupMarginal",
 ]
 
 
@@ -128,7 +130,7 @@ class ResponseModel:
         With a design operator `op`, the sums run over the OFF-support rows of each column
         j (rows with x_ij = 0) and `s` is per column, shape (..., p): the fill-in of a
         sparse centered fit, without touching the support entries."""
-        return None
+        return
 
 
 class ExponentialFamily(ResponseModel):
@@ -206,7 +208,7 @@ class Smoother:
 
     def shift_sums(self, base, offset, aux, op=None):
         """`ResponseModel.shift_sums` for `Smoothed(base, self)`; None = no closed form."""
-        return None
+        return
 
 
 @dataclass(frozen=True)
@@ -272,7 +274,7 @@ class MixtureGH(Smoother):
         shift = eta_k[None] + jnp.asarray(means)[None] + sd[None] * node  # (order, *eta, K)
         ll, g, w = base.terms(shift, _tmap(lambda a: a[None], y_k))
         W = wj.reshape((self.order,) + (1,) * m) * pi[None]  # (order, *eta, K)
-        red = lambda t: jnp.sum(W * t, axis=(0, -1))  # noqa: E731
+        red = lambda t: jnp.sum(W * t, axis=(0, -1))
         return red(ll), red(g), red(w)
 
 
@@ -612,7 +614,7 @@ class Compress(Smoother):
         )
         sll, sg, sw = self.inner.terms(base, znodes, inner_aux)  # each (n, M+1)
         bll, bg, bw = base.cumulant_terms(znodes + obar[:, None])  # plug-in at shift
-        fit = lambda vals: vals @ Vinv.T  # (n, M+1) samples -> (n, M+1) coeffs  # noqa: E731
+        fit = lambda vals: vals @ Vinv.T  # (n, M+1) samples -> (n, M+1) coeffs
         coef_ll = fit(sll - bll)
         coef_g = fit(sg - bg)
         coef_w = fit(sw - bw)
@@ -656,7 +658,7 @@ class Compress(Smoother):
         yu = base.unit_aux(y)  # y-free fold: the per-trial residual
         sll, sg, sw = SelfNormQuad().terms(base, znodes, (yu, x, b_nodes, logW))
         bll, bg, bw = base.cumulant_terms(znodes + obar[:, None])  # plug-in at shift
-        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+        fit = lambda vals: vals @ Vinv.T
         return y, obar, center, halfwidth, fit(sll - bll), fit(sg - bg), fit(sw - bw)
 
     def build_selfnorm_init(self, base, y, x, b_nodes, logW, V0):
@@ -678,7 +680,7 @@ class Compress(Smoother):
         yu = base.unit_aux(y)  # y-free fold: the per-trial residual
         sll, sg, sw = SelfNormQuad().terms(base, znodes, (yu, x, b_nodes, logW))
         bll, bg, bw = base.cumulant_terms(znodes)  # plug-in at obar=0 (mean in eta)
-        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+        fit = lambda vals: vals @ Vinv.T
         # cumulant residuals cr = A^(1) - A(z); aux stores (-cr0, -cr1, cr2), so
         # cr0 = -fit(sll - bll) matches the Gaussian init convention (init = (cr0,cr1,cr2,V0)).
         return (-fit(sll - bll), -fit(sg - bg), fit(sw - bw), V0)
@@ -707,7 +709,7 @@ class Compress(Smoother):
         n = _rows(y)
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
-        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+        fit = lambda vals: vals @ Vinv.T
 
         s = jnp.zeros(n)  # cumulative mean shift
         V = jnp.zeros(n)  # cumulative variance
@@ -776,12 +778,12 @@ class Compress(Smoother):
         nnz = vals_all.shape[0]
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
-        fit = lambda v: v @ Vinv.T  # noqa: E731
+        fit = lambda v: v @ Vinv.T
 
         C = min(int(entry_chunk), nnz)
         nchunks = -(-nnz // C)
         pad = nchunks * C - nnz
-        def _pad(a, fill):  # noqa: E731
+        def _pad(a, fill):
             return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
                     if pad else a)
 
@@ -834,7 +836,7 @@ class Compress(Smoother):
                 r_arg = zc[:, :, None] + o[:, None, :]
                 tt = jnp.clip((r_arg - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
                 Wc = wwc[:, None, :]  # (C, 1, Q)
-                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
+                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)
                 return a_arg, tt, Wc, ss
 
             tz = jnp.clip((znodes - center_prev[:, None]) / hw_prev[:, None], -1., 1.)
@@ -926,12 +928,12 @@ class Compress(Smoother):
         nnz = vals_all.shape[0]
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
-        fit = lambda v: v @ Vinv.T  # noqa: E731
+        fit = lambda v: v @ Vinv.T
 
         C = min(int(entry_chunk), nnz)
         nchunks = -(-nnz // C)
         pad = nchunks * C - nnz
-        def _pad(a, fill):  # noqa: E731
+        def _pad(a, fill):
             return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
                     if pad else a)
 
@@ -990,7 +992,7 @@ class Compress(Smoother):
                 t_bg = jnp.clip((zc[:, :, None] + o_bg[:, None, :]
                                  - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
                 Wc = wwc[:, None, :]  # (C, 1, Q)
-                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
+                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)
                 return a_sp, a_bg, t_sp, t_bg, Wc, ss
 
             bg_args = (base, znodes, s_prev, c, b_nodes, W_all,
@@ -1092,7 +1094,7 @@ class Compress(Smoother):
         wgh = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))  # sum to 1
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
-        fit = lambda vals: vals @ Vinv.T  # noqa: E731
+        fit = lambda vals: vals @ Vinv.T
 
         s = jnp.zeros(n)  # cumulative mean shift s_m
         V = jnp.zeros(n)  # cumulative variance V_m
@@ -1175,13 +1177,13 @@ class Compress(Smoother):
         wgh = jnp.asarray(np.exp(logw_np) / np.sqrt(np.pi))
         xnodes_np, Vinv_np = _cheb_fit_matrix(self.M)
         xnodes, Vinv = jnp.asarray(xnodes_np), jnp.asarray(Vinv_np)
-        fit = lambda v: v @ Vinv.T  # noqa: E731
+        fit = lambda v: v @ Vinv.T
 
         # entries padded to a whole number of chunks; padding carries weight 0.
         C = min(int(entry_chunk), nnz)
         nchunks = -(-nnz // C)
         pad = nchunks * C - nnz
-        def _pad(a, fill):  # noqa: E731
+        def _pad(a, fill):
             return (jnp.concatenate([a, jnp.full((pad, *a.shape[1:]), fill, a.dtype)])
                     if pad else a)
 
@@ -1232,7 +1234,7 @@ class Compress(Smoother):
                 r_arg = zc[:, :, None] + o[:, None, :]
                 tt = jnp.clip((r_arg - center_prev[rc][:, None, None]) / hw_prev[rc][:, None, None], -1., 1.)
                 Wc = wc[:, None, None] * wgh[None, None, :]
-                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)  # noqa: E731
+                ss = lambda v: jax.ops.segment_sum(v, rc, num_segments=n)
                 return a_arg, tt, Wc, ss
 
             tz = jnp.clip((znodes - center_prev[:, None]) / hw_prev[:, None], -1., 1.)
@@ -1496,7 +1498,7 @@ class JJFixed(_JJBase):
 # the CDF, `sigma(t) ~ sum_k pi_k Phi(s_k t)`; `_PG_MIXTURES[K] = (precisions w, weights
 # p, sup error)` approximates the Polya-Gamma scale mixture `sech(t/2) = E_w e^{-w t^2/2}`
 # by K atoms, with the error measured on `sigma(t)`, t <= 0 (the half where the atom
-# representation is used; the other half is the reflection `1 - sigma(-t)`).
+# representation holds; the other half is the reflection `1 - sigma(-t)`).
 _PROBIT_MIXTURES = {
     2: ((0.4352556161, 0.7686228322), (0.4355777996, 0.5644222004), 5.11e-4),
     3: (
@@ -1553,9 +1555,8 @@ class _LogisticMixtureBase(Smoother):
     expectation over `o ~ N(0, ov)` is one more Gaussian. The scheme replaces A with
     the mixture's cumulant ONCE (a fixed table of `order` components, chosen minimax
     in the sup norm) and then integrates the offset EXACTLY. The error is the fixed
-    approximation error, no quadrature: `terms` costs `order` normal-CDF evaluations
-    at ANY offset variance, where GH needs more nodes as ov grows. Not a bound
-    (certified False); convex (every component is a positive Gaussian kernel)."""
+    approximation error, uniformly in ov, where GH needs more nodes as ov grows. Not a
+    bound (certified False); convex (every component is a positive Gaussian kernel)."""
 
     def validate(self, base):
         if not isinstance(base, Bernoulli):
@@ -1594,8 +1595,7 @@ class ProbitMixture(_LogisticMixtureBase):
         pi = jnp.asarray(pi).reshape(lead)
         r = jnp.sqrt(1.0 + s**2 * jnp.asarray(ov)[None, ...])
         z = s * eta[None, ...] / r
-        # 0.5 erfc(-z/sqrt2) IS ndtr; jax's ndtr evaluates erf AND erfc, 3x the cost
-        cdf = 0.5 * jax.scipy.special.erfc(-z / jnp.sqrt(2.0))
+        cdf = _ndtr(z)
         pdf = jnp.exp(-0.5 * z * z) / jnp.sqrt(2.0 * jnp.pi)
         ahat = jnp.sum(pi * (r / s) * (z * cdf + pdf), 0)
         a1 = jnp.sum(pi * cdf, 0)
@@ -1606,25 +1606,43 @@ class ProbitMixture(_LogisticMixtureBase):
 @dataclass(frozen=True)
 class PGMixture(_LogisticMixtureBase):
     """Polya-Gamma atoms: `sigma(t) = 1/2 e^{t/2} sech(t/2)` with `sech(t/2) = E_w
-    e^{-w t^2/2}`, w ~ PG(1, 0), replaced by `sum_k p_k e^{-w_k t^2/2}`. A finite atom
-    mixture is a Gaussian in t, so it cannot follow `sech`'s e^{-|t|/2} tail once the
-    e^{t/2} factor is applied for t > 0: the table is fitted on t <= 0 and the t > 0
-    half is the reflection `sigma(t) = 1 - sigma(-t)`. Under `o ~ N(0, ov)` the
-    reflection is taken at the SIGN OF eta (the sign of eta + o is random), so unlike
-    `ProbitMixture` the error grows with ov, roughly by e^{ov/2}: the kernel
-    e^{u/2} weights the wrong-side tail of o. With u ~ N(-|eta|, ov), d = 1 + w ov:
+    e^{-w t^2/2}`, w ~ PG(1, 0), replaced by `m(t) = sum_k p_k e^{-w_k t^2/2}`. A finite
+    atom mixture is Gaussian in t and cannot follow `sech`'s e^{-|t|/2} tail once the
+    e^{t/2} factor is applied, so `1/2 e^{t/2} m(t)` is only an approximation of sigma
+    on t <= 0 (where the table is fitted); on t > 0 the approximation is the reflection
+    `1 - 1/2 e^{-t/2} m(t)`. The two halves meet at t = 0 in value and slope (sum p = 1),
+    and the resulting sigma-hat is uniformly accurate on the whole line.
 
-        M_k        = E e^{u/2 - w_k u^2/2} = d^{-1/2} exp((u/2 - w_k u^2/2 + ov/8)/d)
-        Ahat'(-|eta|)  = 1/2 sum_k p_k M_k
-        Ahat''(-|eta|) = 1/2 sum_k p_k M_k (1/2 - w_k u) / d
-        Ahat(-|eta|)   = 1/2 sum_k p_k e^{1/(8 w_k)} sqrt(2 pi / w_k)
-                             Phi((sqrt(w_k) u - 1/(2 sqrt(w_k))) / sqrt(d))
+    Under `u = eta + o ~ N(eta, ov)` the split is at the SIGN OF u, which is random, so
+    every expectation is a pair of truncated-Gaussian integrals. With d = 1 + w ov,
+    `M(a) = E e^{a u - w u^2/2} = d^{-1/2} exp((a eta - w eta^2/2 + a^2 ov/2)/d)`, and
+    the truncating law `N(mu_a, s^2)`, `mu_a = (eta + a ov)/d`, `s^2 = ov/d`, z_a =
+    mu_a/s:
 
-    and for eta > 0: `Ahat(eta) = eta + Ahat(-eta)`, `Ahat' = 1 - Ahat'(-eta)`, `Ahat''`
-    even. Kept as the PG counterpart of the probit table; `ProbitMixture` is the one
-    to use."""
+        Ahat'  = Phi(eta/sd) + 1/2 sum_k p_k [M(1/2) Phi(-z_+) - M(-1/2) Phi(z_-)]
+        Ahat'' = 1/2 sum_k p_k { M(1/2) [Phi(-z_+)/2 - w (mu_+ Phi(-z_+) - s phi(z_+))]
+                               + M(-1/2) [Phi(z_-)/2 + w (mu_- Phi(z_-) + s phi(z_-))] }
+
+    (the smoothed sigma-hat and its derivative; the sign-split halves of sigma-hat' are
+    `1/2 sum_k p_k (1/2 + w_k |t|) e^{-|t|/2 - w_k t^2/2}`). `Ahat` is the expectation of
+    the antiderivative `A-hat(u) = 1/2 sum_k p_k c_k Phi(sqrt(w_k) u - b_k)` on u <= 0
+    (`c_k = e^{1/(8 w_k)} sqrt(2 pi / w_k)`, `b_k = 1/(2 sqrt(w_k))`) and `u + A-hat(-u)`
+    on u > 0; `E[Phi(alpha u + beta); u <= 0]` is a bivariate normal orthant, so
+
+        Ahat = eta Phi(eta/sd) + sd phi(eta/sd)
+             + 1/2 sum_k p_k c_k [Phi2(-eta/sd, (sqrt(w_k) eta - b_k)/sqrt(d); rho_k)
+                                + Phi2( eta/sd, (-sqrt(w_k) eta - b_k)/sqrt(d); rho_k)],
+        rho_k = -sqrt(w_k ov / d),
+
+    evaluated by `_numerics.bvn_cdf` (Owen's T on a Gauss-Legendre rule, `bvn_order`
+    nodes, ~1e-14 absolute at 12). Exact for sigma-hat at every ov, so the error is the
+    table's sup error uniformly in ov, like `ProbitMixture` -- at the cost of two
+    orthants per component per entry, about 4 x `bvn_order` exps where the probit table
+    needs one erfc and one exp. The probit table is the cheaper route to the same
+    guarantee; this is the PG counterpart done properly."""
 
     order: int = 5
+    bvn_order: int = 12
 
     def __post_init__(self):
         _mixture_table(_PG_MIXTURES, self.order, "PGMixture")
@@ -1636,19 +1654,49 @@ class PGMixture(_LogisticMixtureBase):
         lead = (-1,) + (1,) * jnp.ndim(eta)
         w = jnp.asarray(w).reshape(lead)
         p = jnp.asarray(p).reshape(lead)
-        v = jnp.asarray(ov)[None, ...]
-        u = -jnp.abs(eta)[None, ...]
-        d = 1.0 + w * v
-        m = jnp.exp((0.5 * u - 0.5 * w * u * u + v / 8.0) / d - 0.5 * jnp.log(d))
-        a1m = 0.5 * jnp.sum(p * m, 0)
-        a2 = 0.5 * jnp.sum(p * m * (0.5 - w * u) / d, 0)
+        # ov = 0 is a legitimate input (one effect, or a plug-in mode); a floor keeps every
+        # ratio finite and the result is the plain sign-split sigma-hat at eta
+        v = jnp.maximum(jnp.asarray(ov), 1e-30)
+        sd = jnp.sqrt(v)
+        e = eta[None, ...]
+        vv = v[None, ...]
+        d = 1.0 + w * vv
+        s = jnp.sqrt(vv / d)
+        rt2pi = jnp.sqrt(2.0 * jnp.pi)
+
+        def trunc(a):
+            # e^{a u - w u^2/2} N(u; eta, ov) = M(a) N(u; mu, s^2); returns M, mu, z = mu/s
+            m = jnp.exp((a * e - 0.5 * w * e * e + 0.5 * a * a * vv) / d - 0.5 * jnp.log(d))
+            mu = (e + a * vv) / d
+            return m, mu, mu / s
+
+        m_p, mu_p, z_p = trunc(0.5)
+        m_n, mu_n, z_n = trunc(-0.5)
+        cdf_p = _ndtr(-z_p)  # P(u <= 0) under the +1/2 tilt
+        cdf_n = _ndtr(z_n)  # P(u > 0) under the -1/2 tilt
+        pdf_p = jnp.exp(-0.5 * z_p * z_p) / rt2pi
+        pdf_n = jnp.exp(-0.5 * z_n * z_n) / rt2pi
+        step = _ndtr(eta / sd)
+        a1 = step + 0.5 * jnp.sum(p * (m_p * cdf_p - m_n * cdf_n), 0)
+        a2 = 0.5 * jnp.sum(
+            p
+            * (
+                m_p * (0.5 * cdf_p - w * (mu_p * cdf_p - s * pdf_p))
+                + m_n * (0.5 * cdf_n + w * (mu_n * cdf_n + s * pdf_n))
+            ),
+            0,
+        )
         sw = jnp.sqrt(w)
-        logc = 1.0 / (8.0 * w) + 0.5 * jnp.log(2.0 * jnp.pi / w)
-        logcdf = jax.scipy.special.log_ndtr((sw * u - 0.5 / sw) / jnp.sqrt(d))
-        am = 0.5 * jnp.sum(p * jnp.exp(logc + logcdf), 0)
-        pos = eta > 0
-        ahat = jnp.where(pos, eta + am, am)
-        a1 = jnp.where(pos, 1.0 - a1m, a1m)
+        b = 0.5 / sw
+        c = jnp.exp(1.0 / (8.0 * w)) * rt2pi / sw
+        rho = -jnp.sqrt(w * vv / d)
+        sqd = jnp.sqrt(d)
+        h = (eta / sd)[None, ...]
+        orth = bvn_cdf(-h, (sw * e - b) / sqd, rho, self.bvn_order) + bvn_cdf(
+            h, (-sw * e - b) / sqd, rho, self.bvn_order
+        )
+        z0 = eta / sd
+        ahat = eta * step + sd * jnp.exp(-0.5 * z0 * z0) / rt2pi + 0.5 * jnp.sum(p * c * orth, 0)
         return y * eta - scale * ahat, y - scale * a1, scale * a2
 
 
