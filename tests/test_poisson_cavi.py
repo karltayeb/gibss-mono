@@ -28,18 +28,25 @@ import numpy as np
 import pytest
 from jax.experimental import sparse as jsp
 
+import gibss.poisson_offset as po
+from gibss.glm import _poisson_vi_aux
 from gibss.methods import fit_glm_susie
+from gibss.operators import as_operator
 from gibss.poisson_offset import (
     _LOGRATE_CAP,
     PoissonLogNormalOffset,
     PoissonSelfNormOffset,
+    _TermCache,
     effect_log_mgf_q1_dense,
+    glm_vi_poisson_center_ser,
+    glm_vi_poisson_ser,
     log_kappa_dense,
     log_kappa_q1_dense,
     log_kappa_q1_sparse,
     log_kappa_sparse,
 )
-from gibss.response import Bernoulli, CompressSelfNorm, Poisson, Smoothed
+from gibss.response import GH, Bernoulli, CompressSelfNorm, Poisson, Smoothed
+from gibss.response_ser import glm_vi_gh_center_ser, glm_vi_gh_ser
 
 
 def _poisson_data(rng, n, p, idx, val, b0=0.2):
@@ -752,3 +759,143 @@ def test_compress_selfnorm_poisson_sparse_centering_matches_dense():
     fm_d = np.asarray([e.feature_log_marginal for e in st_d.single_effects])
     fm_s = np.asarray([e.feature_log_marginal for e in st_s.single_effects])
     assert np.allclose(fm_d, fm_s, atol=1e-5)
+
+
+# ------------------------------------------------------------ 0/1 designs + per-effect memo
+def _gauss_effects(rng, p, L):
+    return [(rng.dirichlet(np.ones(p)), 0.5 * rng.standard_normal(p), rng.uniform(0.05, 0.4, p))
+            for _ in range(L)]
+
+
+@pytest.mark.parametrize("centered", [False, True])
+def test_poisson_log_kappa_binary_matches_general(centered):
+    """On a 0/1 design the MGF fold is affine in X (one matvec, `_effect_log_mgf_binary`).
+    Q2 and Q1, sparse and dense: equal to the general per-entry path, which a 0/1 design
+    reaches only after (eager) centering, so the reference is the dense centered design."""
+    rng = np.random.default_rng(81)
+    n, p, Q = 50, 16, 7
+    Xd = (rng.uniform(size=(n, p)) < 0.25).astype(float)
+    colmean = Xd.mean(0) if centered else np.zeros(p)
+    Xc = jnp.asarray(Xd - colmean[None, :])
+    Xb = jsp.BCOO.fromdense(jnp.asarray(Xd))
+    cm = colmean if centered else None
+    eff = _gauss_effects(rng, p, 3)
+    ref = np.asarray(log_kappa_dense([(Xc, *e) for e in eff], n, offset_var=0.3))
+    if not centered:  # the dense design itself is 0/1 -> binary dense path
+        assert np.max(np.abs(ref - _brute_logkappa(Xd, eff, 0.3))) < 1e-10
+    spar = np.asarray(log_kappa_sparse(Xb, eff, offset_var=0.3, colmean=cm))
+    assert np.max(np.abs(ref - spar)) < 1e-12
+    nodes = [(jnp.asarray(rng.standard_normal((p, Q)) * 0.5),
+              jnp.asarray(rng.standard_normal((p, Q)))) for _ in range(2)]
+    ref1 = _brute_logkappa_q1(np.asarray(Xc), nodes)
+    spar1 = np.asarray(log_kappa_q1_sparse(Xb, nodes, n, colmean=cm))
+    dens1 = np.asarray(log_kappa_q1_dense(Xc, nodes, n))
+    assert np.max(np.abs(ref1 - spar1)) < 1e-12
+    assert np.max(np.abs(ref1 - dens1)) < 1e-12
+
+
+def test_poisson_term_memo_serves_unchanged_effects(monkeypatch):
+    """`logkappa` is additive over effects, so the per-fit memo (`_TermCache`) computes each
+    effect's term once per law: a later fold over the same (slot, arrays) reuses it, a new
+    law array for a slot recomputes just that slot, and the memoized fold equals the
+    from-scratch fold bit for bit."""
+    calls = []
+    real = po._effect_log_mgf_dense
+    monkeypatch.setattr(po, "_effect_log_mgf_dense", lambda *a: calls.append(1) or real(*a))
+    rng = np.random.default_rng(82)
+    n, p = 40, 9
+    X = jnp.asarray(rng.standard_normal((n, p)))
+    eff = [(X, *map(jnp.asarray, e)) for e in _gauss_effects(rng, p, 4)]
+    cache = _TermCache()
+    full = log_kappa_dense(eff, n, offset_var=0.1, keys=[0, 1, 2, 3], cache=cache)
+    assert len(calls) == 4
+    loo = log_kappa_dense(eff[:1] + eff[2:], n, offset_var=0.1, keys=[0, 2, 3], cache=cache)
+    assert len(calls) == 4  # every term served from the memo
+    assert np.array_equal(np.asarray(loo), np.asarray(
+        log_kappa_dense(eff[:1] + eff[2:], n, offset_var=0.1)))
+    eff[1] = (X, *map(jnp.asarray, _gauss_effects(rng, p, 1)[0]))
+    calls.clear()
+    again = log_kappa_dense(eff, n, offset_var=0.1, keys=[0, 1, 2, 3], cache=cache)
+    assert len(calls) == 1  # only slot 1, whose law changed, is recomputed
+    assert np.array_equal(np.asarray(again), np.asarray(log_kappa_dense(eff, n, offset_var=0.1)))
+    assert not np.array_equal(np.asarray(again), np.asarray(full))
+
+
+# ------------------------------------------------- closed-form Gaussian expectation kernels
+def _vi_problem(seed, n, p, scale, density=0.25):
+    rng = np.random.default_rng(seed)
+    Xd = (rng.random((n, p)) < density) * rng.gamma(2.0, scale, size=(n, p))
+    y = jnp.asarray(rng.poisson(np.exp(0.3 + 0.4 * Xd[:, 0])), float)
+    off = jnp.asarray(rng.normal(0.0, 0.3, n))
+    logk = jnp.asarray(rng.gamma(1.0, 0.1, n))
+    return Xd, y, off, logk
+
+
+@pytest.mark.parametrize("pv", [0.1, 1.0, 5.0])
+def test_vi_poisson_kernels_match_high_order_gh(pv):
+    """`glm_vi_poisson_[center_]ser` integrate b in closed form (the log-normal MGF); on a
+    well-posed problem they equal the GH kernels at high order (and an exact, not
+    Chebyshev, centered background) -- dense, sparse, and sparse-centered."""
+    Xd, y, off, logk = _vi_problem(83, 300, 30, 0.6)
+    R = Smoothed(Poisson(), PoissonLogNormalOffset())
+    for X in (jnp.asarray(Xd), jsp.BCOO.fromdense(jnp.asarray(Xd))):
+        op = as_operator(X)
+        ref = glm_vi_gh_ser(op, (y, logk), off, pv, R, order=60, tol=1e-12)
+        got = glm_vi_poisson_ser(op, y, logk, off, pv, tol=1e-12)
+        for a, b in zip(ref, got):
+            assert np.max(np.abs(np.asarray(a) - np.asarray(b))) < 1e-11
+    op = as_operator(jsp.BCOO.fromdense(jnp.asarray(Xd)))
+    cbar = jnp.asarray(Xd.mean(0))
+    ref = glm_vi_gh_center_ser(op, (y, logk), off, cbar, pv, R, order=60, tol=1e-12,
+                               background="exact")
+    got = glm_vi_poisson_center_ser(op, y, logk, off, cbar, pv, tol=1e-12)
+    for a, b in zip(ref, got):
+        assert np.max(np.abs(np.asarray(a) - np.asarray(b))) < 1e-10
+
+
+def test_vi_poisson_kernel_reaches_exact_optimum():
+    """With a wide prior and large entries the exact expectation E[e^{x b}] is e^{100+} at
+    the prior start; GH (any order) underestimates it there and the GH kernel settles on a
+    point whose true ELBO is far lower. The closed-form kernel solves the EXACT stationarity
+    conditions (score and Price) on every feature, centered or not, and its exact ELBO is
+    never below the GH kernel's."""
+    Xd, y, off, logk = _vi_problem(14, 38, 30, 1.27, density=0.3)
+    pv = 20.0
+    a = np.asarray(off + logk)
+    yy = np.asarray(y)
+    R = Smoothed(Poisson(), PoissonLogNormalOffset())
+    X = jsp.BCOO.fromdense(jnp.asarray(Xd))
+    op = as_operator(X)
+
+    def check(xc_cols, m, v, other=None):
+        m, v = np.asarray(m), np.asarray(v)
+        for j in range(Xd.shape[1]):
+            x = xc_cols[:, j]
+            lam = np.exp(a + x * m[j] + 0.5 * x**2 * v[j])
+            assert abs(np.sum(x * (yy - lam)) - m[j] / pv) < 1e-7 * (1 + np.sum(x**2 * lam))
+            assert abs(1 / v[j] - 1 / pv - np.sum(x**2 * lam)) < 1e-7 / v[j]
+            if other is not None:
+                def F(mm, vv, x=x):
+                    return (np.sum(yy * x * mm) - np.sum(np.exp(a + x * mm + 0.5 * x**2 * vv))
+                            - 0.5 * (np.log(pv / vv) + (vv + mm**2) / pv - 1))
+                om, ov = float(other[0][j]), float(other[1][j])
+                assert F(m[j], v[j]) >= F(om, ov) - 1e-8
+
+    got = glm_vi_poisson_ser(op, y, logk, off, pv, tol=1e-12)
+    gh = glm_vi_gh_ser(op, (y, logk), off, pv, R, order=40, tol=1e-12)
+    check(Xd, got[0], got[1], other=gh)
+    cbar = Xd.mean(0)
+    got_c = glm_vi_poisson_center_ser(op, y, logk, off, jnp.asarray(cbar), pv, tol=1e-12)
+    check(Xd - cbar[None, :], got_c[0], got_c[1])
+
+
+def test_poisson_vi_gh_routes_to_closed_form_kernel():
+    """vi_gh on the log-link Poisson (plain base = plug-in Q2, or the analytic offset fold =
+    CAVI in Q2) uses the closed-form kernel; every other response keeps GH over b."""
+    y = jnp.arange(4.0)
+    logk = jnp.ones(4)
+    assert _poisson_vi_aux(Poisson(), y)[1].shape == (4,)
+    got = _poisson_vi_aux(Smoothed(Poisson(), PoissonLogNormalOffset()), (y, logk))
+    assert got[1] is logk
+    assert _poisson_vi_aux(Bernoulli(), y) is None
+    assert _poisson_vi_aux(Smoothed(Poisson(), GH()), (y, logk)) is None

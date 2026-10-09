@@ -35,7 +35,12 @@ from .engine import (
 )
 from ._numerics import _gh_rule
 from .cf_offset import CharFnOffset, CharFnSelfNorm
-from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
+from .poisson_offset import (
+    PoissonLogNormalOffset,
+    PoissonSelfNormOffset,
+    glm_vi_poisson_center_ser,
+    glm_vi_poisson_ser,
+)
 from .linear import (  # noqa: F401 (prep_data re-export)
     is_bcoo,
     prep_data,
@@ -47,6 +52,7 @@ from .response import (
     Binomial,
     Compress,
     CompressSelfNorm,
+    Poisson,
     ResponseModel,
     Smoothed,
 )
@@ -58,9 +64,7 @@ from .response_ser import (
     glm_jj_ser,
     glm_linear_profile_ser,
     glm_linear_ser,
-    glm_profile_ser,
     glm_profile_ser_nodes,
-    glm_ser,
     glm_ser_nodes,
     glm_vi_gh_center_ser,
     glm_vi_gh_profile_ser,
@@ -513,10 +517,10 @@ def _build_offset_table(data, state, effects, offset_var, keys=None):
             # baseline+support split (colmean) instead of zero-clumping -- no densify.
             cbar = getattr(data, "column_center", None)
             return smoother.build_aux_sparse(
-                base, y, X, eff, offset_var=offset_var, colmean=cbar
+                base, y, X, eff, offset_var=offset_var, colmean=cbar, keys=keys
             )
         eff = [(X, e.alpha, e.mu, e.var) for e in effects]
-        return smoother.build_aux(base, y, eff, offset_var=offset_var)
+        return smoother.build_aux(base, y, eff, offset_var=offset_var, keys=keys)
 
     if isinstance(smoother, Compress):
         if is_bcoo(X):
@@ -595,6 +599,24 @@ def _intercept_offset_aux(data, state):
     )
 
 
+def _poisson_vi_aux(response, aux):
+    """`(y, logkappa)` when the vi_gh response is the log-link Poisson -- plain (`logkappa
+    = 0`, plug-in Q2) or with the analytic offset fold `PoissonLogNormalOffset` (CAVI in
+    Q2) -- whose Gaussian expectation over b is closed form (`glm_vi_poisson_ser`); else
+    None (the kernel integrates b by GH)."""
+    if type(response) is Poisson:
+        y = jnp.asarray(aux)
+        return y, jnp.zeros(y.shape[0])
+    if (
+        isinstance(response, Smoothed)
+        and type(response.base) is Poisson
+        and isinstance(response.smoother, PoissonLogNormalOffset)
+    ):
+        y, logk = aux
+        return jnp.asarray(y), jnp.asarray(logk)
+    return None
+
+
 def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
     """(kernel, intercept) dispatch, returning the raw per-feature (mu, var, log_bf,
     coefficient_kl, nodes) so wrappers (e.g. cox_poisson's partial-likelihood read-out)
@@ -623,6 +645,12 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
             # Expose the centered per-feature quad nodes so the sparse-CENTERED
             # self-normalized offset fold can fold this effect against (x_ij - c_j) b.
             return mu, var, log_bf, coefficient_kl, (b_nodes, log_node_weight)
+        if fs.kernel == "vi_gh" and (pois := _poisson_vi_aux(fs.response, aux)):
+            # log link: E_b and the -c_j background are closed form (exact, no GH/Chebyshev)
+            mu, var, log_bf, coefficient_kl = glm_vi_poisson_center_ser(
+                op, *pois, offset, center, prior_variance,
+            )
+            return mu, var, log_bf, coefficient_kl, None
         if fs.kernel == "vi_gh":
             # CAVI in Q2 on a centered sparse column: GH over b against the offset table,
             # with the same support+background split as glm_center_ser for the -c_j fill.
@@ -693,6 +721,12 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
         mu, var, log_bf, coefficient_kl, _, _ = glm_vi_gh_profile_ser(
             op, aux, offset, prior_variance, fs.response, order=order,
             background=fs.background,
+        )
+    elif fs.kernel == "vi_gh" and (pois := _poisson_vi_aux(fs.response, aux)):
+        # log link: the Gaussian expectation over b is the log-normal MGF, so the kernel
+        # needs no GH (gibss_gaussian on Poisson, and cf_cavi's PoissonLogNormalOffset).
+        mu, var, log_bf, coefficient_kl = glm_vi_poisson_ser(
+            op, *pois, offset, prior_variance,
         )
     elif fs.kernel == "vi_gh":
         # CAVI in Q2: `aux` is the CharFnOffset table built from the OTHER effects'
@@ -1463,14 +1497,19 @@ def _selfnorm_fold_aux(data, state, comp, base, y, n, others, include_intercept=
             (jnp.asarray(e.b_nodes).T, jnp.asarray(e.log_node_weight).T) for e in others
         ]
         icpt = (icpt_nodes, icpt_logw) if have_icpt else None
+        # memo validity keys: the effect's STORED node arrays (the .T views are fresh).
+        refs = [(e.b_nodes, e.log_node_weight) for e in others]
         if is_bcoo(data.X):
             # centered sparse: an off-support entry contributes the per-feature node MGF at
             # -c_j (not a constant), folded via the baseline+support split (colmean).
             cbar = getattr(data, "column_center", None)
             return comp.build_aux_sparse(
-                base, y, data.X, node_effects, intercept=icpt, colmean=cbar
+                base, y, data.X, node_effects, intercept=icpt, colmean=cbar, keys=keys,
+                refs=refs,
             )
-        return comp.build_aux(base, y, jnp.asarray(data.X), node_effects, intercept=icpt)
+        return comp.build_aux(
+            base, y, jnp.asarray(data.X), node_effects, intercept=icpt, keys=keys, refs=refs
+        )
 
     if have_icpt:
         bc = icpt_nodes - float(fs.intercept_value)  # centered (order,)
