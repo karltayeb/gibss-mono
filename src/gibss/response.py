@@ -57,6 +57,8 @@ __all__ = [
     "TaylorFixed",
     "JJEnvelope",
     "JJFixed",
+    "ProbitMixture",
+    "PGMixture",
     "Smoothed",
     "Bernoulli",
     "Binomial",
@@ -1486,15 +1488,179 @@ class JJFixed(_JJBase):
         return y * eta - s * ahat, y - s * (0.5 + 2.0 * lam * eta), s * 2.0 * lam
 
 
+# Normal scale mixtures of the logistic law: the Stefanski (1991) / Monahan-Stefanski
+# (1992) idea. Each table is the minimax (sup-norm) fit with `order` components, the
+# weights solved by LP for fixed scales and the scales by Nelder-Mead on the LP value
+# (tests/test_logistic_mixtures.py re-derives one row and checks every stored sup error
+# on a fine grid). `_PROBIT_MIXTURES[K] = (scales s, weights pi, sup error)` approximates
+# the CDF, `sigma(t) ~ sum_k pi_k Phi(s_k t)`; `_PG_MIXTURES[K] = (precisions w, weights
+# p, sup error)` approximates the Polya-Gamma scale mixture `sech(t/2) = E_w e^{-w t^2/2}`
+# by K atoms, with the error measured on `sigma(t)`, t <= 0 (the half where the atom
+# representation is used; the other half is the reflection `1 - sigma(-t)`).
+_PROBIT_MIXTURES = {
+    2: ((0.4352556161, 0.7686228322), (0.4355777996, 0.5644222004), 5.11e-4),
+    3: (
+        (0.3640550303, 0.5778259784, 0.9079865251),
+        (0.1626247650, 0.5852585832, 0.2521166518),
+        4.36e-5,
+    ),
+    4: (
+        (0.3351379510, 0.4998726162, 0.7194325868, 1.0203012706),
+        (0.0866333203, 0.4114961889, 0.3996179543, 0.1022525366),
+        1.16e-5,
+    ),
+    5: (
+        (0.3162367085, 0.4607563874, 0.6335348846, 0.7692652365, 1.0484258608),
+        (0.0528098652, 0.3233888979, 0.3101136733, 0.2307965000, 0.0828910636),
+        3.75e-6,
+    ),
+    6: (
+        (0.2662578976, 0.3652826200, 0.4904770006, 0.6457376051, 0.8484319994, 1.1467448049),
+        (0.0082316367, 0.1072018298, 0.2942977605, 0.3453412126, 0.2109044088, 0.0340231517),
+        5.76e-7,
+    ),
+}
+_PG_MIXTURES = {
+    2: ((0.1057718734, 0.4599642892), (0.6043552765, 0.3956447235), 2.47e-4),
+    3: (
+        (0.0711225949, 0.2439790677, 0.7026736631),
+        (0.3365591694, 0.5245290805, 0.1389117502),
+        1.92e-5,
+    ),
+    4: (
+        (0.0556400591, 0.1645867276, 0.4270912724, 1.0020380802),
+        (0.2039341723, 0.4688489259, 0.2893702692, 0.0378466326),
+        2.73e-6,
+    ),
+    5: (
+        (0.0509020172, 0.1351671042, 0.2613704381, 0.4713578826, 1.0017043652),
+        (0.1622886702, 0.3672483397, 0.2311527168, 0.2037706683, 0.0355396050),
+        1.40e-6,
+    ),
+}
+
+
+def _mixture_table(table, order, name):
+    if order not in table:
+        raise ValueError(f"{name}: order must be one of {sorted(table)}; got {order!r}")
+    return table[order]
+
+
+class _LogisticMixtureBase(Smoother):
+    """Shared plumbing for the fixed normal-scale-mixture smoothers. The logistic
+    cumulant has no closed-form Gaussian convolution, but a normal scale mixture of the
+    logistic law does: every component is a Gaussian kernel in the predictor, so its
+    expectation over `o ~ N(0, ov)` is one more Gaussian. The scheme replaces A with
+    the mixture's cumulant ONCE (a fixed table of `order` components, chosen minimax
+    in the sup norm) and then integrates the offset EXACTLY. The error is the fixed
+    approximation error, no quadrature: `terms` costs `order` normal-CDF evaluations
+    at ANY offset variance, where GH needs more nodes as ov grows. Not a bound
+    (certified False); convex (every component is a positive Gaussian kernel)."""
+
+    def validate(self, base):
+        if not isinstance(base, Bernoulli):
+            raise TypeError(
+                f"{type(self).__name__} is a normal scale mixture of the LOGISTIC law; "
+                f"{type(base).__name__} is not logistic -- use GH instead."
+            )
+
+
+@dataclass(frozen=True)
+class ProbitMixture(_LogisticMixtureBase):
+    """Stefanski's probit mixture: `sigma(t) ~ sum_k pi_k Phi(s_k t)` with sup error
+    4e-5 (3 components), 4e-6 (5), 6e-7 (6). Integrating `o ~ N(0, ov)` shrinks each
+    probit slope, `E_o Phi(s(eta + o)) = Phi(z)`, `z = s eta / r`, `r = sqrt(1 + s^2
+    ov)`, so with aux = (y, ov):
+
+        Ahat'(eta)  = sum_k pi_k Phi(z_k)                      (the smoothed mean)
+        Ahat''(eta) = sum_k pi_k (s_k / r_k) phi(z_k)
+        Ahat(eta)   = sum_k pi_k (r_k / s_k) [z_k Phi(z_k) + phi(z_k)]
+
+    (the antiderivative of Phi; the constant is fixed by Ahat -> 0 as eta -> -inf,
+    like softplus). The absolute error of `Ahat'` is at most the table's sup error for
+    EVERY ov, because the expectation of a uniformly small error stays small."""
+
+    order: int = 5
+
+    def __post_init__(self):
+        _mixture_table(_PROBIT_MIXTURES, self.order, "ProbitMixture")
+
+    def terms(self, base, eta, aux):
+        y, ov = aux
+        y, scale = base.unpack(y)  # scale: per-row trial count (1 for Bernoulli)
+        s, pi, _ = _mixture_table(_PROBIT_MIXTURES, self.order, "ProbitMixture")
+        lead = (-1,) + (1,) * jnp.ndim(eta)
+        s = jnp.asarray(s).reshape(lead)
+        pi = jnp.asarray(pi).reshape(lead)
+        r = jnp.sqrt(1.0 + s**2 * jnp.asarray(ov)[None, ...])
+        z = s * eta[None, ...] / r
+        # 0.5 erfc(-z/sqrt2) IS ndtr; jax's ndtr evaluates erf AND erfc, 3x the cost
+        cdf = 0.5 * jax.scipy.special.erfc(-z / jnp.sqrt(2.0))
+        pdf = jnp.exp(-0.5 * z * z) / jnp.sqrt(2.0 * jnp.pi)
+        ahat = jnp.sum(pi * (r / s) * (z * cdf + pdf), 0)
+        a1 = jnp.sum(pi * cdf, 0)
+        a2 = jnp.sum(pi * (s / r) * pdf, 0)
+        return y * eta - scale * ahat, y - scale * a1, scale * a2
+
+
+@dataclass(frozen=True)
+class PGMixture(_LogisticMixtureBase):
+    """Polya-Gamma atoms: `sigma(t) = 1/2 e^{t/2} sech(t/2)` with `sech(t/2) = E_w
+    e^{-w t^2/2}`, w ~ PG(1, 0), replaced by `sum_k p_k e^{-w_k t^2/2}`. A finite atom
+    mixture is a Gaussian in t, so it cannot follow `sech`'s e^{-|t|/2} tail once the
+    e^{t/2} factor is applied for t > 0: the table is fitted on t <= 0 and the t > 0
+    half is the reflection `sigma(t) = 1 - sigma(-t)`. Under `o ~ N(0, ov)` the
+    reflection is taken at the SIGN OF eta (the sign of eta + o is random), so unlike
+    `ProbitMixture` the error grows with ov, roughly by e^{ov/2}: the kernel
+    e^{u/2} weights the wrong-side tail of o. With u ~ N(-|eta|, ov), d = 1 + w ov:
+
+        M_k        = E e^{u/2 - w_k u^2/2} = d^{-1/2} exp((u/2 - w_k u^2/2 + ov/8)/d)
+        Ahat'(-|eta|)  = 1/2 sum_k p_k M_k
+        Ahat''(-|eta|) = 1/2 sum_k p_k M_k (1/2 - w_k u) / d
+        Ahat(-|eta|)   = 1/2 sum_k p_k e^{1/(8 w_k)} sqrt(2 pi / w_k)
+                             Phi((sqrt(w_k) u - 1/(2 sqrt(w_k))) / sqrt(d))
+
+    and for eta > 0: `Ahat(eta) = eta + Ahat(-eta)`, `Ahat' = 1 - Ahat'(-eta)`, `Ahat''`
+    even. Kept as the PG counterpart of the probit table; `ProbitMixture` is the one
+    to use."""
+
+    order: int = 5
+
+    def __post_init__(self):
+        _mixture_table(_PG_MIXTURES, self.order, "PGMixture")
+
+    def terms(self, base, eta, aux):
+        y, ov = aux
+        y, scale = base.unpack(y)
+        w, p, _ = _mixture_table(_PG_MIXTURES, self.order, "PGMixture")
+        lead = (-1,) + (1,) * jnp.ndim(eta)
+        w = jnp.asarray(w).reshape(lead)
+        p = jnp.asarray(p).reshape(lead)
+        v = jnp.asarray(ov)[None, ...]
+        u = -jnp.abs(eta)[None, ...]
+        d = 1.0 + w * v
+        m = jnp.exp((0.5 * u - 0.5 * w * u * u + v / 8.0) / d - 0.5 * jnp.log(d))
+        a1m = 0.5 * jnp.sum(p * m, 0)
+        a2 = 0.5 * jnp.sum(p * m * (0.5 - w * u) / d, 0)
+        sw = jnp.sqrt(w)
+        logc = 1.0 / (8.0 * w) + 0.5 * jnp.log(2.0 * jnp.pi / w)
+        logcdf = jax.scipy.special.log_ndtr((sw * u - 0.5 / sw) / jnp.sqrt(d))
+        am = 0.5 * jnp.sum(p * jnp.exp(logc + logcdf), 0)
+        pos = eta > 0
+        ahat = jnp.where(pos, eta + am, am)
+        a1 = jnp.where(pos, 1.0 - a1m, a1m)
+        return y * eta - scale * ahat, y - scale * a1, scale * a2
+
+
 @dataclass(frozen=True)
 class Smoothed(ResponseModel):
     """Offset-integrated family: `smoother` applied to `base`.
 
     The wrapper only validates (at construction, via `smoother.validate(base)`) and
     delegates; scheme implementations, aux contracts, and capability requirements
-    live on the `Smoother` objects. `aux = (y, ov)` for GH/Taylor/JJEnvelope,
-    `(y, ov, xi)` for JJFixed -- the per-row variance ov of the random offset is the
-    leave-one-out message variance in the engine. Query `smoother.certified` to know
+    live on the `Smoother` objects. `aux = (y, ov)` for GH/Taylor/JJEnvelope/
+    ProbitMixture/PGMixture, `(y, ov, xi)` for JJFixed -- the per-row variance ov of
+    the random offset is the leave-one-out message variance in the engine. Query `smoother.certified` to know
     whether the resulting evidence is a true ELBO.
     """
 

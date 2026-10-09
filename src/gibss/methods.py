@@ -32,7 +32,9 @@ from .response import (
     JJEnvelope,
     JJFixed,
     MixtureGH,
+    PGMixture,
     Poisson,
+    ProbitMixture,
     ResponseModel,
     Smoothed,
     Taylor,
@@ -63,6 +65,13 @@ _SMOOTHERS = {
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
+    # fixed normal scale mixtures of the logistic law (Bernoulli/Binomial only): the
+    # offset integrates in closed form against each Gaussian component, so the error is
+    # the table's sup error (4e-5 at 3 components, 4e-6 at 5) at ANY offset variance,
+    # where "gh" needs more nodes as the variance grows. probit_mixture is the one to
+    # use; pg_mixture (Polya-Gamma atoms) degrades past ov ~ 4 and is kept for comparison.
+    "probit_mixture": lambda cfg: ProbitMixture(order=cfg["mixture_order"]),
+    "pg_mixture": lambda cfg: PGMixture(order=cfg["mixture_order"]),
     # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).
     # "compress" (above) doubles as the Q2 peel builder (gaussian) and the Q1 fold
     # (unconstrained); _resolve routes on variational_family.
@@ -76,6 +85,7 @@ _DEFAULTS = {
     "offset_integration": "none",  # "none" | key of _SMOOTHERS
     "offset_quadrature_points": 15,
     "effect_quadrature_points": 15,
+    "mixture_order": 5,  # components of the probit_mixture / pg_mixture logistic tables
     "compress_degree": 48,  # Chebyshev degree M for the compress/cf offset tables
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
@@ -268,6 +278,7 @@ def fit_glm_susie(
     offset_integration=None,
     offset_quadrature_points=None,
     effect_quadrature_points=None,
+    mixture_order=None,
     background=None,
     # plain values (no preset interaction, ordinary defaults)
     center=None,  # pre-center columns; None = on wherever supported (see below)
@@ -311,9 +322,10 @@ def fit_glm_susie(
 
     `effect_quadrature_points` is the GH tail for integrating the effect b
     (unconstrained q only); `offset_quadrature_points` is the nested GH inside
-    offset_integration="gh". Axis arguments not consulted by the resolved
-    configuration are ignored (tuning knobs), but combinations implying a wrong
-    model are rejected -- see `_resolve`.
+    offset_integration="gh"; `mixture_order` is the number of components of the
+    offset_integration="probit_mixture" / "pg_mixture" logistic tables (2 to 6).
+    Axis arguments not consulted by the resolved configuration are ignored (tuning
+    knobs), but combinations implying a wrong model are rejected -- see `_resolve`.
 
     Pass `record=History()` (see `gibss.history`) to capture the full fitting history --
     a host-numpy snapshot after every single-effect update -- without putting any of it on
@@ -353,6 +365,7 @@ def fit_glm_susie(
             offset_integration=offset_integration,
             offset_quadrature_points=offset_quadrature_points,
             effect_quadrature_points=effect_quadrature_points,
+            mixture_order=mixture_order,
             background=background,
         ).items()
         if v is not None

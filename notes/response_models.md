@@ -357,3 +357,55 @@ finite by construction; the price EM pays is a diffuse Ez and much softer PIPs.
 Simple, human-readable: one per-column kernel (`glm_ser`), a tiny ResponseModel per
 family, the two-group SER with no EM matching/beating the EM twogroup on PIP, generic
 GLM family for logistic/Poisson, suite green. [reached for milestones 1-5]
+
+## Fixed normal scale mixtures of the logistic law (probit_mixture / pg_mixture)
+
+The logistic cumulant has no closed-form Gaussian convolution, so every pointwise
+`(y, ov)` scheme either quadratures it (GH), expands it (Taylor) or bounds it (JJ). A
+normal scale mixture of the logistic law does convolve in closed form: each component
+is a Gaussian kernel in the predictor, and a Gaussian kernel convolved with
+`N(0, ov)` is one more Gaussian. `ProbitMixture(order=K)` replaces `sigma` ONCE with
+Stefanski's `sum_k pi_k Phi(s_k t)` (minimax fitted, sup error 4e-5 at K=3, 4e-6 at
+K=5, 6e-7 at K=6) and then integrates the offset exactly:
+
+    Ahat'  = sum_k pi_k Phi(z_k),  z_k = s_k eta / sqrt(1 + s_k^2 ov)
+    Ahat'' = sum_k pi_k s_k / sqrt(1 + s_k^2 ov) phi(z_k)
+    Ahat   = sum_k pi_k sqrt(1 + s_k^2 ov) / s_k [z_k Phi(z_k) + phi(z_k)]
+
+The error of `Ahat'` is at most the table's sup error for EVERY ov (a bounded
+pointwise error stays bounded under expectation), measured against a 120-node GH
+reference on eta in [-15, 15]:
+
+    ov        0       1       4      10      25     cost (2000x300 terms)
+    GH5     3e-16   9e-5    4e-3    2e-2    6e-2     11 ms
+    GH15    6e-16   6e-9    3e-5    1e-3    8e-3     26 ms
+    Taylor  2e-16   1e-2    1e-1    3e-1    1e+0      4 ms
+    Probit3 4e-5    3e-5    2e-5    1e-5    9e-6      6 ms
+    Probit5 5e-6    4e-6    3e-6    2e-6    2e-6     10 ms
+
+(max |Ahat' error|; the Ahat error is 3-4x the sup error, the Ahat'' error smaller.)
+Not a bound (certified False), convex, costs one erfc and one exp per component per
+entry. End to end this shows where the offset variance is large. With a per-row random
+intercept of variance 9 (1500 x 200, L=5, 15 sweeps, reference GH with 91 nodes), the
+per-feature log BF error and wall time:
+
+    gh5      4.0 nats    2.4 s      probit3  3.8e-3    2.6 s
+    gh15     2.6e-2      5.8 s      probit5  6.2e-5    3.8 s
+    gh31     9.3e-5     10.6 s      probit6  8.8e-5    3.3 s
+    taylor2  51          0.9 s      jj       40        1.2 s
+
+so the 5-component table matches 31-node GH at a third of the cost, and at the cost of
+5-node GH it is 10^4 times closer. On an ordinary fit (small message variance) every
+pointwise scheme agrees with exact Q2 CAVI to the same ~3e-2 nats, the Gaussian-moment
+approximation of the offset law, and the table buys nothing. `PGMixture` is the Polya-Gamma counterpart, `sech(t/2) ~ sum_k p_k
+e^{-w_k t^2/2}` so `sigma(t) ~ 1/2 e^{t/2} sum_k p_k e^{-w_k t^2/2}`: a finite atom
+mixture is Gaussian in t and cannot follow the e^{-|t|/2} tail once the e^{t/2}
+factor is applied, so the table is fitted on t <= 0 and the other half is the
+reflection `1 - sigma(-t)`. Under a random offset the reflection is taken at the sign
+of eta, not of eta + o, so its error grows like e^{ov/2} (4e-3 by ov=10 at K=3);
+kept for comparison, use the probit table. The tables live in
+`response._PROBIT_MIXTURES` / `_PG_MIXTURES` (scales, weights, sup error) and
+`tests/test_logistic_mixtures.py` checks every row on a fine grid and (slow) re-derives
+one by the LP-in-weights / Nelder-Mead-in-scales fit (Nelder-Mead on the LP value is
+only reliable up to 6 scales; a 7 or 8 component row needs a Remez-type exchange).
+Front door: `offset_integration="probit_mixture"`, `mixture_order=K` (2 to 6, default 5).
