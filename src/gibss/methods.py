@@ -436,36 +436,13 @@ def fit_glm_susie(
     #   compress_selfnorm (Q1): dense + sparse. Bernoulli via the self-normalized centered
     #     fold; Poisson via the node-MGF baseline+support split (log_kappa_q1_sparse).
     #   quad / linear (classic): dense eager; sparse via glm_center_ser / CenteredOperator.
-    #   vi / jj: dense only (their per-entry variance/tilt drops the sparse off-support fill).
-    # Default (center=None) is CENTERED wherever the resolved kernel and builder support it,
-    # on BOTH layouts -- the canonical model, so a method name means one model and a dense
-    # and a BCOO design fit the same thing. The one exception is the sparse vi kernel (no
-    # centered fold yet), which falls back to uncentered; an EXPLICIT center=True on an
-    # unsupported combo is an error, not a fallback.
-    smoother = getattr(response, "smoother", None)
-    if kernel == "vi_gh" or isinstance(
-        smoother, (PoissonSelfNormOffset, Compress, CharFnSelfNorm)
-    ):
-        # every Q2 (vi_gh) and Q1 (self-normalized) fold consumes centering on both layouts.
-        # The analytic Q1 Poisson fold pre-centers a BCOO design via the baseline+support
-        # split (an off-support entry contributes the per-feature node MGF at -c_j, not a
-        # constant), like the Bernoulli Q1 fold.
-        if center is None:
-            center = True
-    else:
-        center_supported = (not is_bcoo(X)) or kernel in ("quad", "linear", "jj")
-        if center is None:
-            center = center_supported
-        elif center and not center_supported:
-            raise ValueError(
-                f"center=True is not supported for the resolved kernel={kernel!r} on a "
-                f"sparse (BCOO) design (only 'quad' and 'linear' consume sparse "
-                f"pre-centering; the vi/jj kernels' per-entry variance/tilt would drop "
-                f"the off-support fill-in). For the SAME intercept-decoupling benefit on "
-                f"sparse, use intercept='profiled' (a per-feature intercept, invariant to "
-                f"column shifts -- so centering is unnecessary). Otherwise pass "
-                f"center=False, or densify X."
-            )
+    #   vi / jj: dense eager; sparse via the 2-D (c m, c^2 v) background of
+    #     glm_vi_center_ser / glm_jj_center_ser (their per-entry variance/tilt puts a second
+    #     per-feature parameter on the off-support fill).
+    # Default (center=None) is CENTERED on BOTH layouts -- the canonical model, so a method
+    # name means one model and a dense and a BCOO design fit the same thing.
+    if center is None:
+        center = True
 
     data = glm.prep_data(X, y, center=center, n_trials=trials, covariates=covariates)
     init = (

@@ -66,6 +66,7 @@ from .response_ser import (
     glm_linear_ser,
     glm_profile_ser_nodes,
     glm_ser_nodes,
+    glm_vi_center_ser,
     glm_vi_gh_center_ser,
     glm_vi_gh_profile_ser,
     glm_vi_gh_ser,
@@ -142,14 +143,24 @@ class GLMFamilyState:
     #             TaylorFixed/JJFixed schemes). Gaussian + "linear" IS linear SuSiE;
     #             JJFixed + "linear" is globaljj; TaylorFixed + "linear" is IRLS /
     #             score mode.
-    #   "vi"      glm_vi_ser / glm_vi_profile_ser -- Gaussian-restricted q(b|gamma) =
-    #             N(m, v); the pointwise scheme doubles as the E_q operator. With
-    #             JJEnvelope: classic localjj (shared) / centered localjj (profiled).
+    #   "vi"      glm_vi_ser / glm_vi_profile_ser / glm_vi_center_ser -- Gaussian-
+    #             restricted q(b|gamma) = N(m, v) with a POINTWISE scheme (GH, Taylor,
+    #             JJEnvelope, ProbitMixture, PGMixture): the scheme integrates b. Since
+    #             x b + o ~ N(x m, x^2 v + ov), one call of the scheme with the per-entry
+    #             variance x^2 v + ov is E_{b,o}; no quadrature over b, and for a scheme
+    #             closed form in its variance (the mixture tables) no quadrature at all.
+    #             Newton on m, Price's theorem for v. With JJEnvelope: classic localjj
+    #             (shared) / centered localjj (profiled). Sparse centering: the fill
+    #             carries c_j m_j AND c_j^2 v_j, so the background is the 2-D surrogate
+    #             of glm_vi_center_ser (as for "jj").
     #   "jj"      glm_jj_ser -- conjugate quadratic-bound SER (classic localjj);
     #             the kernel tunes the per-entry tilt itself. Shared intercept only.
     #   "vi_gh"   glm_vi_gh_ser -- Gaussian q(b|gamma) integrated by GH over b against
-    #             an offset-integrated cumulant (response = Smoothed(base,
-    #             CharFnOffset() | Compress())): CAVI in Q2. The offset table is built
+    #             an offset-integrated cumulant TABLE (response = Smoothed(base,
+    #             CharFnOffset() | Compress() | PoissonLogNormalOffset())): CAVI in Q2.
+    #             A table has no variance argument to fold x^2 v into (it is built for
+    #             the other effects' actual mixture law), so GH integrates b; the Poisson
+    #             table's b-integral is closed form instead. The offset table is built
     #             per update from the OTHER effects' Gaussian-mixture laws (not the
     #             message), so the offset is the true mixture, not a single Gaussian --
     #             by the exact CF product (CharFnOffset) or the quadrature peel
@@ -675,14 +686,19 @@ def _fit_effect_raw(data, fs, aux, offset, prior_variance, order):
             # a CenteredOperator's rank-1 rmatvec/moment(2) corrections carry it (O(nnz)
             # on BCOO, no background). Wrap the op and fall through to the linear branch.
             op = CenteredOperator.from_offsets(op, center)
-        else:  # vi: the entry-space per-entry variance (x^2 v) becomes a SECOND per-feature
-            # parameter under centering (c_j^2 v_j) that the 1-D background can't express -- a
-            # 2-D surrogate is a follow-up (done for 'jj' above; 'vi' pending).
+        elif fs.kernel == "vi":
+            # Gaussian q + a pointwise scheme on a centered sparse column: the per-entry
+            # variance x^2 v puts a SECOND per-feature param off-support (c_j^2 v_j next to
+            # the shift c_j m_j), so the -c_j fill background is the 2-D Chebyshev surrogate
+            # in (c m, c^2 v) + the O(nnz) support correction (glm_vi_center_ser), as for jj.
+            bg = "chebyshev" if fs.background == "exact" else fs.background
+            mu, var, log_bf, coefficient_kl = glm_vi_center_ser(
+                op, aux, offset, center, prior_variance, fs.response, background=bg,
+            )
+            return mu, var, log_bf, coefficient_kl, None
+        else:
             raise NotImplementedError(
-                "sparse (BCOO) pre-centering is implemented for kernel='quad', 'vi_gh', "
-                f"'jj' and 'linear'; kernel={fs.kernel!r} would silently fit the UNCENTERED "
-                "model (its per-entry variance adds a second per-feature parameter). "
-                "Pass center=False, or use intercept='profiled' (invariant to shifts)."
+                f"sparse (BCOO) pre-centering: unexpected kernel {fs.kernel!r}."
             )
     nodes = None  # (b_nodes, log_node_weight) for the plain quad/shared kernel, else None
     if fs.kernel == "quad" and profiled:

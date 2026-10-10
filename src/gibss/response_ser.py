@@ -680,7 +680,7 @@ def _jj_center_sums(response, offset, y, ov, a_g, b_g, with_ll):
     return W, G, jnp.sum(ll, 0)
 
 
-def _jj_center_box(c, m, v):
+def _center2d_box(c, m, v):
     """The `(a_lo, a_hi, b_lo, b_hi)` box a Chebyshev surrogate is fit over: the realized
     range of `a = c m` and `bvar = c^2 v` padded by 0.5 each way (bvar floored at 0)."""
     a, bvar = c * m, c**2 * v
@@ -692,7 +692,7 @@ def _jj_center_box(c, m, v):
     )
 
 
-def _jj_center_inside(c, m, v, box):
+def _center2d_inside(c, m, v, box):
     """Do every feature's `(c m, c^2 v)` lie inside `box`?"""
     a, bvar = c * m, c**2 * v
     a_lo, a_hi, b_lo, b_hi = box
@@ -701,8 +701,9 @@ def _jj_center_inside(c, m, v, box):
     )
 
 
-def _jj_center_cheb_fit(response, offset, y, ov, box, degree, with_ll):
-    """2-D Chebyshev coefficients `(cW, cG, cL)` of the `_jj_center_sums` functions over
+def _center2d_cheb_fit(sums, box, degree, with_ll):
+    """2-D Chebyshev coefficients `(cW, cG, cL)` of the all-rows sums `sums(a_g, b_g,
+    with_ll) -> (W, G, L)` (`_jj_center_sums` / `_vi_center_sums`, partially applied) over
     `box`, from one (degree+1)^2 CGL node grid: O(n D^2). `cL` is None unless `with_ll`."""
     a_lo, a_hi, b_lo, b_hi = box
     xnodes_np, P_np = _cheb_fit_matrix(degree)
@@ -711,12 +712,12 @@ def _jj_center_cheb_fit(response, offset, y, ov, box, degree, with_ll):
     b_nodes = 0.5 * (b_hi + b_lo) + 0.5 * (b_hi - b_lo) * xnodes  # (D+1,)
     grid_a = jnp.broadcast_to(a_nodes[:, None], (degree + 1, degree + 1))
     grid_b = jnp.broadcast_to(b_nodes[None, :], (degree + 1, degree + 1))
-    Wg, Gg, Lg = _jj_center_sums(response, offset, y, ov, grid_a, grid_b, with_ll)
+    Wg, Gg, Lg = sums(grid_a, grid_b, with_ll)
     return P @ Wg @ P.T, P @ Gg @ P.T, (P @ Lg @ P.T if with_ll else None)
 
 
-def _jj_center_cheb_eval(coef, box, a, bvar):
-    """Evaluate one `_jj_center_cheb_fit` surrogate at the per-feature `(a, bvar)` (p,):
+def _center2d_cheb_eval(coef, box, a, bvar):
+    """Evaluate one `_center2d_cheb_fit` surrogate at the per-feature `(a, bvar)` (p,):
     O(D^2 p)."""
     a_lo, a_hi, b_lo, b_hi = box
     ta = (2.0 * a - (a_hi + a_lo)) / (a_hi - a_lo)  # (p,) -> [-1, 1]
@@ -742,13 +743,13 @@ def glm_jj_center_ser(
     fill `-c_j`, and the JJ tilt there is `xi^2 = (offset - c_j m)^2 + c_j^2 v + ov` -- TWO
     per-feature params (mean shift `c_j m`, variance add `c_j^2 v`). So the all-rows
     off-support background is a 2-D Chebyshev surrogate in `(a=c m, bvar=c^2 v)`
-    (`_jj_center_cheb_fit`), corrected on the O(nnz) support entries, exactly as
+    (`_center2d_cheb_fit` of `_jj_center_sums`), corrected on the O(nnz) support entries, as
     `glm_center_ser` splits the quad kernel with the 1-D `_background`. `center` is c (p,),
     GIVEN. The evidence is the JJ ELBO (a certified lower bound), integrated exactly. Returns
     (m, v, log_bf, coefficient_kl); shared intercept only.
 
     The surrogate is fit per ROUND, not per MM iteration: a round fits the box around the
-    current iterates (`_jj_center_box`) once -- the O(n D^2) grid, which costs more than the
+    current iterates (`_center2d_box`) once -- the O(n D^2) grid, which costs more than the
     O(nnz) support pass -- then iterates the MM against that fit until it converges or an
     iterate leaves the box, in which case the next round refits around it. The MM is monotone
     from any start, so a round that converges inside its box IS the fixed point of the
@@ -773,6 +774,9 @@ def glm_jj_center_ser(
     c_e = op.broadcast_cols(c)
     xc_e = x - c_e  # (x_ij - c_j) at support entries
     inv_pv = 1.0 / prior_variance
+
+    def sums(a_g, b_g, with_ll):
+        return _jj_center_sums(response, offset, y, ov, a_g, b_g, with_ll)
 
     def support(m, v):
         # O(nnz): the support entries' own b = 0 terms at the centered value (x - c), and
@@ -807,7 +811,7 @@ def glm_jj_center_ser(
 
         def body(s):
             m, v, _, it = s
-            BGw, BGg, _ = _jj_center_sums(response, offset, y, ov, c * m, c**2 * v, False)
+            BGw, BGg, _ = sums(c * m, c**2 * v, False)
             m_new, v_new, step = mm_step(m, v, BGw, BGg)
             return m_new, v_new, step, it + 1
 
@@ -818,16 +822,16 @@ def glm_jj_center_ser(
 
         def round_body(s):
             m, v, _, it = s
-            box = _jj_center_box(c, m, v)
-            cW, cG, _ = _jj_center_cheb_fit(response, offset, y, ov, box, degree, False)
+            box = _center2d_box(c, m, v)
+            cW, cG, _ = _center2d_cheb_fit(sums, box, degree, False)
 
             def body(t):
                 m, v, _, it, _ = t
                 a, bvar = c * m, c**2 * v
-                BGw = _jj_center_cheb_eval(cW, box, a, bvar)
-                BGg = _jj_center_cheb_eval(cG, box, a, bvar)
+                BGw = _center2d_cheb_eval(cW, box, a, bvar)
+                BGg = _center2d_cheb_eval(cG, box, a, bvar)
                 m_new, v_new, step = mm_step(m, v, BGw, BGg)
-                return m_new, v_new, step, it + 1, _jj_center_inside(c, m_new, v_new, box)
+                return m_new, v_new, step, it + 1, _center2d_inside(c, m_new, v_new, box)
 
             m, v, step, it, _ = jax.lax.while_loop(
                 lambda t: (t[3] < n_iter) & (t[2] > tol) & t[4],
@@ -848,13 +852,13 @@ def glm_jj_center_ser(
     # background (with the loglik sum) at the converged box.
     a, bvar = c * m, c**2 * v
     if background == "exact":
-        BGw, BGg, BGl = _jj_center_sums(response, offset, y, ov, a, bvar, True)
+        BGw, BGg, BGl = sums(a, bvar, True)
     else:
-        box = _jj_center_box(c, m, v)
-        cW, cG, cL = _jj_center_cheb_fit(response, offset, y, ov, box, degree, True)
-        BGw = _jj_center_cheb_eval(cW, box, a, bvar)
-        BGg = _jj_center_cheb_eval(cG, box, a, bvar)
-        BGl = _jj_center_cheb_eval(cL, box, a, bvar)
+        box = _center2d_box(c, m, v)
+        cW, cG, cL = _center2d_cheb_fit(sums, box, degree, True)
+        BGw = _center2d_cheb_eval(cW, box, a, bvar)
+        BGg = _center2d_cheb_eval(cG, box, a, bvar)
+        BGl = _center2d_cheb_eval(cL, box, a, bvar)
     _, M2 = moments(m, v, BGw, BGg)
     m_e, v_e = op.broadcast_cols(m), op.broadcast_cols(v)
     em_s = off_e + xc_e * m_e
@@ -1034,6 +1038,152 @@ def glm_vi_ser(
     ll0 = response.terms(off_e, (y_e, ov_e))[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
     elbo_rel = jnp.where(ok, op.local_moment(0, ll - ll0) - kl, 0.0)
+    return m, v, elbo_rel, kl
+
+
+def _vi_center_sums(response, offset, y, ov, a_g, b_g, with_ll):
+    """All-rows off-support sums of the sparse-centered Gaussian-VI fold, as functions of
+    the two per-feature fill params `a = c m` (mean shift) and `bvar = c^2 v` (variance
+    add): at the fill `-c_j` the entry sees `eta_i = offset_i - a` with variance `ov_i +
+    bvar`, so this returns `(W, G, L) = sum_i terms(offset_i - a, (y_i, ov_i + bvar))` --
+    the smoothed curvature and score at the CURRENT mean (the Newton terms of
+    `glm_vi_ser`), and the smoothed loglik there (the evidence), or `L = None` unless
+    `with_ll`. `a_g, b_g` share any shape (a (p,) vector for the exact grid, a (D+1, D+1)
+    node grid for the surrogate) and are broadcast against the rows."""
+    lead = (-1,) + (1,) * a_g.ndim
+    off_b = offset.reshape(lead)
+    ov_b = ov.reshape(lead) if ov.ndim else ov
+    y_b = _tmap(lambda a: a.reshape(lead), y)
+    em = off_b - a_g[None, ...]
+    ve = jnp.broadcast_to(ov_b + b_g[None, ...], em.shape)
+    ll, g, w = response.terms(em, (y_b, ve))
+    return jnp.sum(w, 0), jnp.sum(g, 0), (jnp.sum(ll, 0) if with_ll else None)
+
+
+@partial(jax.jit, static_argnames=("response", "n_iter", "background", "degree"))
+def glm_vi_center_ser(
+    op,
+    aux,
+    offset,
+    center,
+    prior_variance,
+    response: ResponseModel = Smoothed(Bernoulli(), GH()),
+    n_iter: int = 100,
+    tol: float = 1e-8,
+    background: str = "chebyshev",
+    degree: int = 16,
+):
+    """Sparse-CENTERED Gaussian-restricted variational SER: `glm_vi_ser` on `eta = offset +
+    (x_ij - c_j) b`. The kernel folds the effect's own variance into the scheme's per-entry
+    variance, `x^2 v + ov`; under centering a zero design entry is the fill `-c_j`, so the
+    off-support rows see the mean shift `c_j m` AND the variance add `c_j^2 v` -- TWO
+    per-feature params, which is why the 1-D `_background` of `glm_center_ser` cannot
+    serve here. As in `glm_jj_center_ser`, the all-rows off-support sums are a 2-D
+    Chebyshev surrogate in `(c m, c^2 v)` (`_vi_center_sums`), fit per ROUND over the box
+    around the current iterates and refit when an iterate leaves it, corrected on the
+    O(nnz) support entries. The Newton iteration is `glm_vi_ser`'s; the evidence is
+    E_q[ll] - ll(b = 0) over all rows, the smoothed loglik at the posterior mean (that is
+    what the convolution computes). `background="exact"` forms the (n, p) grid every
+    iteration (validation / small p). `center` is c (p,), GIVEN; shared intercept only.
+    Returns (m, v, elbo_rel, coefficient_kl = KL(q_j || prior))."""
+    if not isinstance(response, Smoothed) or response.smoother.takes_row_param:
+        raise TypeError(
+            "glm_vi_center_ser needs Smoothed(base, scheme) with a POINTWISE scheme "
+            "(GH/Taylor/JJEnvelope/ProbitMixture/PGMixture): the scheme is the Gaussian "
+            f"expectation operator and receives the per-entry variance; got {response!r}."
+        )
+    y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
+    y = _tmap(jnp.asarray, y)
+    offset = jnp.asarray(offset)
+    ov = jnp.asarray(ov)
+    c = jnp.asarray(center)
+    x = op.entry_x
+    y_e = _tmap(op.broadcast_rows, y)
+    off_e = op.broadcast_rows(offset)
+    ov_e = op.broadcast_rows(ov) if ov.ndim else ov
+    c_e = op.broadcast_cols(c)
+    xc_e = x - c_e  # (x_ij - c_j) at support entries
+    inv_pv = 1.0 / prior_variance
+
+    def sums(a_g, b_g, with_ll):
+        return _vi_center_sums(response, offset, y, ov, a_g, b_g, with_ll)
+
+    def support(m, v):
+        # O(nnz): the support entries' own smoothed terms at the centered value (x - c), and
+        # the fill terms (-c) the all-rows background counted there, to be removed.
+        m_e, v_e = op.broadcast_cols(m), op.broadcast_cols(v)
+        ll_s, g_s, w_s = response.terms(off_e + xc_e * m_e, (y_e, xc_e**2 * v_e + ov_e))
+        ll_b, g_b, w_b = response.terms(off_e - c_e * m_e, (y_e, c_e**2 * v_e + ov_e))
+        return (
+            op.local_moment(0, xc_e * g_s),
+            op.local_moment(0, xc_e**2 * w_s),
+            op.local_moment(0, g_b),
+            op.local_moment(0, w_b),
+            op.local_moment(0, ll_s - ll_b),
+        )
+
+    def newton(m, v, BGw, BGg):
+        # score sum_i (x-c) g and curvature sum_i (x-c)^2 w over ALL rows: the support's own
+        # terms plus the fill's (-c) times the background minus its support part
+        S1, S2, Sg, Sw, _ = support(m, v)
+        prec = inv_pv + S2 + c**2 * (BGw - Sw)
+        score = S1 - c * (BGg - Sg)
+        step = jnp.clip((score - inv_pv * m) / prec, -4.0, 4.0)  # glm_vi_ser's trust region
+        return m + step, 1.0 / prec, jnp.max(jnp.abs(step))
+
+    init = (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0)
+    if background == "exact":
+
+        def body(s):
+            m, v, _, it = s
+            BGw, BGg, _ = sums(c * m, c**2 * v, False)
+            m_new, v_new, step = newton(m, v, BGw, BGg)
+            return m_new, v_new, step, it + 1
+
+        m, v, _, _ = jax.lax.while_loop(lambda s: (s[3] < n_iter) & (s[2] > tol), body, init)
+    else:
+
+        def round_body(s):
+            m, v, _, it = s
+            box = _center2d_box(c, m, v)
+            cW, cG, _ = _center2d_cheb_fit(sums, box, degree, False)
+
+            def body(t):
+                m, v, _, it, _ = t
+                a, bvar = c * m, c**2 * v
+                BGw = _center2d_cheb_eval(cW, box, a, bvar)
+                BGg = _center2d_cheb_eval(cG, box, a, bvar)
+                m_new, v_new, step = newton(m, v, BGw, BGg)
+                return m_new, v_new, step, it + 1, _center2d_inside(c, m_new, v_new, box)
+
+            m, v, step, it, _ = jax.lax.while_loop(
+                lambda t: (t[3] < n_iter) & (t[2] > tol) & t[4],
+                body,
+                (m, v, jnp.inf, it, jnp.array(True)),
+            )
+            return m, v, step, it
+
+        m, v, _, _ = jax.lax.while_loop(
+            lambda s: (s[3] < n_iter) & (s[2] > tol), round_body, init
+        )
+    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
+    m = jnp.where(ok, m, 0.0)
+    v = jnp.where(ok, v, prior_variance)
+
+    # evidence: all-rows smoothed loglik at (m, v) -- the background's L at the fill, the
+    # support's own terms in place of its fill terms -- minus the b = 0 baseline (offset
+    # variance only, feature-independent: one scalar)
+    a, bvar = c * m, c**2 * v
+    if background == "exact":
+        _, _, BGl = sums(a, bvar, True)
+    else:
+        box = _center2d_box(c, m, v)
+        _, _, cL = _center2d_cheb_fit(sums, box, degree, True)
+        BGl = _center2d_cheb_eval(cL, box, a, bvar)
+    L = BGl + support(m, v)[4]
+    L0 = jnp.sum(response.terms(offset, (y, ov))[0])
+    kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+    elbo_rel = jnp.where(ok, L - L0 - kl, 0.0)
     return m, v, elbo_rel, kl
 
 

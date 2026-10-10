@@ -185,19 +185,23 @@ def test_linear_kernel_sparse_centered_matches_dense():
     np.testing.assert_allclose(np.asarray(dense.alpha), np.asarray(sp.alpha), atol=1e-9)
 
 
-def test_explicit_center_true_unsupported_sparse_raises():
-    # kernel='vi' still lacks a sparse centered fold (jj got the 2-D background; vi's
-    # per-entry variance needs the same and is pending), so an EXPLICIT center=True there is
-    # a clear front-door error, not a deep NotImplementedError from the dispatch.
+def test_sparse_vi_centers_by_default_and_matches_dense():
+    # kernel='vi' on BCOO used to be the one combination without a centered fold (an
+    # explicit center=True raised, the default fell back to uncentered). It now has the
+    # 2-D background (glm_vi_center_ser), so the default is centered on both layouts and
+    # the BCOO fit equals the dense eagerly-centered fit.
     import jax
     from jax.experimental import sparse
     X, y = _data("logistic")
     Xs = sparse.BCOO.fromdense(jax.numpy.asarray(X))
-    with pytest.raises(ValueError, match="center=True is not supported"):
-        fit_glm_susie(
-            Xs, y, variational_family="gaussian", offset_integration="gh",
-            center=True, max_iter=5,
-        )
+    kw = {"variational_family": "gaussian", "offset_integration": "gh", "max_iter": 10}
+    dense = fit_glm_susie(X, y, **kw)
+    sp = fit_glm_susie(Xs, y, **kw)
+    assert sp.family_state.kernel == "vi"
+    np.testing.assert_allclose(np.asarray(dense.alpha), np.asarray(sp.alpha), atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(dense.ser_log_bf), np.asarray(sp.ser_log_bf), atol=1e-6
+    )
 
 
 def test_center_and_adaptive_background_front_door():
@@ -262,7 +266,7 @@ def test_explicit_table_response_routes_to_vi_gh():
     cf_cavi / compress_cavi) must resolve to the vi_gh kernel: the generic Smoothed
     fallthrough ('vi') hands it a (y, ov) aux the table cannot consume."""
     from gibss.cf_offset import CharFnOffset
-    from gibss.methods import _resolve, _DEFAULTS
+    from gibss.methods import _DEFAULTS, _resolve
     from gibss.response import Bernoulli, Smoothed
 
     resp = Smoothed(Bernoulli(), CharFnOffset(M=32))
