@@ -67,7 +67,8 @@ _SMOOTHERS = {
     "jj_fixed": lambda cfg: JJFixed(),
     # fixed normal scale mixtures of the logistic law (Bernoulli/Binomial only): the
     # offset integrates in closed form against each Gaussian component, so the error is
-    # the table's sup error (4e-5 at 3 components, 4e-6 at 5) at ANY offset variance,
+    # the table's sup error (4e-5 at 3 components, 6e-7 at 5, 6e-9 at 8) at ANY offset
+    # variance,
     # where "gh" needs more nodes as the variance grows. probit_mixture costs one erfc
     # and one exp per component; pg_mixture (Polya-Gamma atoms) has the same guarantee
     # but needs two bivariate normal orthants per component, ~10x the cost.
@@ -324,7 +325,7 @@ def fit_glm_susie(
     `effect_quadrature_points` is the GH tail for integrating the effect b
     (unconstrained q only); `offset_quadrature_points` is the nested GH inside
     offset_integration="gh"; `mixture_order` is the number of components of the
-    offset_integration="probit_mixture" / "pg_mixture" logistic tables (2 to 6).
+    offset_integration="probit_mixture" / "pg_mixture" logistic tables (2 to 8).
     Axis arguments not consulted by the resolved configuration are ignored (tuning
     knobs), but combinations implying a wrong model are rejected -- see `_resolve`.
 

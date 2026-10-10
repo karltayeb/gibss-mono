@@ -365,23 +365,24 @@ The logistic cumulant has no closed-form Gaussian convolution, so every pointwis
 normal scale mixture of the logistic law does convolve in closed form: each component
 is a Gaussian kernel in the predictor, and a Gaussian kernel convolved with
 `N(0, ov)` is one more Gaussian. `ProbitMixture(order=K)` replaces `sigma` ONCE with
-Stefanski's `sum_k pi_k Phi(s_k t)` (minimax fitted, sup error 4e-5 at K=3, 4e-6 at
-K=5, 6e-7 at K=6) and then integrates the offset exactly:
+Stefanski's `sum_k pi_k Phi(s_k t)` (minimax fitted, sup error 4e-5 at K=3, 6e-7 at
+K=5, 8e-8 at K=6, 6e-9 at K=8) and then integrates the offset exactly:
 
     Ahat'  = sum_k pi_k Phi(z_k),  z_k = s_k eta / sqrt(1 + s_k^2 ov)
     Ahat'' = sum_k pi_k s_k / sqrt(1 + s_k^2 ov) phi(z_k)
     Ahat   = sum_k pi_k sqrt(1 + s_k^2 ov) / s_k [z_k Phi(z_k) + phi(z_k)]
 
 The error of `Ahat'` is at most the table's sup error for EVERY ov (a bounded
-pointwise error stays bounded under expectation), measured against a 120-node GH
+pointwise error stays bounded under expectation), measured against a trapezoid
 reference on eta in [-15, 15]:
 
     ov        0       1       4      10      25     cost (2000x300 terms)
-    GH5     3e-16   9e-5    4e-3    2e-2    6e-2     11 ms
-    GH15    6e-16   6e-9    3e-5    1e-3    8e-3     26 ms
-    Taylor  2e-16   1e-2    1e-1    3e-1    1e+0      4 ms
-    Probit3 4e-5    3e-5    2e-5    1e-5    9e-6      6 ms
-    Probit5 5e-6    4e-6    3e-6    2e-6    2e-6     10 ms
+    GH5     2e-16   9e-5    4e-3    2e-2    6e-2     11 ms
+    GH15    4e-16   6e-9    3e-5    1e-3    8e-3     26 ms
+    Taylor  0       1e-2    1e-1    3e-1    1e+0      4 ms
+    Probit3 4e-5    3e-5    2e-5    1e-5    8e-6      6 ms
+    Probit5 6e-7    5e-7    3e-7    2e-7    1e-7     10 ms
+    Probit8 7e-9    3e-9    1e-9    1e-9    1e-9     16 ms
 
 (max |Ahat' error|; the Ahat error is 3-4x the sup error, the Ahat'' error smaller.)
 Not a bound (certified False), convex, costs one erfc and one exp per component per
@@ -415,8 +416,9 @@ against scipy in tests/test_bvn.py). The result is exact for sigma-hat (5e-12 ag
 trapezoid integral of it) and the error against the logistic is the table's sup error
 at every ov, like probit:
 
-    ov        0.3     1       4      10      25     cost
-    PG5     1.2e-6  1.0e-6  6.7e-7  4.3e-7  1.1e-6   176 ms
+    ov        0       1       4      10      25     cost
+    PG5     2e-7    2e-7    1e-7    8e-8    5e-8     176 ms
+    PG8     2e-9    7e-10   4e-10   4e-10   3e-10    280 ms
 
 The price is the orthants: two per component per entry, each two Owen's T (24 exps)
 and a few erfc, about 10x the probit table and 7x GH15. In the random-intercept
@@ -426,7 +428,20 @@ closed form in Phi alone but its error grows like e^{ov/2} (3e-2 by ov=25); it w
 tried and dropped. The probit representation never needs a split because Phi has the
 same tail shape as sigma on both sides. The tables live in
 `response._PROBIT_MIXTURES` / `_PG_MIXTURES` (scales, weights, sup error) and
-`tests/test_logistic_mixtures.py` checks every row on a fine grid and (slow) re-derives
-one by the LP-in-weights / Nelder-Mead-in-scales fit (Nelder-Mead on the LP value is
-only reliable up to 6 scales; a 7 or 8 component row needs a Remez-type exchange).
-Front door: `offset_integration="probit_mixture"`, `mixture_order=K` (2 to 6, default 5).
+`gibss._mixture_fit` is the fitting protocol and `python -m gibss._mixture_fit --family
+probit --K 9` makes a new row: the outer problem in the scales is a nonconvex nonlinear
+Chebyshev approximation, so each run is a sequential LP (linearize the error in the
+log-scales and the weights, solve `min h s.t. |e + J d| <= h` on the simplex inside a
+trust region), from a few hundred log-uniform random starts, with the best run polished
+Remez-style (the continuous extrema of the error, Brent-refined, are added to the grid
+until the discrete and continuous sup agree). `certify` reports the continuous sup
+error, the equioscillation count against the 2K alternation points a local optimum of
+the 2K-1 parameter family needs, and the basin fraction (starts reaching the best
+value), which is the evidence for globality since the outer problem has no certificate.
+The first tables (Nelder-Mead on the LP value) were local optima short of
+equioscillation on 7 of 9 rows, 2-6x above the minimax level. Rows 2-6 of both families
+now equioscillate on all 2K points; the K=7 and 8 rows are the best found (13/14 and
+15/16 in both families), the end game stalls one short there, and the test pins their
+counts. `tests/test_logistic_mixtures.py` re-certifies every
+stored row and (slow) checks it is a fixed point of the SLP. Front door:
+`offset_integration="probit_mixture"`, `mixture_order=K` (2 to 8, default 5).
