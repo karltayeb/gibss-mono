@@ -486,10 +486,16 @@ is the limitation of fixed-node GH and the reason for the mixtures; in the Gauss
 family prefer `probit_mixture`.
 
 The companion report, that `compute_elbo_gaussian` scores one state 0.3-0.5 nats lower on
-sparse centered X than on dense, did not reproduce: on the same cell the CF ELBO agrees
-across layouts to 1e-4 in every case tried (fitted states, effect variances inflated 10x
-and 100x, both scoring orders in separate processes), at main and at the experiments'
-pinned commit 735749e; Compress agrees to 6e-3 and a 4e5-sample Monte Carlo to 1.5 se.
+sparse centered X than on dense, is a Poisson bug: `elbo._poisson_expected_ll` called
+`log_kappa_sparse` / `log_kappa_q1_sparse` without the design's column means, so on a
+pre-centered BCOO design every off-support entry was scored at fill 0 instead of -c_j, a
+near-constant per-row bias (0.22 nats on a 600 x 40 density-0.1 design, the same for
+gIBSS-Q2, CAVI-Q2 and free-form Q1 states). The fit's own offset tables already passed
+`colmean` (`glm._build_offset_table`); the evaluator now does too, in both the Q2 and Q1
+arms. The logistic CF path was never affected (its sparse fold took the centering from the
+start), which is why the logistic checks on 022 agreed across layouts to 1e-4.
+`tests/test_elbo_sparse_center.py` pins dense-vs-sparse agreement of `compute_elbo` and
+`compute_elbo_gaussian` for both families in Q2 and Q1.
 `tests/test_vi_damping.py` pins the convergence (100 vs 1000 iterations, dense vs both
 sparse backgrounds, profiled), the probit optimum against brute force, and the front
 door's dense/sparse agreement at a capped prior variance.

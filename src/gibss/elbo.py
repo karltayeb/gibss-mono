@@ -133,6 +133,10 @@ def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var, r
     mean)."""
     fs = state.family_state
     X = data.X
+    # a pre-centered BCOO design carries its column means and the off-support fill is
+    # -c_j: the sparse builders take the baseline+support split, as in the fit's own
+    # offset tables (glm._build_offset_table); dense data is centered eagerly.
+    colmean = getattr(data, "column_center", None)
     effects = list(state.single_effects)
     if is_q1:
         node_effects = [
@@ -145,7 +149,7 @@ def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var, r
             icpt = (fs.intercept_b_nodes, fs.intercept_log_node_weight)
         n = jnp.asarray(data.y).shape[0]
         if is_bcoo(X):
-            logk = log_kappa_q1_sparse(X, node_effects, n, intercept=icpt)
+            logk = log_kappa_q1_sparse(X, node_effects, n, intercept=icpt, colmean=colmean)
         else:
             logk = log_kappa_q1_dense(X, node_effects, n, intercept=icpt)
         # A SHARED intercept fit as a POINT (plug-in gIBSS: no free-form nodes) still has a
@@ -164,7 +168,7 @@ def _poisson_expected_ll(data, state, eta, is_q1, integrate_b0, intercept_var, r
         offset_var = intercept_var + ri_var
         if is_bcoo(X):
             eff = [(e.alpha, e.mu, e.var) for e in effects]
-            logk = log_kappa_sparse(X, eff, offset_var=offset_var)
+            logk = log_kappa_sparse(X, eff, offset_var=offset_var, colmean=colmean)
         else:
             eff = [(X, e.alpha, e.mu, e.var) for e in effects]
             logk = log_kappa_dense(eff, jnp.asarray(data.y).shape[0], offset_var=offset_var)
