@@ -499,3 +499,16 @@ start), which is why the logistic checks on 022 agreed across layouts to 1e-4.
 `tests/test_vi_damping.py` pins the convergence (100 vs 1000 iterations, dense vs both
 sparse backgrounds, profiled), the probit optimum against brute force, and the front
 door's dense/sparse agreement at a capped prior variance.
+
+## LogNormal: the exact single-Gaussian offset for Poisson
+
+`E_{o ~ N(0, ov)} e^{eta + o} = e^{eta + ov/2}`, so the Gaussian-smoothed Poisson cumulant
+is the Poisson cumulant at a shifted predictor, with `Ahat' = Ahat'' = Ahat`. `LogNormal`
+is that scheme: closed form, certified with equality, convex, with closed-form shifted row
+sums (`log_link_shift_sums`) for the centered backgrounds. `offset_integration="lognormal"`
+on the Poisson family; under `variational_family="unconstrained"` it is gIBSS with the
+moment-matched offset and the GH tail over b, under `"gaussian"` the `vi` kernel becomes
+closed-form Gaussian VI for Poisson (the per-feature ELBO `sum_i y_i eta_i - e^{eta_i +
+(x_i^2 v + ov_i)/2} - KL` is maximized exactly). It is what `"gh"` approximates on this
+family, and it supersedes `"gh"` and `"taylor2"` there. `PoissonLogNormalOffset`
+(`cf_cavi`) remains the exact fold of the other effects' mixture law.

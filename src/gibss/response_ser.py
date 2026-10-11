@@ -1028,12 +1028,12 @@ def glm_vi_ser(
     higher ELBO): the Gaussian restriction trades a little evidence for Gaussian
     messages that are exact within the variational family and, with a certified
     scheme, a true ELBO. `aux = (y, ov)` or plain y (ov = 0); `response` must be
-    Smoothed(base, scheme) with a pointwise scheme (GH/Taylor/JJEnvelope).
+    Smoothed(base, scheme) with a pointwise scheme (GH/Taylor/LogNormal/JJEnvelope).
     Returns (m, v, elbo_rel, coefficient_kl = KL(q_j || prior))."""
     if not isinstance(response, Smoothed) or response.smoother.takes_row_param:
         raise TypeError(
             "glm_vi_ser needs Smoothed(base, scheme) with a POINTWISE scheme "
-            "(GH/Taylor/JJEnvelope): the scheme is the Gaussian expectation operator "
+            "(GH/Taylor/LogNormal/JJEnvelope): the scheme is the Gaussian expectation operator "
             f"and receives the per-entry variance x^2 v + ov; got {response!r}."
         )
     y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
@@ -1126,7 +1126,7 @@ def glm_vi_center_ser(
     if not isinstance(response, Smoothed) or response.smoother.takes_row_param:
         raise TypeError(
             "glm_vi_center_ser needs Smoothed(base, scheme) with a POINTWISE scheme "
-            "(GH/Taylor/JJEnvelope/ProbitMixture/PGMixture): the scheme is the Gaussian "
+            "(GH/Taylor/LogNormal/JJEnvelope/ProbitMixture/PGMixture): the scheme is the Gaussian "
             f"expectation operator and receives the per-entry variance; got {response!r}."
         )
     y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)
@@ -1550,12 +1550,12 @@ def glm_vi_profile_ser(
     columns); pre-centering makes it exact.
 
     aux = (y, ov) or plain y (ov = 0); response must be Smoothed with a pointwise
-    scheme (GH/Taylor/JJEnvelope). Returns (m, v, elbo_rel, coefficient_kl, b0,
+    scheme (GH/Taylor/LogNormal/JJEnvelope). Returns (m, v, elbo_rel, coefficient_kl, b0,
     precision), the glm_profile_ser contract."""
     if not isinstance(response, Smoothed) or response.smoother.takes_row_param:
         raise TypeError(
             "glm_vi_profile_ser needs Smoothed(base, scheme) with a POINTWISE scheme "
-            "(GH/Taylor/JJEnvelope): the scheme is the Gaussian expectation operator "
+            "(GH/Taylor/LogNormal/JJEnvelope): the scheme is the Gaussian expectation operator "
             f"and receives the per-entry variance x^2 v + ov; got {response!r}."
         )
     y, ov = aux if isinstance(aux, tuple) else (aux, 0.0)

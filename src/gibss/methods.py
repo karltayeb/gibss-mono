@@ -31,6 +31,7 @@ from .response import (
     Gaussian,
     JJEnvelope,
     JJFixed,
+    LogNormal,
     MixtureGH,
     PGMixture,
     Poisson,
@@ -67,6 +68,9 @@ _SMOOTHERS = {
     # non-Gaussian quadrature posterior -> the IBSS fixed point is the exact CAVI posterior.
     "compress_selfnorm": lambda cfg: CompressSelfNorm(M=cfg["compress_degree"]),
     "taylor2": lambda cfg: Taylor(),
+    # lognormal: the exact single-Gaussian offset for the Poisson base, E e^{eta+o} =
+    # e^{eta+ov/2}; closed form and certified, so it is what "gh" approximates there.
+    "lognormal": lambda cfg: LogNormal(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
@@ -266,7 +270,8 @@ def _resolve(cfg):
         raise ValueError(
             "variational_family='gaussian' needs an offset-integration scheme "
             "(the scheme is the variational expectation operator E_q): set "
-            "offset_integration to 'gh', 'taylor2', 'jj' (single-Gaussian offset), "
+            "offset_integration to 'gh', 'taylor2', 'jj', 'lognormal' (single-Gaussian "
+            "offset), "
             "'cf'/'compress' (exact-mixture CAVI), or 'none' (plug-in mean)."
         )
     return response, "vi"
@@ -335,6 +340,8 @@ def fit_glm_susie(
     falls with the per-entry variance x^2 v + ov (a near-separated feature at prior
     variance 100 puts its posterior variance 3-4x off); "probit_mixture" keeps its 6e-7
     at any variance and is the better choice there.
+    For the Poisson family offset_integration="lognormal" is the exact single-Gaussian
+    offset, e^{eta + ov/2}, closed form and certified; "gh" only approximates it.
     Axis arguments not consulted by the resolved configuration are ignored (tuning
     knobs), but combinations implying a wrong model are rejected -- see `_resolve`.
 

@@ -56,6 +56,7 @@ __all__ = [
     "Gaussian",
     "JJEnvelope",
     "JJFixed",
+    "LogNormal",
     "MixtureGH",
     "PGMixture",
     "Poisson",
@@ -1359,6 +1360,38 @@ class Taylor(Smoother):
         a3, a4 = base.cumulant_derivs(eta)
         hv = 0.5 * jnp.asarray(ov)
         return ll - hv * w, g - hv * scale * a3, w + hv * scale * a4
+
+
+@dataclass(frozen=True)
+class LogNormal(Smoother):
+    """Exact Gaussian smoothing of the log link: `E_{o ~ N(0, ov)} e^{eta + o} = e^{eta + ov/2}`,
+    so `Ahat(eta; ov) = e^{eta + ov/2}` and `Ahat' = Ahat'' = Ahat` -- a Poisson row under a
+    Gaussian offset is a Poisson row with its predictor shifted by ov/2. aux = (y, ov).
+    Closed form (no extra likelihood pass), certified with equality (Ahat == Atilde) and
+    convex; in the `vi` kernel, whose entry variance is x^2 v + ov, it makes Gaussian VI
+    for Poisson closed form per Newton step, and its shifted row sums are closed form
+    (`log_link_shift_sums`), so the centered backgrounds need no Chebyshev surrogate.
+    Requires the Poisson base. This is the single-Gaussian (moment-matched) offset; the
+    other effects' actual mixture law folds through `PoissonLogNormalOffset` (cf_cavi)."""
+
+    certified = True
+
+    def validate(self, base):
+        if not isinstance(base, Poisson):
+            raise TypeError(
+                "LogNormal needs the Poisson base (log link: E e^{eta + o} = e^{eta + ov/2}); "
+                f"got {type(base).__name__}."
+            )
+
+    def terms(self, base, eta, aux):
+        y, ov = aux
+        hv = 0.5 * jnp.asarray(ov)
+        ll, g, w = base.terms(eta + hv, y)  # y (eta + hv) - e^{eta + hv}, and its derivatives
+        return ll - jnp.asarray(y) * hv, g, w
+
+    def shift_sums(self, base, offset, aux, op=None):
+        y, ov = aux
+        return log_link_shift_sums(y, offset, offset + 0.5 * jnp.asarray(ov), op=op)
 
 
 @dataclass(frozen=True)
