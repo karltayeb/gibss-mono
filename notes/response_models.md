@@ -445,3 +445,51 @@ now equioscillate on all 2K points; the K=7 and 8 rows are the best found (13/14
 counts. `tests/test_logistic_mixtures.py` re-certifies every
 stored row and (slow) checks it is a fixed point of the SLP. Front door:
 `offset_integration="probit_mixture"`, `mixture_order=K` (2 to 8, default 5).
+
+## The Gaussian-VI fixed point at large variance (the 022 density-0.005 regression)
+
+The 022 "smoothed" arm (Smoothed(GH5), Gaussian q, EB prior variance capped at 100) gave
+different answers on the dense and sparse layouts of the same data at density 0.005
+(five-member sets): up to 0.56 in PIP and 2.6 nats on 3 of 8 cells, while probit_mixture
+agreed to every digit. The sparse centering was not the cause: the 2-D Chebyshev
+background agrees with the exact all-rows sums to 1e-12 there. The iteration itself did
+not converge; dense GH5 with 100 vs 1000 Newton iterations differed by 7 in a posterior
+mean, and the two layouts were two different non-converged iterates. The map `(m, v) <-
+(m + clipped Newton step, 1 / (1/pv + sum x^2 w))` is not a contraction at large x^2 v:
+on a separated column (three members, all 1) at prior variance 100 it 2-cycles between
+two regimes with +-4 m-steps, and this is true of the EXACT scheme as well. probit5 on
+that column alternated between (m 6.3, v 45) and (m 10.3, v 6.7) forever, the gradient of
+the per-feature ELBO at either point is 0.1, and the true maximum (brute force) is (9.47,
+15.24); main's answer was whichever iterate the n_iter cap landed on. Probit agreed across
+layouts on 022 because the two runs happened to land on the same phase.
+
+The three kernels (`glm_vi_ser`, `glm_vi_center_ser`, `glm_vi_profile_ser`) now damp the
+log-v step per feature, halving the damping when the step reverses direction and doubling
+it back otherwise (`_damped_variance_step`; floor 1/16, cap 1), and the stop residual
+includes the v step (it used to be the m step alone, so a tiny m step with v still moving
+could also stop the loop early). The m update and Price's theorem are unchanged. On the
+separated column the damped iteration converges to the brute-force maximum of the exact
+objective for probit5, and to a fixed point in 50-90 iterations for GH5 and Taylor; dense,
+sparse-exact and sparse-Chebyshev agree to 1e-6, as do 100 and 1000 iterations.
+
+A variant that gave each scheme its own variance slope (`-2 dAhat/d(ov)` of the GH node
+sum, the base A'' for Taylor, so the fixed point is the maximum of the scheme's smoothed
+ELBO) was tried and dropped: at prior variance 1, Taylor's Price curvature (A'' + ov/2
+A'''') puts v within 2% of the exact 0.604 while its own slope (A'') is 5% off, and GH's
+node-sum derivative is a Stein-identity estimate of E[A''] that is worse than the node
+average `w` at any variance. The kernel is a quadrature of the exact stationarity
+conditions, with the scheme as the expectation operator for A' and A'' alike; for an
+inexact scheme the fixed point is its estimate of the exact optimum. GH5 at prior
+variance 100 is still a poor estimate (v 15 against probit5's exact 3.75 on 022's
+feature 127): five nodes cannot integrate the logistic cumulant against N(m, 26), which
+is the limitation of fixed-node GH and the reason for the mixtures; in the Gaussian
+family prefer `probit_mixture`.
+
+The companion report, that `compute_elbo_gaussian` scores one state 0.3-0.5 nats lower on
+sparse centered X than on dense, did not reproduce: on the same cell the CF ELBO agrees
+across layouts to 1e-4 in every case tried (fitted states, effect variances inflated 10x
+and 100x, both scoring orders in separate processes), at main and at the experiments'
+pinned commit 735749e; Compress agrees to 6e-3 and a 4e5-sample Monte Carlo to 1.5 se.
+`tests/test_vi_damping.py` pins the convergence (100 vs 1000 iterations, dense vs both
+sparse backgrounds, profiled), the probit optimum against brute force, and the front
+door's dense/sparse agreement at a capped prior variance.

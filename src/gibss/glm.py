@@ -149,7 +149,8 @@ class GLMFamilyState:
     #             x b + o ~ N(x m, x^2 v + ov), one call of the scheme with the per-entry
     #             variance x^2 v + ov is E_{b,o}; no quadrature over b, and for a scheme
     #             closed form in its variance (the mixture tables) no quadrature at all.
-    #             Newton on m, Price's theorem for v. With JJEnvelope: classic localjj
+    #             Newton on m, Price's theorem for v (damped in log v when it
+    #             reverses: the undamped map 2-cycles at large x^2 v). With JJEnvelope: classic localjj
     #             (shared) / centered localjj (profiled). Sparse centering: the fill
     #             carries c_j m_j AND c_j^2 v_j, so the background is the 2-D surrogate
     #             of glm_vi_center_ser (as for "jj").

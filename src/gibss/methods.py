@@ -53,6 +53,11 @@ _FAMILIES = {
 
 # smoother constructors, keyed by public name; each receives the resolved config
 _SMOOTHERS = {
+    # gh: Gauss-Hermite on the TRUE cumulant at fixed nodes. In the Gaussian family the
+    # same rule also integrates the effect (one lumped variance x^2 v + ov, the "vi"
+    # kernel), so its accuracy degrades with that variance: on a near-separated feature
+    # with the prior variance in the tens, five nodes put the posterior variance 3-4x off.
+    # probit_mixture is exact to 6e-7 at any variance for 1.5x the cost; prefer it there.
     "gh": lambda cfg: GH(order=cfg["offset_quadrature_points"]),
     "compress": lambda cfg: Compress(
         inner=MixtureGH(order=cfg["offset_quadrature_points"]),
@@ -325,7 +330,11 @@ def fit_glm_susie(
     `effect_quadrature_points` is the GH tail for integrating the effect b
     (unconstrained q only); `offset_quadrature_points` is the nested GH inside
     offset_integration="gh"; `mixture_order` is the number of components of the
-    offset_integration="probit_mixture" / "pg_mixture" logistic tables (2 to 8).
+    offset_integration="probit_mixture" / "pg_mixture" logistic tables (2 to 8). In the
+    Gaussian family "gh" integrates the effect with those same nodes, so its accuracy
+    falls with the per-entry variance x^2 v + ov (a near-separated feature at prior
+    variance 100 puts its posterior variance 3-4x off); "probit_mixture" keeps its 6e-7
+    at any variance and is the better choice there.
     Axis arguments not consulted by the resolved configuration are ignored (tuning
     knobs), but combinations implying a wrong model are rejected -- see `_resolve`.
 

@@ -702,9 +702,10 @@ def _center2d_inside(c, m, v, box):
 
 
 def _center2d_cheb_fit(sums, box, degree, with_ll):
-    """2-D Chebyshev coefficients `(cW, cG, cL)` of the all-rows sums `sums(a_g, b_g,
-    with_ll) -> (W, G, L)` (`_jj_center_sums` / `_vi_center_sums`, partially applied) over
-    `box`, from one (degree+1)^2 CGL node grid: O(n D^2). `cL` is None unless `with_ll`."""
+    """2-D Chebyshev coefficients of each of the all-rows sums `sums(a_g, b_g, with_ll)`
+    (`_jj_center_sums` / `_vi_center_sums`, partially applied: a tuple of (D+1, D+1) node
+    grids, None for a sum not requested) over `box`, from one (degree+1)^2 CGL node grid:
+    O(n D^2). Returns the tuple of coefficient arrays, None where the sum was None."""
     a_lo, a_hi, b_lo, b_hi = box
     xnodes_np, P_np = _cheb_fit_matrix(degree)
     xnodes, P = jnp.asarray(xnodes_np), jnp.asarray(P_np)
@@ -712,8 +713,7 @@ def _center2d_cheb_fit(sums, box, degree, with_ll):
     b_nodes = 0.5 * (b_hi + b_lo) + 0.5 * (b_hi - b_lo) * xnodes  # (D+1,)
     grid_a = jnp.broadcast_to(a_nodes[:, None], (degree + 1, degree + 1))
     grid_b = jnp.broadcast_to(b_nodes[None, :], (degree + 1, degree + 1))
-    Wg, Gg, Lg = sums(grid_a, grid_b, with_ll)
-    return P @ Wg @ P.T, P @ Gg @ P.T, (P @ Lg @ P.T if with_ll else None)
+    return tuple(None if S is None else P @ S @ P.T for S in sums(grid_a, grid_b, with_ll))
 
 
 def _center2d_cheb_eval(coef, box, a, bvar):
@@ -960,6 +960,36 @@ def glm_linear_profile_ser(op, aux, offset, prior_variance, response: ResponseMo
     return b, var, log_bf, coefficient_kl, b0, schur
 
 
+def _vi_init(p, prior_variance):
+    """Gaussian-VI loop state: (m, v, v-damping, last v-step sign, residual, iteration)."""
+    return (jnp.zeros(p), jnp.full(p, prior_variance), jnp.ones(p), jnp.zeros(p), jnp.inf, 0)
+
+
+def _vi_resid(step, dlogv):
+    return jnp.maximum(jnp.max(jnp.abs(step)), jnp.max(jnp.abs(dlogv)))
+
+
+def _damped_variance_step(v, prec, lam, sgn, tol):
+    """One Gaussian-VI variance step toward its fixed point `1/prec` (prec = 1/pv + sum
+    x^2 w), in log v with a per-feature damping `lam` that halves (floor 1/16) when the
+    step reverses direction and doubles back (cap 1) when it does not. The undamped map
+    `(m, v) <- (m + clipped Newton step, 1/prec(m, v))` is not a contraction at large
+    x^2 v: on a separated column at prior variance 100 it 2-cycles between two regimes
+    (probit5: m 6.3 / v 45 and m 10.3 / v 6.7, with +-4 m-steps, while the true optimum is
+    m 9.5 / v 15.2), for the exact schemes as much as for GH, and the iterate at n_iter was
+    the answer. The damping breaks the cycle; the grow-back keeps a monotone approach at
+    full speed. Returns `(v_new, lam, sgn, dlogv)` with `dlogv` the step taken."""
+    dl = -jnp.log(prec) - jnp.log(v)
+    moved = jnp.abs(dl) > tol
+    s = jnp.sign(dl)
+    lam = jnp.where(
+        moved,
+        jnp.where(s * sgn < 0.0, jnp.maximum(0.5 * lam, 1.0 / 16.0), jnp.minimum(2.0 * lam, 1.0)),
+        lam,
+    )
+    return v * jnp.exp(lam * dl), lam, jnp.where(moved, s, sgn), lam * dl
+
+
 @partial(jax.jit, static_argnames=("response", "n_iter"))
 def glm_vi_ser(
     op,
@@ -982,9 +1012,17 @@ def glm_vi_ser(
     expectation operator -- the kernel feeds it the entry-shaped variance, exactly
     as glm_jj_ser feeds an entry-shaped tilt. Stationarity: m solves the smoothed
     score equation; 1/v = 1/pv + sum_i x^2 weight (Price's theorem: d/dv E[f] =
-    1/2 E[f''], with `weight` the scheme's curvature -- exact Ahat'' for GH/Taylor;
-    for JJEnvelope it is the MM majorizer and the iteration is coordinate ascent on
-    the BOUND's ELBO, whose fixed point is classic localjj (= glm_jj_ser) exactly.
+    1/2 E[f''], with `weight` the scheme's curvature). The scheme is the expectation
+    operator for A' and A'' alike, so for an inexact scheme (GH, Taylor) the fixed point
+    is that scheme's estimate of the exact optimum rather than the optimum of a
+    surrogate objective (a Taylor or GH node sum differentiated in the variance tracks
+    the truth worse than its curvature does); for the probit/PG mixtures it is exact;
+    for JJEnvelope the weight is the MM majorizer and the iteration is coordinate ascent
+    on the BOUND's ELBO, whose fixed point is classic localjj (= glm_jj_ser) exactly.
+    The map is not a contraction at large x^2 v -- on a separated column at prior
+    variance 100 it 2-cycles, for every scheme (see `_damped_variance_step`) -- so the
+    v step is damped in log v per feature when it reverses, and the stop residual
+    includes it.
 
     vs `glm_ser` (free-form q via the GH tail = the exact per-feature posterior,
     higher ELBO): the Gaussian restriction trades a little evidence for Gaussian
@@ -1014,18 +1052,17 @@ def glm_vi_ser(
         return response.terms(eta, (y_e, ve))
 
     def body(state):
-        m, v, _, it = state
+        m, v, lam, sgn, _, it = state
         _, g, w = smoothed(m, v)
         prec = inv_pv + op.local_moment(2, w)
         # Damp the Newton m-step (+-4 log-odds): undamped it overshoots to +-inf on a
         # (near-)separated column at large prior variance -- same trust region as glm_ser.
         step = jnp.clip((op.local_moment(1, g) - inv_pv * m) / prec, -4.0, 4.0)
-        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+        v, lam, sgn, dl = _damped_variance_step(v, prec, lam, sgn, tol)
+        return m + step, v, lam, sgn, _vi_resid(step, dl), it + 1
 
-    m, v, _, _ = jax.lax.while_loop(
-        lambda s: (s[3] < n_iter) & (s[2] > tol),
-        body,
-        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    m, v, _, _, _, _ = jax.lax.while_loop(
+        lambda s: (s[5] < n_iter) & (s[4] > tol), body, _vi_init(op.p, prior_variance)
     )
     ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
     m = jnp.where(ok, m, 0.0)
@@ -1122,49 +1159,51 @@ def glm_vi_center_ser(
             op.local_moment(0, ll_s - ll_b),
         )
 
-    def newton(m, v, BGw, BGg):
+    def newton(m, v, lam, sgn, BGw, BGg):
         # score sum_i (x-c) g and curvature sum_i (x-c)^2 w over ALL rows: the support's own
         # terms plus the fill's (-c) times the background minus its support part
         S1, S2, Sg, Sw, _ = support(m, v)
         prec = inv_pv + S2 + c**2 * (BGw - Sw)
         score = S1 - c * (BGg - Sg)
         step = jnp.clip((score - inv_pv * m) / prec, -4.0, 4.0)  # glm_vi_ser's trust region
-        return m + step, 1.0 / prec, jnp.max(jnp.abs(step))
+        v, lam, sgn, dl = _damped_variance_step(v, prec, lam, sgn, tol)
+        return m + step, v, lam, sgn, _vi_resid(step, dl)
 
-    init = (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0)
+    init = _vi_init(op.p, prior_variance)
     if background == "exact":
 
         def body(s):
-            m, v, _, it = s
+            m, v, lam, sgn, _, it = s
             BGw, BGg, _ = sums(c * m, c**2 * v, False)
-            m_new, v_new, step = newton(m, v, BGw, BGg)
-            return m_new, v_new, step, it + 1
+            return (*newton(m, v, lam, sgn, BGw, BGg), it + 1)
 
-        m, v, _, _ = jax.lax.while_loop(lambda s: (s[3] < n_iter) & (s[2] > tol), body, init)
+        m, v, _, _, _, _ = jax.lax.while_loop(
+            lambda s: (s[5] < n_iter) & (s[4] > tol), body, init
+        )
     else:
 
         def round_body(s):
-            m, v, _, it = s
+            m, v, lam, sgn, _, it = s
             box = _center2d_box(c, m, v)
             cW, cG, _ = _center2d_cheb_fit(sums, box, degree, False)
 
             def body(t):
-                m, v, _, it, _ = t
+                m, v, lam, sgn, _, it, _ = t
                 a, bvar = c * m, c**2 * v
                 BGw = _center2d_cheb_eval(cW, box, a, bvar)
                 BGg = _center2d_cheb_eval(cG, box, a, bvar)
-                m_new, v_new, step = newton(m, v, BGw, BGg)
-                return m_new, v_new, step, it + 1, _center2d_inside(c, m_new, v_new, box)
+                m, v, lam, sgn, resid = newton(m, v, lam, sgn, BGw, BGg)
+                return m, v, lam, sgn, resid, it + 1, _center2d_inside(c, m, v, box)
 
-            m, v, step, it, _ = jax.lax.while_loop(
-                lambda t: (t[3] < n_iter) & (t[2] > tol) & t[4],
+            m, v, lam, sgn, resid, it, _ = jax.lax.while_loop(
+                lambda t: (t[5] < n_iter) & (t[4] > tol) & t[6],
                 body,
-                (m, v, jnp.inf, it, jnp.array(True)),
+                (m, v, lam, sgn, jnp.inf, it, jnp.array(True)),
             )
-            return m, v, step, it
+            return m, v, lam, sgn, resid, it
 
-        m, v, _, _ = jax.lax.while_loop(
-            lambda s: (s[3] < n_iter) & (s[2] > tol), round_body, init
+        m, v, _, _, _, _ = jax.lax.while_loop(
+            lambda s: (s[5] < n_iter) & (s[4] > tol), round_body, init
         )
     ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
     m = jnp.where(ok, m, 0.0)
@@ -1500,7 +1539,8 @@ def glm_vi_profile_ser(
     into the all-rows background + support-only correction exactly as in
     glm_profile_map -- the background works UNCHANGED because off-support entries
     have x = 0, hence entry variance = ov. v by Price + the envelope theorem
-    (dF/db0 = 0 at the profiled point): 1/v = 1/pv + sum x^2 w. No GH tail anywhere.
+    (dF/db0 = 0 at the profiled point): 1/v = 1/pv + sum x^2 w, damped in log v when it
+    reverses as in glm_vi_ser. No GH tail anywhere.
 
     The implied parameterization -- profiled mean, CONDITIONAL variance -- matches
     `ser_ops.localjj_centered_ser` ("profiled mean, conditional variance"), and with
@@ -1542,25 +1582,34 @@ def glm_vi_profile_ser(
         return t, t0
 
     def body(state):
-        m, v, b0, _, it = state
+        m, v, b0, lam, sgn, _, it = state
         (_, g, w), (_, g0, w0) = terms_pair(m, v, b0)
         BGw, BGg, _ = _bg(b0)
         H00 = BGw + op.local_moment(0, w - w0)
         H0b = op.local_moment(1, w)
-        S2w = op.local_moment(2, w)
-        Hbb = S2w + inv_pv
+        Hbb = op.local_moment(2, w) + inv_pv
         gb0 = BGg + op.local_moment(0, g - g0)
         gb = op.local_moment(1, g) - inv_pv * m
         det = H00 * Hbb - H0b**2
         db0 = jnp.clip((Hbb * gb0 - H0b * gb) / det, -4.0, 4.0)
         dm = jnp.clip((H00 * gb - H0b * gb0) / det, -4.0, 4.0)
-        resid = jnp.maximum(jnp.max(jnp.abs(dm)), jnp.max(jnp.abs(db0)))
-        return m + dm, 1.0 / (inv_pv + S2w), b0 + db0, resid, it + 1
+        # v by Price: off-support entries have x = 0, so the support sum is all of sum x^2 w
+        v, lam, sgn, dl = _damped_variance_step(v, Hbb, lam, sgn, tol)
+        resid = jnp.maximum(_vi_resid(dm, dl), jnp.max(jnp.abs(db0)))
+        return m + dm, v, b0 + db0, lam, sgn, resid, it + 1
 
-    m, v, b0, _, _ = jax.lax.while_loop(
-        lambda s: (s[4] < n_iter) & (s[3] > tol),
+    m, v, b0, _, _, _, _ = jax.lax.while_loop(
+        lambda s: (s[6] < n_iter) & (s[5] > tol),
         body,
-        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.full(op.p, c0), jnp.inf, 0),
+        (
+            jnp.zeros(op.p),
+            jnp.full(op.p, prior_variance),
+            jnp.full(op.p, c0),
+            jnp.ones(op.p),
+            jnp.zeros(op.p),
+            jnp.inf,
+            0,
+        ),
     )
     ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0) & jnp.isfinite(b0)
     m = jnp.where(ok, m, 0.0)
