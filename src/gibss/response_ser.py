@@ -127,13 +127,18 @@ class _TermsView:
         return self._fn(eta, aux)
 
 
-def _gh_split(response, order):
+def _gh_split(response, order, closed=False):
     """`(rules, views)` for integrating `response.terms` over b ~ N(m, v) by GH: one
     (nodes, weights, view) per part. A split scheme (a Chebyshev offset table with
     `residual_order` below `order`) gets its exact plug-in base on the kernel's `order`
     nodes and its tabulated residual on `residual_order` nodes -- the residual carries the
     per-entry Clenshaw cost, so this is the CAVI kernel's dominant saving -- and the two
-    GH sums add (E[.] is linear). Anything else is one part on `order` nodes."""
+    GH sums add (E[.] is linear). Anything else is one part on `order` nodes.
+
+    `closed=True` (for kernels that integrate per entry, like `glm_vi_gh_ser`) lets a
+    smoother whose plug-in half has a closed-form Gaussian integral over b
+    (`plugin_integrated_terms`, e.g. `CharFnGaussRef`) skip GH for that half: its part is
+    `(None, None, fn)` and the kernel calls `fn(eta, ve, aux)` once per entry."""
     sm = getattr(response, "smoother", None)
     ro = getattr(sm, "residual_order", None)
     if ro == "auto":
@@ -143,6 +148,19 @@ def _gh_split(response, order):
         # Tied to the kernel's order so a caller asking for a high order gets it on both
         # halves. Floor of 5: below that the residual's own shape is under-resolved.
         ro = max(5, int(order) - 8)
+    if closed and isinstance(response, Smoothed) and hasattr(sm, "plugin_integrated_terms"):
+        # the plug-in half integrates over b in closed form (a Gaussian-offset reference:
+        # the effect only widens its variance), so it is one evaluation per entry, not
+        # `order`; the tabulated residual keeps its GH rule. A closed part is
+        # `(None, None, fn(eta, ve, aux) -> (E ll, E g, E w, T3, T4))`.
+        base = response.base
+        ro = order if ro is None else min(ro, order)
+        nodes_np, logw_np = _gh_rule(ro)
+        return [
+            (None, None, lambda eta, ve, aux: sm.plugin_integrated_terms(base, eta, ve, aux)),
+            (jnp.asarray(nodes_np), jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi),
+             _TermsView(lambda eta, aux: sm.residual_terms(base, eta, aux))),
+        ]
     if isinstance(response, Smoothed) and ro is not None and ro < order:
         base = response.base
         parts = [
@@ -1275,7 +1293,7 @@ def glm_vi_gh_ser(
     x = op.entry_x
     inv_pv = 1.0 / prior_variance
 
-    parts = _gh_split(response, order)  # [(nodes, weights, terms view)], 1 or 2 parts
+    parts = _gh_split(response, order, closed=True)  # [(nodes, weights, view)], 1 or 2
     aux_o = _tmap(lambda a: a[None, ...], aux_e)  # open the GH-node axis on aux
 
     def node_terms(m, v):
@@ -1293,6 +1311,10 @@ def glm_vi_gh_ser(
         lead = (-1,) + (1,) * jnp.ndim(eta)
         acc = None
         for nodes, wts, view in parts:
+            if nodes is None:  # closed-form Gaussian part (see `_gh_split(closed=True)`)
+                part = view(eta, ve, aux_e)
+                acc = part if acc is None else tuple(a + b for a, b in zip(acc, part))
+                continue
             shft = eta[None, ...] + sd[None, ...] * nodes.reshape(lead)  # (order, *eta)
             ll, g, w = view.terms(shft, aux_o)
             W = wts.reshape(lead)

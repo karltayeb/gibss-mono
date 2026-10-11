@@ -18,7 +18,7 @@ family, Gaussian q without a smoothing scheme).
 from __future__ import annotations
 
 from . import glm
-from .cf_offset import CharFnOffset, CharFnSelfNorm
+from .cf_offset import CharFnGaussRef, CharFnOffset, CharFnSelfNorm
 from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
@@ -99,6 +99,11 @@ _SMOOTHERS = {
     # "compress" (above) doubles as the Q2 peel builder (gaussian) and the Q1 fold
     # (unconstrained); _resolve routes on variational_family.
     "cf": lambda cfg: CharFnOffset(M=cfg["compress_degree"]),
+    # cf_gaussref: the same CAVI in Q2 by the Gaussian offset reference (the probit
+    # mixture at the offset variance) plus a CF tilt (logistic only, gaussian only).
+    "cf_gaussref": lambda cfg: CharFnGaussRef(
+        M=cfg["compress_degree"], order=cfg["mixture_order"]
+    ),
 }
 
 _DEFAULTS = {
@@ -127,6 +132,14 @@ PRESETS = {
     "smoothed": {"offset_integration": "gh"},
     "localjj": {"variational_family": "gaussian", "offset_integration": "jj"},
     "cf_cavi": {"variational_family": "gaussian", "offset_integration": "cf"},
+    # the same CAVI-in-Q2 fixed point by a second route: the closed-form Gaussian-offset
+    # probit mixture plus a CF tilt to the true mixture offset (exact for the 8-component
+    # probit mixture of the logistic law, 6e-9 from it).
+    "cf_cavi_gaussref": {
+        "variational_family": "gaussian",
+        "offset_integration": "cf_gaussref",
+        "mixture_order": 8,
+    },
     # exact free-form CAVI in Q1 through the CF product over the node laws (the CF
     # replacement for offset_integration="compress_selfnorm").
     "cf_cavi_q1": {"variational_family": "unconstrained", "offset_integration": "cf"},
@@ -230,6 +243,20 @@ def _resolve(cfg):
                 else CharFnOffset(M=cfg["compress_degree"])
             )
             return Smoothed(base, offset), "vi_gh"
+        elif integ == "cf_gaussref":
+            # CAVI in Q2 through the Gaussian offset reference + CF tilt (CharFnGaussRef):
+            # the logistic table's Gaussian-q counterpart of "cf", same vi_gh table seam.
+            if vfam != "gaussian":
+                raise ValueError(
+                    "offset_integration='cf_gaussref' is CAVI in Q2; it needs "
+                    "variational_family='gaussian'."
+                )
+            if not isinstance(base, Bernoulli):
+                raise ValueError(
+                    "offset_integration='cf_gaussref' needs the logistic family "
+                    f"(the probit mixture tables); got family={fam!r}."
+                )
+            return Smoothed(base, _SMOOTHERS["cf_gaussref"](cfg)), "vi_gh"
         elif integ == "compress":
             # CAVI in Q2 (gaussian): the Compress peel as the offset-integrated-cumulant
             # builder, interchangeable with "cf" behind the same table seam; GH over b.

@@ -1903,6 +1903,46 @@ class ProbitMixture(_LogisticMixtureBase):
         a2 = jnp.sum(pi * (s / r) * pdf, 0)
         return y * eta - scale * ahat, y - scale * a1, scale * a2
 
+    def integrated_terms(self, base, eta, aux, ve):
+        """`terms` averaged over a Gaussian effect, `eta + x b` with `b ~ N(m, v)`, in
+        closed form: the effect adds `ve = x^2 v` to the offset variance, so `E_b` of
+        each term is the term itself at `ov + ve`. Returns `(E ll, E g, E w, T3, T4)`, the
+        five per-entry sums the vi_gh kernels form by Gauss-Hermite (see
+        `response_ser._stein_sums`). With `A3, A4` the third and fourth eta-derivatives of
+        Ahat, Stein's lemma on the GH variable `u ~ N(0, 1/2)` and the node shift
+        `sqrt(2 ve) u` gives
+
+            T3 = E[u w]          = sqrt(ve / 2) A3,
+            T4 = E[(2u^2 - 1) w] = ve A4,
+
+        `A3 = -sum_k pi_k (s_k/r_k)^2 z_k phi(z_k)`, `A4 = sum_k pi_k (s_k/r_k)^3 (z_k^2 - 1)
+        phi(z_k)`, all at the widened `r_k = sqrt(1 + s_k^2 (ov + ve))`. Exact, where GH
+        needs the kernel's full order."""
+        y, ov = aux
+        y, scale = base.unpack(y)
+        s, pi, _ = _mixture_table(_PROBIT_MIXTURES, self.order, "ProbitMixture")
+        lead = (-1,) + (1,) * jnp.ndim(eta)
+        s = jnp.asarray(s).reshape(lead)
+        pi = jnp.asarray(pi).reshape(lead)
+        ve = jnp.asarray(ve)
+        r = jnp.sqrt(1.0 + s**2 * (jnp.asarray(ov) + ve)[None, ...])
+        z = s * eta[None, ...] / r
+        cdf = _ndtr(z)
+        pdf = jnp.exp(-0.5 * z * z) / jnp.sqrt(2.0 * jnp.pi)
+        q = s / r
+        ahat = jnp.sum(pi * (z * cdf + pdf) / q, 0)
+        a1 = jnp.sum(pi * cdf, 0)
+        a2 = jnp.sum(pi * q * pdf, 0)
+        a3 = -jnp.sum(pi * q**2 * z * pdf, 0)
+        a4 = jnp.sum(pi * q**3 * (z * z - 1.0) * pdf, 0)
+        return (
+            y * eta - scale * ahat,
+            y - scale * a1,
+            scale * a2,
+            jnp.sqrt(0.5 * ve) * scale * a3,
+            ve * scale * a4,
+        )
+
 
 @dataclass(frozen=True)
 class PGMixture(_LogisticMixtureBase):

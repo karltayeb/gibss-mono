@@ -95,7 +95,9 @@ from jax.ops import segment_sum
 from ._numerics import _cheb_fit_matrix
 from .operators import BCOOOperator
 from .response import (
+    _PROBIT_MIXTURES,
     Bernoulli,
+    ProbitMixture,
     ResponseModel,
     Smoother,
     _rows,
@@ -115,6 +117,7 @@ __all__ = [
     "build_aux_sparse",
     "CharFnOffset",
     "CharFnSelfNorm",
+    "CharFnGaussRef",
 ]
 
 # An effect in EFFECT SPACE: design block `x` (n, C) and its row-independent Q2 law
@@ -482,6 +485,8 @@ def smoothed_nodes(
     ratchet=None,
     keys=None,
     cache=None,
+    reference=None,
+    residual=False,
 ):
     """Offset-integrated cumulant `Atilde` and its first two z-derivatives at the CGL
     nodes, via the psi-tamed residual CF quadrature (logistic base only).
@@ -494,7 +499,13 @@ def smoothed_nodes(
 
     `offset_var` folds one extra homogeneous zero-mean Gaussian into the offset (e.g. the
     shared intercept's posterior variance), sized into the grid and the CF alike. `keys` /
-    `cache` memoize the per-effect factors across tables (see `_FactorCache`)."""
+    `cache` memoize the per-effect factors across tables (see `_FactorCache`).
+
+    `reference=None` is the plug-in reference above (logistic `psi`, residual `phi - 1`).
+    `reference=K` (a probit-mixture order) is the GAUSSIAN reference of `CharFnGaussRef`:
+    the cumulant is the K-component probit mixture, and `At*` is its exact integral over the
+    offset, `ProbitMixture_K(z, V) - tilt`. `residual=True` returns the residual channels
+    `(Aref - At, Aref' - At', At'' - Aref'')` in place of `At0..At2`, `Aref` the reference."""
     if not isinstance(base, Bernoulli):
         raise TypeError(
             "cf_offset.smoothed_nodes supports only the logistic (Bernoulli / Binomial) base; "
@@ -515,14 +526,133 @@ def smoothed_nodes(
         eff = (jnp.asarray(x),) + refs
         mom = lambda e=eff: effect_moments(e)  # noqa: E731
         V0 = V0 + (mom() if cache is None else cache.moments(slot, refs, mom))[1]
+    if Tmax is None and reference is not None:
+        Tmax = _mixture_tail_Tmax(reference, tol)
     Tmax, ntau, hw = _grid_size(
         V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau, bucket, ratchet
     )
-    tau, wq, psi = _frequency_grid(Tmax, ntau)
+    tau, wq, kern = _reference_grid(reference, Tmax, ntau)
     phi, s, V = offset_cf(
         effects, tau, n=n, offset_var=offset_var, keys=keys, cache=cache
     )  # + intercept var
-    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (jnp.full((n,), hw), s, V)
+    return _nodes_from_cf(phi, V, tau, wq, kern, hw, M, reference, residual) + (
+        jnp.full((n,), hw), s, V)
+
+
+def _mixture_tail_Tmax(order: int, tol: float) -> float:
+    """Smallest `Tmax` with the Gaussian-reference tilt's frequency tail below `tol`.
+
+    The probit mixture's `A'' = sum_k pi_k s_k phi(s_k u)` has the Fourier transform
+    `psihat(t) = sum_k pi_k exp(-t^2 / (2 s_k^2))`. The weight channel of the tilt has no
+    `1/t` damping and `|phi - gamma| <= 2`, so truncating at `T` costs at most
+    `(2/pi) INT_T^inf psihat = (2/pi) sum_k pi_k s_k sqrt(pi/2) erfc(T / (s_k sqrt 2))`;
+    the value and gradient channels carry `1/t^2` and `1/t` and are smaller past `T = 1`.
+    Bisection on that closed form. Like `_psi_tail_Tmax` it depends on the kernel alone,
+    so it holds for any offset law."""
+    s, pi, _ = _PROBIT_MIXTURES[order]
+
+    def tail(T):
+        return sum(
+            (2.0 / math.pi) * p * sk * math.sqrt(math.pi / 2.0) * math.erfc(T / (sk * math.sqrt(2.0)))
+            for sk, p in zip(s, pi)
+        )
+
+    lo, hi = 0.0, 1.0
+    while tail(hi) > tol:
+        hi *= 2.0
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if tail(mid) > tol else (lo, mid)
+    return float(hi)
+
+
+def _reference_grid(reference, Tmax, ntau):
+    """`(tau, wq, kernel)` for the reference: the logistic `psi` grid for the plug-in
+    reference (`reference=None`), the probit mixture's Gaussian `psihat` for `reference=K`."""
+    if reference is None:
+        return _frequency_grid(Tmax, ntau)
+    tau = jnp.linspace(0.0, Tmax, ntau)
+    dtau = Tmax / (ntau - 1)
+    wq = jnp.full((ntau,), dtau).at[0].set(0.5 * dtau).at[-1].set(0.5 * dtau)
+    s, pi, _ = _PROBIT_MIXTURES[reference]
+    s, pi = jnp.asarray(s)[:, None], jnp.asarray(pi)[:, None]
+    psihat = jnp.sum(pi * jnp.exp(-0.5 * (tau[None, :] / s) ** 2), axis=0)
+    return tau, wq, psihat
+
+
+def _reference_terms(reference, z, V):
+    """The reference cumulant `(Aref, Aref', Aref'')` at the nodes `z` (n, M+1): softplus
+    for the plug-in reference, the probit mixture at offset variance `V` (n,) otherwise."""
+    if reference is None:
+        sig = jax.nn.sigmoid(z)
+        return jax.nn.softplus(z), sig, sig * (1.0 - sig)
+    zero = jnp.zeros_like(z)  # y = 0: ProbitMixture.terms returns (-A, -A', A'')
+    ll, g, w = ProbitMixture(order=reference).terms(
+        Bernoulli(), z, (zero, jnp.broadcast_to(V[:, None], z.shape))
+    )
+    return -ll, -g, w
+
+
+def _nodes_from_cf(phi, V, tau, wq, kern, hw, M, reference, residual):
+    """`(znodes, c0, c1, c2)`: the offset-integrated cumulant at the CGL nodes, or, with
+    `residual`, its residual channels against the reference."""
+    if reference is None:
+        znodes, At0, At1, At2 = _atilde_from_cf(phi, V, tau, wq, kern, hw, M)
+    else:
+        znodes, D_ll, D_g, D_w = _gauss_tilt_from_cf(phi, V, tau, wq, kern, hw, M)
+        if residual:
+            return znodes, D_ll, D_g, D_w
+        R0, R1, R2 = _reference_terms(reference, znodes, V)
+        return znodes, R0 - D_ll, R1 - D_g, R2 + D_w
+    if residual:
+        R0, R1, R2 = _reference_terms(None, znodes, V)
+        return znodes, R0 - At0, R1 - At1, At2 - R2
+    return znodes, At0, At1, At2
+
+
+@partial(jax.jit, static_argnames=("M",))
+def _gauss_tilt_from_cf(phi, V, tau, wq, psihat, hw, M):
+    """The Gaussian-reference tilt `(znodes, Aref - At, Aref' - At', At'' - Aref'')` at the
+    CGL nodes, `Aref = ProbitMixture(z, V)`, from a ZERO-MEAN offset CF `phi` (n, ntau).
+
+    Same transform as `_atilde_from_cf` with two substitutions. The residual is `phi -
+    gamma`, `gamma = exp(-t^2 V / 2)` the CF of the moment-matched Gaussian `N(0, V)`, in
+    place of `phi - 1` (the point mass at the mean). And the kernel is `psihat`, the
+    Fourier transform of the probit mixture's `A''`, in place of the logistic `psi`, so
+    the tilt is exact for the mixture cumulant whose Gaussian integral `Aref` is closed
+    form. `phi` and `gamma` agree in mass, mean and variance, so the residual is O(t^3)
+    at 0: the `/t^2` value integrand vanishes there and no `t = 0` limit term is needed."""
+    R = phi - jnp.exp(-0.5 * V[:, None] * tau[None, :] ** 2)
+    tau_safe = jnp.where(tau > 0, tau, 1.0)
+    c_val = jnp.where(tau > 0, wq * psihat / tau_safe**2, 0.0)
+    c_grd = jnp.where(tau > 0, wq * psihat / tau_safe, 0.0)
+    c_wt = wq * psihat
+    inv_pi = 1.0 / jnp.pi
+    xnodes = jnp.asarray(_cheb_fit_matrix(M)[0])
+    z = hw * xnodes
+    E = jnp.exp(1j * (tau[:, None] * z[None, :]))
+    stacked = jnp.concatenate(
+        [R * c_val[None, :], R * c_grd[None, :], R * c_wt[None, :]], axis=0
+    )
+    P = stacked @ E
+    n = phi.shape[0]
+    D_ll = inv_pi * jnp.real(P[:n])
+    D_g = -inv_pi * jnp.imag(P[n : 2 * n])
+    D_w = inv_pi * jnp.real(P[2 * n :])
+    return jnp.broadcast_to(z[None, :], (n, M + 1)), D_ll, D_g, D_w
+
+
+def _fit_tilt_table(y, D_ll, D_g, D_w, hw, V, M):
+    """The `CharFnGaussRef` aux `(y, obar, center, halfwidth, coef_ll, coef_g, coef_w,
+    V)`: the `_fit_table` layout (degree-M Chebyshev fits of the residual channels, here
+    the tilt against the Gaussian reference) plus the per-row offset variance `V` the
+    closed-form reference half needs. Per trial, like `_fit_table`."""
+    _, Vinv_np = _cheb_fit_matrix(M)
+    Vinv = jnp.asarray(Vinv_np)
+    fit = lambda vals: vals @ Vinv.T  # noqa: E731
+    z = jnp.zeros_like(hw)
+    return y, z, z, hw, fit(D_ll), fit(D_g), fit(D_w), V
+
 
 
 def _frequency_grid(Tmax, ntau):
@@ -749,6 +879,8 @@ def smoothed_nodes_sparse(
     ratchet=None,
     keys=None,
     cache=None,
+    reference=None,
+    residual=False,
 ):
     """Sparse (BCOO) analogue of `smoothed_nodes`: `effects` is a list of `(alpha, mu,
     var)` over the shared design `X`. Returns `(znodes, At0, At1, At2, hw, s, V)`.
@@ -769,15 +901,18 @@ def smoothed_nodes_sparse(
         refs = (jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var))
         mom = lambda r=refs: _sparse_effect_moments(op, *r, c_arr)  # noqa: E731
         V0 = V0 + (mom() if cache is None else cache.moments(slot, refs, mom))[1]
+    if Tmax is None and reference is not None:
+        Tmax = _mixture_tail_Tmax(reference, tol)
     Tmax, ntau, hw = _grid_size(
         V0, tol, Tmax, ntau, kappa, T, safety, min_ntau, max_ntau, bucket, ratchet
     )
-    tau, wq, psi = _frequency_grid(Tmax, ntau)
+    tau, wq, kern = _reference_grid(reference, Tmax, ntau)
     phi, s, V = offset_cf_sparse(
         X, effects, tau, n=n, entry_chunk=entry_chunk, offset_var=offset_var,
         colmean=colmean, keys=keys, cache=cache,
     )
-    return _atilde_from_cf(phi, V, tau, wq, psi, hw, M) + (jnp.full((n,), hw), s, V)
+    return _nodes_from_cf(phi, V, tau, wq, kern, hw, M, reference, residual) + (
+        jnp.full((n,), hw), s, V)
 
 
 def build_aux_sparse(base, y, X, effects, M=48, entry_chunk=1 << 15, **kwargs):
@@ -883,6 +1018,87 @@ class CharFnOffset(Smoother):
 
     def terms(self, base: ResponseModel, eta, aux):
         return _table_terms(base, eta, aux)
+
+
+@dataclass(frozen=True)
+class CharFnGaussRef(CharFnOffset):
+    """Q2 CAVI through a Gaussian offset reference plus a characteristic-function tilt.
+
+    `CharFnOffset` corrects the plug-in cumulant `A(z)` (the offset as a point mass at
+    its mean, CF `1`) by the whole offset integral. This scheme corrects the GAUSSIAN
+    reference instead: `ProbitMixture(order)` at the offset's own variance `V`, the
+    closed-form integral of the probit-mixture cumulant over `N(0, V)`. The table then
+    holds only the tilt from the moment-matched Gaussian to the true Gaussian-mixture
+    offset, computed by the same CF product with the residual `phi - exp(-t^2 V/2)` and
+    the mixture's Fourier kernel `psihat` (`_gauss_tilt_from_cf`).
+
+    The likelihood is the `order`-component probit mixture of the logistic law (sup error
+    6e-9 on the mean at the default 8), and for that likelihood the fit is exact CAVI in
+    Q2 up to the CF quadrature and Chebyshev tolerances. It is an independent route to the
+    `CharFnOffset` fixed point: the two agree to within the table's sup error.
+
+    The tilt is small. The reference matches the offset in mass, mean and variance, so the
+    tilt starts at the third cumulant (about V^1.5) where the plug-in residual starts at
+    `V/2 A''`. At V <= 4 its sup is 3 to 1000x smaller than the plug-in residual's (grad
+    channel), and it vanishes when every other effect's alpha is a point mass (the offset
+    is then exactly Gaussian). `ProbitMixture` alone, without the table, is the Q2 fit
+    with a Gaussian offset; the tilt measures how far that is from CAVI.
+
+    aux = `(y, obar, center, halfwidth, coef_ll, coef_g, coef_w, V)`: the `CharFnOffset`
+    table (here fitted to the tilt) plus the per-row offset variance `V` for the closed-form
+    reference. `plugin_terms` is that reference, so the vi_gh GH split integrates the
+    reference on the full order and the small tilt on `residual_order` nodes."""
+
+    order: int = 8
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.order not in _PROBIT_MIXTURES:
+            raise ValueError(
+                f"CharFnGaussRef: order must be one of {sorted(_PROBIT_MIXTURES)}; "
+                f"got {self.order!r}"
+            )
+
+    def build_aux(self, base, y, effects, ntau=None, Tmax=None, offset_var=0.0, keys=None):
+        y = _tmap(jnp.asarray, y)
+        _, D_ll, D_g, D_w, hw, _, V = smoothed_nodes(
+            effects, self.M, base=base, n=_rows(y), tol=self.tol, kappa=self.kappa,
+            T=self.T, safety=self.safety, ntau=ntau, Tmax=Tmax, offset_var=offset_var,
+            bucket=self.ntau_bucket, ratchet=self._ratchet, keys=keys,
+            cache=self._memo(), reference=self.order, residual=True,
+        )
+        return _fit_tilt_table(y, D_ll, D_g, D_w, hw, V, self.M)
+
+    def build_aux_sparse(self, base, y, X, effects, ntau=None, Tmax=None,
+                         entry_chunk=1 << 15, offset_var=0.0, colmean=None, keys=None):
+        y = _tmap(jnp.asarray, y)
+        _, D_ll, D_g, D_w, hw, _, V = smoothed_nodes_sparse(
+            X, effects, self.M, base=base, entry_chunk=entry_chunk, tol=self.tol,
+            kappa=self.kappa, T=self.T, safety=self.safety, ntau=ntau, Tmax=Tmax,
+            offset_var=offset_var, colmean=colmean, bucket=self.ntau_bucket,
+            ratchet=self._ratchet, keys=keys, cache=self._memo(),
+            reference=self.order, residual=True,
+        )
+        return _fit_tilt_table(y, D_ll, D_g, D_w, hw, V, self.M)
+
+    def plugin_terms(self, base: ResponseModel, eta, aux):
+        return ProbitMixture(order=self.order).terms(base, eta, (aux[0], aux[7]))
+
+    def residual_terms(self, base: ResponseModel, eta, aux):
+        return _table_residual_terms(base, eta, aux[:7])
+
+    def plugin_integrated_terms(self, base: ResponseModel, eta, ve, aux):
+        """The reference half averaged over the effect `b ~ N(m, v)` in closed form
+        (`ve = x^2 v` adds to the offset variance; `ProbitMixture.integrated_terms`), so
+        the vi_gh kernel needs no GH nodes for it -- only for the small tilt."""
+        return ProbitMixture(order=self.order).integrated_terms(
+            base, eta, (aux[0], aux[7]), ve
+        )
+
+    def terms(self, base: ResponseModel, eta, aux):
+        bll, bg, bw = self.plugin_terms(base, eta, aux)
+        rll, rg, rw = self.residual_terms(base, eta, aux)
+        return bll + rll, bg + rg, jnp.maximum(bw + rw, 0.0)
 
 
 # --------------------------------------------------------------------------------------
