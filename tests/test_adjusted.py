@@ -1,14 +1,18 @@
-"""Adjusted gIBSS: `Smoothed(base, Adjusted())` replaces the offset-smoothed loglik with the
-family's own GLM at an adjusted response y + delta and offset shift nu, tuned per row so
-the surrogate matches the Taylor-smoothed value, score and curvature at the anchor.
+"""Adjusted gIBSS: `Smoothed(base, Adjusted())` replaces the offset-smoothed loglik
+`y*eta - E_o A(eta + o)` with the family's own GLM at a shifted response y + delta, a
+shifted and tempered predictor (eta + nu)/kappa and a constant C, tuned per row at the
+current predictor mean z so the two agree there in value, score, curvature and third
+derivative.
 
-Anchors: Gaussian reduces to Taylor (nu = delta = 0); Poisson matches the exact smoothed
-score/curvature at every eta (nu = ov/2, delta = 0), so the fit equals the GH-smoothed
-fit; the logistic pole of A''''/A''' at p = 1/2 is clipped continuously.
+Gaussian: kappa = 1, nu = delta = 0, the Taylor smoother exactly. Poisson: kappa = 1,
+nu = log E e^o, delta = C = 0, the GH-smoothed loglik at EVERY eta. Logistic: kappa > 1
+(the averaged cumulant is flatter than any shifted logistic), and the four matched
+quantities agree with the GH-smoothed ones to quadrature accuracy.
 """
 
 from dataclasses import replace
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -16,9 +20,11 @@ import pytest
 from gibss import glm
 from gibss.methods import fit_glm_susie
 from gibss.response import (
+    GH,
     Adjusted,
     Bernoulli,
     Binomial,
+    ExponentialFamily,
     Gaussian,
     Poisson,
     Smoothed,
@@ -29,89 +35,148 @@ from gibss.response import (
 
 def _rows(seed, n=7):
     r = np.random.default_rng(seed)
-    eta = jnp.asarray(r.normal(size=n))
     z = jnp.asarray(r.normal(size=n))
-    ov = jnp.asarray(r.uniform(0.0, 2.0, n))
+    eta = z + jnp.asarray(r.normal(size=n))
+    ov = jnp.asarray(r.uniform(0.1, 3.0, n))
     return r, eta, z, ov
 
 
-def test_poisson_score_and_curvature_exact_at_every_eta():
+def _terms(base, y, ov, z, smoother=Adjusted()):
+    param = smoother.adjustment(base, z, ov)
+    return lambda eta: Smoothed(base, smoother).terms(eta, (y, ov, param)), param
+
+
+def _weight_slope(fn, z):
+    """d weight / d eta at z, per row: minus the loglik's third derivative."""
+    n = z.shape[0]
+    return jax.vmap(jax.grad(lambda e, i: fn(jnp.full((n,), e))[2][i]))(z, jnp.arange(n))
+
+
+def test_poisson_is_the_smoothed_loglik_at_every_eta():
     r, eta, z, ov = _rows(0)
     y = jnp.asarray(r.poisson(2.0, eta.shape[0]).astype(float))
-    ll, g, w = Smoothed(Poisson(), Adjusted()).terms(eta, (y, ov, z))
-    lam = jnp.exp(eta + ov / 2)  # E_o exp(eta + o), o ~ N(0, ov)
+    fn, (delta, nu, kappa, const) = _terms(Poisson(), y, ov, z)
+    np.testing.assert_allclose(kappa, 1.0, atol=1e-12)
+    np.testing.assert_allclose(nu, ov / 2, atol=1e-12)  # log E e^o under o ~ N(0, ov)
+    np.testing.assert_allclose(delta, 0.0, atol=1e-12)
+    np.testing.assert_allclose(const, 0.0, atol=1e-12)
+    ll, g, w = fn(eta)
+    lam = jnp.exp(eta + ov / 2)
+    np.testing.assert_allclose(ll, y * eta - lam, atol=1e-12)
     np.testing.assert_allclose(g, y - lam, atol=1e-12)
     np.testing.assert_allclose(w, lam, atol=1e-12)
-    # the shape in eta is exact too: ll - exact is a per-row constant
-    ll2, _, _ = Smoothed(Poisson(), Adjusted()).terms(eta + 0.3, (y, ov, z))
-    exact = lambda e: y * e - jnp.exp(e + ov / 2)
-    np.testing.assert_allclose(ll2 - ll, exact(eta + 0.3) - exact(eta), atol=1e-12)
 
 
-def test_gaussian_reduces_to_taylor():
+def test_gaussian_equals_taylor_exactly():
     r, eta, z, ov = _rows(1)
     y = jnp.asarray(r.normal(size=eta.shape[0]))
     base = Gaussian(variance=0.7)
-    got = Smoothed(base, Adjusted()).terms(eta, (y, ov, z))
+    fn, (delta, nu, kappa, _) = _terms(base, y, ov, z)
+    np.testing.assert_allclose(kappa, 1.0, atol=1e-12)
+    np.testing.assert_allclose(nu, 0.0, atol=1e-12)
+    np.testing.assert_allclose(delta, 0.0, atol=1e-12)
     want = Smoothed(base, Taylor()).terms(eta, (y, ov))
-    for a, b in zip(got, want):
+    for a, b in zip(fn(eta), want):
         np.testing.assert_allclose(a, b, atol=1e-12)
 
 
-@pytest.mark.parametrize("z0", [-2.5, -1.2, 1.5])
-def test_logistic_matches_taylor_at_anchor(z0):
-    """At the anchor the value matches the Taylor value exactly; score and curvature match
-    it up to O(ov^2) (the error quarters when ov halves) away from the clip band."""
-    base = Bernoulli()
-    z = jnp.full((2,), z0)
-    y = jnp.asarray([0.0, 1.0])
-
-    def err(ov):
-        ov = jnp.full((2,), ov)
-        ll, g, w = Smoothed(base, Adjusted()).terms(z, (y, ov, z))
-        tl, tg, tw = Smoothed(base, Taylor()).terms(z, (y, ov))
-        np.testing.assert_allclose(ll, tl, atol=1e-12)
-        return float(jnp.max(jnp.abs(g - tg))), float(jnp.max(jnp.abs(w - tw)))
-
-    (g1, w1), (g2, w2) = err(0.02), err(0.01)
-    assert g2 < 0.3 * g1 and w2 < 0.3 * w1
+def test_logistic_matches_value_score_curvature_third_at_z():
+    """Against a 60-node GH average (the smoother's own targets use 15 nodes)."""
+    r, eta, z, ov = _rows(2)
+    y = jnp.asarray(r.binomial(1, 0.5, eta.shape[0]).astype(float))
+    fn, (_, _, kappa, _) = _terms(Bernoulli(), y, ov, z, Adjusted(order=60))
+    ref = Smoothed(Bernoulli(), GH(60)).terms
+    got, want = fn(z), ref(z, (y, ov))
+    for a, b in zip(got, want):
+        np.testing.assert_allclose(a, b, atol=1e-10)
+    np.testing.assert_allclose(
+        _weight_slope(fn, z), _weight_slope(lambda e: ref(e, (y, ov)), z), atol=1e-8
+    )
+    assert np.all(np.asarray(kappa) > 1.0)  # averaging flattens the logistic cumulant
 
 
-@pytest.mark.parametrize("ov", [1e-3, 0.1, 1.0])
-def test_logistic_pole_clipped_continuous_and_bounded(ov):
-    """A''' = 0 at z = 0 with A'''' = -1/8: the raw ratio has a pole there. The clipped nu
-    is finite, bounded by sqrt(ov), exactly 0 at the pole, and continuous through it."""
-    z = jnp.linspace(-1.0, 1.0, 20001)  # contains z = 0 exactly
-    delta, nu, _ = Adjusted().adjustment(Bernoulli(), z, ov)
-    nu, delta = np.asarray(nu), np.asarray(delta)
-    assert np.all(np.isfinite(nu)) and np.all(np.isfinite(delta))
-    assert np.max(np.abs(nu)) <= np.sqrt(ov) * (1 + 1e-12)
-    assert nu[10000] == 0.0 and delta[10000] == 0.0
-    # Lipschitz on the grid: the clip interval 2|A'''/A''''| has slope ~8 at z = 0
-    assert np.max(np.abs(np.diff(nu))) < 10 * float(z[1] - z[0])
+def test_logistic_tracks_the_smoothed_score_away_from_z():
+    """On the window z +- 2 the surrogate score stays within 0.02 of the GH-smoothed one at
+    ov up to 3; the shift-only (kappa = 1) surrogate matched at the same point does not."""
+    z, ov = jnp.zeros(1), jnp.asarray([3.0])
+    y = jnp.zeros(1)
+    fn, (delta, nu, kappa, const) = _terms(Bernoulli(), y, ov, z)
+    ref = Smoothed(Bernoulli(), GH(60)).terms
+    grid = jnp.linspace(-2.0, 2.0, 81)
+    score_ref = jax.vmap(lambda e: ref(e[None], (y, ov))[1][0])(grid)
+
+    def err(f):
+        return float(jnp.max(jnp.abs(jax.vmap(lambda e: f(e[None])[1][0])(grid) - score_ref)))
+
+    assert err(fn) < 0.02
+    # shift-only comparator: kappa = 1, nu matching the curvature, delta the score at z
+    t2 = ref(z, (y, ov))[2]
+    nu1 = jnp.log((0.5 - jnp.sqrt(0.25 - t2)) / (0.5 + jnp.sqrt(0.25 - t2))) - z
+    delta1 = jax.nn.sigmoid(z + nu1) - (y - ref(z, (y, ov))[1])
+    def shift_only(e):
+        return Smoothed(Bernoulli(), Adjusted()).terms(
+            e, (y, ov, (delta1, nu1, jnp.ones(1), jnp.zeros(1)))
+        )
+
+    assert err(shift_only) > 0.1
 
 
-def test_quadratic_cumulant_gives_zero_adjustment():
-    z = jnp.linspace(-3, 3, 11)
-    delta, nu, _ = Adjusted().adjustment(Gaussian(), z, 0.5)  # A''' = A'''' = 0: 0/0 -> 0
-    assert np.all(np.asarray(nu) == 0.0) and np.all(np.asarray(delta) == 0.0)
+def test_shape_point_closed_forms_agree_with_newton():
+    """The Bernoulli and Poisson closed forms solve A'''(w)/A''(w)^2 = r; the default
+    Newton fallback (what a family without a closed form gets) lands on the same w."""
+    r = jnp.linspace(-6.0, 6.0, 25)
+    w = Bernoulli().shape_point(r, 0.0)
+    s = jax.nn.sigmoid(w)
+    np.testing.assert_allclose((1 - 2 * s) / (s * (1 - s)), r, atol=1e-10)
+    np.testing.assert_allclose(
+        ExponentialFamily.shape_point(Bernoulli(), r, jnp.zeros_like(r)), w, atol=1e-10
+    )
+    rp = jnp.exp(jnp.linspace(-3.0, 3.0, 7))
+    wp = Poisson().shape_point(rp, 0.0)
+    np.testing.assert_allclose(jnp.exp(-wp), rp, rtol=1e-12)
+    np.testing.assert_allclose(
+        ExponentialFamily.shape_point(Poisson(), rp, jnp.zeros_like(rp)), wp, atol=1e-8
+    )
+
+
+def test_shape_point_logistic_is_continuous_through_zero():
+    """A''' = 0 at p = 1/2 is a pole of A''''/A''' (the old shift rule clipped there); the
+    (nu, kappa) rule has none: w(r) is smooth with w(0) = 0 and w(-r) = -w(r)."""
+    r = jnp.linspace(-1e-3, 1e-3, 20001)
+    w = np.asarray(Bernoulli().shape_point(r, 0.0))
+    assert np.all(np.isfinite(w)) and abs(w[10000]) < 1e-15  # the grid's r = 0 is ~1e-20
+    np.testing.assert_allclose(w, -w[::-1], atol=1e-15)
+    assert np.max(np.abs(np.diff(w))) < 10 * float(r[1] - r[0])
 
 
 def test_binomial_equals_expanded_bernoulli_terms():
-    """loglik, score and curvature are linear in the per-trial terms: a Binomial(3 of 5)
-    row is five Bernoulli rows sharing eta, z and ov."""
+    """A Binomial(3 of 5) row is five Bernoulli rows sharing eta, z and ov: the per-unit
+    (delta, nu, kappa, C) are the same and the trial count scales delta, C and the cumulant."""
     eta, z, ov = jnp.asarray([0.4]), jnp.asarray([-0.1]), jnp.asarray([0.6])
-    got = Smoothed(Binomial(), Adjusted()).terms(eta, ((jnp.asarray([3.0]), jnp.asarray([5.0])), ov, z))
+    fn, pb = _terms(Binomial(), (jnp.asarray([3.0]), jnp.asarray([5.0])), ov, z)
+
+    def one(a):
+        return jnp.broadcast_to(a, (5,))
+
     ys = jnp.asarray([1.0, 1.0, 1.0, 0.0, 0.0])
-    one = lambda a: jnp.broadcast_to(a, (5,))
-    parts = Smoothed(Bernoulli(), Adjusted()).terms(one(eta), (ys, one(ov), one(z)))
-    for a, b in zip(got, parts):
+    parts_fn, pe = _terms(Bernoulli(), ys, one(ov), one(z))
+    for a, b in zip(pb, pe):
+        np.testing.assert_allclose(one(a), b, atol=1e-12)
+    for a, b in zip(fn(eta), parts_fn(one(eta))):
         np.testing.assert_allclose(a, [jnp.sum(b)], atol=1e-12)
 
 
 def test_validate_requires_exponential_family():
     with pytest.raises(TypeError, match="ExponentialFamily"):
         Smoothed(TwoGroupMarginal(), Adjusted())
+
+
+def test_row_param_needs_the_family():
+    with pytest.raises(TypeError, match="family"):
+        Adjusted().row_param(jnp.zeros(3), jnp.ones(3), 0.0)
+    delta, nu, kappa, const = Adjusted().row_param(jnp.zeros(3), jnp.ones(3), 0.5, family=Poisson())
+    np.testing.assert_allclose(nu, 0.5, atol=1e-12)
+    np.testing.assert_allclose(kappa, 1.0, atol=1e-12)
 
 
 def _sim(family, seed, n=400, p=30, b0=0.0, rho=0.6):
@@ -138,12 +203,13 @@ def _stack(state, attr):
 
 
 def test_poisson_fit_equals_gh_smoothed_fit():
+    """Same 15-node GH average of e^o on both sides, so the two fits are the same fit."""
     X, y = _sim("poisson", 0, b0=0.5)
     kw = {"family": "poisson", "L": 4, "max_iter": 30, "schedule": _FIXED}
     a = fit_glm_susie(X, y, method="adjusted", **kw)
     b = fit_glm_susie(X, y, method="smoothed", **kw)
-    for attr in ("alpha", "mu", "var"):
-        np.testing.assert_allclose(_stack(a, attr), _stack(b, attr), atol=1e-6)
+    for attr in ("alpha", "mu", "var", "feature_log_marginal"):
+        np.testing.assert_allclose(_stack(a, attr), _stack(b, attr), atol=1e-8)
 
 
 @pytest.mark.parametrize("seed", [0, 1])
@@ -155,135 +221,14 @@ def test_logistic_closer_to_exact_cavi_than_gibss(seed):
     ref = fit_glm_susie(X, y, method="cf_cavi_q1", **kw)
     out = {m: fit_glm_susie(X, y, method=m, **kw) for m in ("logistic", "adjusted")}
 
+    def pip(t):
+        return 1 - np.prod(1 - _stack(t, "alpha"), 0)
+
     def gaps(s):
         lm = _stack(s, "feature_log_marginal") - _stack(ref, "feature_log_marginal")
-        pip = lambda t: 1 - np.prod(1 - _stack(t, "alpha"), 0)
         return np.max(np.abs(lm[:3])), np.max(np.abs(pip(s) - pip(ref)))
 
     lm_g, pip_g = gaps(out["logistic"])
     lm_a, pip_a = gaps(out["adjusted"])
     assert lm_a < 0.25 * lm_g
     assert pip_a <= pip_g + 1e-3
-
-
-# ---- the six (data, offset, ridge) cases ----------------------------------------------
-
-_CASES = [
-    (True, False, False),
-    (False, True, False),
-    (True, True, False),
-    (True, False, True),
-    (False, True, True),
-    (True, True, True),
-]
-
-
-@pytest.mark.parametrize("flags", _CASES)
-def test_case_matches_its_conditions_to_second_order(flags):
-    """Each switched-on parameter takes one condition (delta: score, kappa: curvature, nu:
-    the lowest one left). At the anchor the value is the Taylor value exactly, and every
-    matched derivative agrees with the Taylor target up to O(ov^2): halving ov quarters
-    the error. Off the clip bands (z = 1.5 keeps p away from 1/2, 0.21 and 0.79)."""
-    import jax
-
-    sm = Adjusted(*flags)
-    base = Bernoulli()
-    z = jnp.asarray([1.5, 1.5])
-    y = jnp.asarray([0.0, 1.0])
-    matched = set()
-    if sm.data:
-        matched.add(1)
-    if sm.ridge:
-        matched.add(2)
-    if sm.nu_order:
-        matched.add(sm.nu_order)
-
-    def derivs(fn, ov):
-        # loglik derivatives 1..3 at the anchor: grad, -weight, -d weight / d eta
-        aux = (y, jnp.full((2,), ov), z)
-        g = fn(z, aux)[1]
-        w = fn(z, aux)[2]
-        dw = jax.vmap(jax.grad(lambda e, i: fn(jnp.full((2,), e), aux)[2][i]))(z, jnp.arange(2))
-        return g, -w, -dw
-
-    def target(ov):
-        a2 = base.cumulant_terms(z)[2]
-        a3, a4 = base.cumulant_derivs(z)
-        a5 = base.cumulant_deriv5(z)
-        h = 0.5 * ov
-        return (y - jax.nn.sigmoid(z) - h * a3, -(a2 + h * a4), -(a3 + h * a5))
-
-    def err(ov):
-        fn = Smoothed(base, sm).terms
-        ll = fn(z, (y, jnp.full((2,), ov), z))[0]
-        tl = Smoothed(base, Taylor()).terms(z, (y, jnp.full((2,), ov)))[0]
-        np.testing.assert_allclose(ll, tl, atol=1e-12)
-        got, want = derivs(fn, ov), target(ov)
-        return {k: float(jnp.max(jnp.abs(got[k - 1] - want[k - 1]))) for k in matched}
-
-    e1, e2 = err(0.02), err(0.01)
-    for k in matched:
-        assert e2[k] <= 0.3 * e1[k] + 1e-13, (k, e1[k], e2[k])
-
-
-@pytest.mark.parametrize("flags", _CASES)
-def test_case_poisson_exact_with_offset(flags):
-    """Every Poisson derivative is e^z, so any case with the offset on has nu = ov/2 and
-    delta = kappa = 0: the smoothed score and curvature at every eta."""
-    r, eta, z, ov = _rows(3)
-    y = jnp.asarray(r.poisson(2.0, eta.shape[0]).astype(float))
-    delta, nu, kappa = Adjusted(*flags).adjustment(Poisson(), z, ov)
-    if not flags[1]:
-        return
-    np.testing.assert_allclose(nu, ov / 2, atol=1e-12)
-    np.testing.assert_allclose(delta, 0.0, atol=1e-12)
-    np.testing.assert_allclose(kappa, 0.0, atol=1e-12)
-    _, g, w = Smoothed(Poisson(), Adjusted(*flags)).terms(eta, (y, ov, z))
-    lam = jnp.exp(eta + ov / 2)
-    np.testing.assert_allclose(g, y - lam, atol=1e-12)
-    np.testing.assert_allclose(w, lam, atol=1e-12)
-
-
-@pytest.mark.parametrize("flags", _CASES)
-def test_case_gaussian_reduces_to_taylor(flags):
-    r, eta, z, ov = _rows(4)
-    y = jnp.asarray(r.normal(size=eta.shape[0]))
-    base = Gaussian(variance=0.7)
-    got = Smoothed(base, Adjusted(*flags)).terms(eta, (y, ov, z))
-    want = Smoothed(base, Taylor()).terms(eta, (y, ov))
-    for a, b in zip(got, want):
-        np.testing.assert_allclose(a, b, atol=1e-12)
-
-
-@pytest.mark.parametrize("flags", [(False, True, False), (True, True, True)])
-def test_case_shift_finite_and_continuous(flags):
-    """Score-matched nu divides by A'' > 0 (no pole); third-derivative nu has a pole at
-    A'''' = 0 (logistic p ~ 0.21, 0.79), clipped continuously like the curvature case."""
-    ov = 0.5
-    z = jnp.linspace(-3.0, 3.0, 60001)
-    delta, nu, kappa = Adjusted(*flags).adjustment(Bernoulli(), z, ov)
-    for a in (delta, nu, kappa):
-        assert np.all(np.isfinite(np.asarray(a)))
-    assert np.max(np.abs(np.asarray(nu))) <= np.sqrt(ov) * (1 + 1e-12)
-    assert np.max(np.abs(np.diff(np.asarray(nu)))) < 50 * float(z[1] - z[0])
-
-
-def test_third_condition_needs_fifth_derivative():
-    from gibss.response import ExponentialFamily
-
-    class NoFifth(ExponentialFamily):
-        def terms(self, eta, aux):
-            return Poisson().terms(eta, aux)
-
-        def cumulant_derivs(self, eta):
-            return Poisson().cumulant_derivs(eta)
-
-    Smoothed(NoFifth(), Adjusted(True, True, False))  # fine: curvature case
-    with pytest.raises(TypeError, match="A\\^\\(5\\)"):
-        Smoothed(NoFifth(), Adjusted(True, True, True))
-
-
-def test_ridge_cases_flagged_nonconvex():
-    assert Adjusted(True, True, False).convex
-    assert not Adjusted(True, True, True).convex
-    assert not Adjusted(False, True, True).convex

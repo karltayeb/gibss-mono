@@ -62,10 +62,12 @@ _SMOOTHERS = {
     "compress_selfnorm": lambda cfg: CompressSelfNorm(M=cfg["compress_degree"]),
     "taylor2": lambda cfg: Taylor(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
-    # adjusted gIBSS: the family's own GLM with response/offset shifted per row to match
-    # the Taylor-smoothed score and curvature at the current predictor (re-anchored each
-    # effect update). Non-quadratic, so it runs in the free-form quad kernel.
-    "adjusted": lambda cfg: Adjusted(*cfg["_adjust"]),
+    # adjusted gIBSS: the family's own GLM with a per-row response shift, predictor shift
+    # and temperature (delta, nu, kappa), tuned each effect update so it matches the
+    # offset-smoothed loglik at the current predictor in value, score, curvature and third
+    # derivative. The targets are GH averages on `offset_quadrature_points` nodes.
+    # Non-quadratic, so it runs in the free-form quad kernel.
+    "adjusted": lambda cfg: Adjusted(order=cfg["offset_quadrature_points"]),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
     # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).
@@ -87,7 +89,6 @@ _DEFAULTS = {
     # preset-only knobs (no public argument; reachable via method=)
     "_anchor": "update",  # taylor_fixed expansion anchor: "update" | "null"
     "_mean_message": False,  # working-model mode: drop the message variance
-    "_adjust": (True, True, False),  # adjusted (data, offset, ridge) switches
 }
 
 # Named methods = partial configs over the same axes; user kwargs override.
@@ -106,17 +107,7 @@ PRESETS = {
     # offset integration; the effect b is Gaussian-VI-integrated (glm_vi_gh_ser, plain base).
     "gibss_gaussian": {"variational_family": "gaussian", "offset_integration": "none"},
     "globaljj": {"offset_integration": "jj_fixed"},
-    # adjusted gIBSS, named by its switched-on parameters: d = data shift delta (score),
-    # o = offset shift nu, r = ridge kappa (curvature); nu takes the lowest condition left
-    # (o: score, do: curvature, dor: third derivative). "adjusted" = "adjusted_do".
     "adjusted": {"offset_integration": "adjusted"},
-    **{
-        f"adjusted_{name}": {
-            "offset_integration": "adjusted",
-            "_adjust": ("d" in name, "o" in name, "r" in name),
-        }
-        for name in ("d", "o", "do", "dr", "or", "dor")
-    },
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
         "offset_integration": "taylor_fixed",

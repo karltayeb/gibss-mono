@@ -78,6 +78,7 @@ __all__ = [
     "estimate_intercept_step",
     "estimate_random_intercept_step",
     "update_row_param_step",
+    "update_row_param_loo_index_step",
     "default_schedule",
     "to_gaussian_family",
 ]
@@ -443,7 +444,7 @@ def _aux(data, state, include_intercept_var=True, include_ri_var=True):
     ov = _offset_var(state, include_intercept_var, include_ri_var)
     smoother = fs.response.smoother
     if smoother.takes_row_param and fs.kernel != "jj":
-        return y, ov, jnp.asarray(fs.row_param)
+        return y, ov, jax.tree_util.tree_map(jnp.asarray, fs.row_param)
     return y, ov
 
 
@@ -772,7 +773,7 @@ def _null_row_param_solve(mean, ov, y, base, response, profiled, n_iter=200, tol
     y = jax.tree_util.tree_map(jnp.asarray, y)  # observation leaf: y, or (y, n_trials)
 
     def tune(c):
-        return smoother.row_param(mean, ov, base + c)
+        return smoother.row_param(mean, ov, base + c, family=response.base)
 
     if profiled:
         def body(s):
@@ -1338,6 +1339,51 @@ def estimate_random_intercept_step(data, state):
     )
 
 
+def _tune_row_param(data, fs, mean, ov):
+    """The smoother's per-row parameter at predictor mean `mean` (+ the non-effect parts of
+    eta) and offset variance `ov`; profiled intercepts tune at the profiled null intercept."""
+    if fs.intercept == "profiled":
+        _, param, _ = _null_row_param_solve(
+            mean, ov, _response_aux(data), fs.glm_offset, fs.response, True
+        )
+    else:
+        param = fs.response.smoother.row_param(
+            mean,
+            ov,
+            _nuisance_mean(fs) + fs.glm_offset,  # every non-effect part of eta
+            family=fs.response.base,
+        )
+    return param
+
+
+def update_row_param_loo_index_step(data, l, state):
+    """Re-tune the row parameter for the effect about to be fitted at the moments its kernel
+    sees: the full predictor mean (the leave-one-out message plus this effect's own, as in
+    `update_row_param_step`) and the LEAVE-ONE-OUT variance. Runs after
+    `subtract_message_index_step`. Only for smoothers whose parameter bakes the offset
+    variance in (`Smoother.loo_variance`; Adjusted tunes (delta, nu, kappa, C) against
+    E_o A^(k)(z + o) under o ~ N(0, ov)). For those the full-message value from
+    `update_row_param_step` (which the intercept step consumes) would carry this effect's
+    own variance into ov, a per-row value bias that sums over rows (about a nat at n = 400
+    on a lead effect)."""
+    fs = state.family_state
+    smoother = getattr(fs.response, "smoother", None)
+    if (
+        fs.kernel == "jj"
+        or not isinstance(fs.response, Smoothed)
+        or not smoother.takes_row_param
+        or not smoother.loo_variance
+    ):
+        return state
+    effect = state.single_effects[l]
+    msg = getattr(effect, "cached_message", None)
+    if msg is None:
+        msg = effect.message(data)
+    mean = jnp.asarray(state.total_message.mean) + jnp.asarray(msg.mean)
+    param = _tune_row_param(data, fs, mean, _offset_var(state))
+    return replace(state, family_state=replace(fs, row_param=param))
+
+
 def update_row_param_step(data, state):
     """Refresh the smoother's per-row engine-tuned parameter from the FULL message
     (all effects) + intercept, before each effect update. JJFixed: the globaljj tilt
@@ -1361,15 +1407,13 @@ def update_row_param_step(data, state):
     ):
         return state
     mean = jnp.asarray(state.total_message.mean)
-    ov = _offset_var(state)  # message variance + intercept variance
-    if fs.intercept == "profiled":
-        _, param, _ = _null_row_param_solve(
-            mean, ov, _response_aux(data), fs.glm_offset, fs.response, True
-        )
-    else:
-        param = fs.response.smoother.row_param(
-            mean, ov, _nuisance_mean(fs) + fs.glm_offset  # every non-effect part of eta
-        )
+    # message variance + intercept variance. A `loo_variance` smoother bakes ov into the
+    # parameter, and this full-message value's only consumer is the intercept step, whose
+    # own aux excludes the intercept's variance (mean-field self-exclusion): match it. The
+    # effect kernels get their own re-tune (update_row_param_loo_index_step).
+    smoother = fs.response.smoother
+    ov = _offset_var(state, include_intercept_var=not smoother.loo_variance)
+    param = _tune_row_param(data, fs, mean, ov)
     return replace(state, family_state=replace(fs, row_param=param))
 
 
@@ -1590,6 +1634,7 @@ def default_schedule() -> Schedule:
         before_effect_update=(update_row_param_step, estimate_intercept_step),
         effect_update=(
             subtract_message_index_step,
+            update_row_param_loo_index_step,
             update_effect_index_step,
             update_prior_variance_index_step,
             add_message_index_step,
