@@ -289,7 +289,7 @@ def test_two_point_rule_matches_its_conditions():
     ov = jnp.asarray(r.uniform(0.5, 4.0, 9))
     sm = Adjusted(order=60, rule="two_point")
     y = jnp.zeros(9)
-    param = sm.adjustment_two_point(Bernoulli(), s, z, ov)
+    param = sm.row_param(z, ov, 0.0, family=Bernoulli(), null_mean=s)  # the jitted path
     f = lambda e: Smoothed(Bernoulli(), sm).terms(e, (y, ov, param))  # noqa: E731
     ref = lambda e: Smoothed(Bernoulli(), GH(60)).terms(e, (y, ov))  # noqa: E731
     np.testing.assert_allclose(f(s)[0], ref(s)[0], atol=1e-8)
@@ -302,3 +302,30 @@ def test_two_point_rule_matches_its_conditions():
     d, nu, kappa, _ = Adjusted(rule="two_point").adjustment_two_point(Gaussian(0.7), s, z, ov)
     np.testing.assert_allclose(kappa, 1.0, atol=1e-12)
     np.testing.assert_allclose(nu, 0.0, atol=1e-12)
+
+
+def test_null_rule_matches_at_the_null_end():
+    """rule="null" is the one-point rule at s = null_mean + base; without `null_mean` (the
+    intercept step) every rule falls back to the one-point rule at z."""
+    r = np.random.default_rng(7)
+    s = jnp.asarray(r.normal(size=9))
+    z = s + jnp.asarray(r.normal(size=9))
+    ov = jnp.asarray(r.uniform(0.5, 4.0, 9))
+    base = 0.3
+    one = Adjusted(order=60)
+    for rule in ("null", "two_point", "one_point"):
+        got = Adjusted(order=60, rule=rule).row_param(z - base, ov, base, family=Bernoulli())
+        np.testing.assert_allclose(np.stack(got), np.stack(one.adjustment(Bernoulli(), z, ov)), atol=1e-12)
+    got = Adjusted(order=60, rule="null").row_param(z - base, ov, base, family=Bernoulli(), null_mean=s - base)
+    np.testing.assert_allclose(np.stack(got), np.stack(one.adjustment(Bernoulli(), s, ov)), atol=1e-12)
+
+
+def test_rule_presets():
+    from gibss.methods import PRESETS, _DEFAULTS, _resolve
+
+    for preset, rule in (("adjusted", "one_point"), ("adjusted_two_point", "two_point"),
+                         ("adjusted_null", "null")):
+        response, _ = _resolve({**_DEFAULTS, **PRESETS[preset]})
+        assert response.smoother.rule == rule
+    with pytest.raises(ValueError):
+        Adjusted(rule="midpoint")

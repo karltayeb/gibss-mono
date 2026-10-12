@@ -32,6 +32,7 @@ the reason schemes are objects, not method strings.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -1469,12 +1470,15 @@ class Adjusted(Smoother):
 
     order: int = 15
     target: str = "gh"  # how E_o A^(k)(z + o) is approximated: "gh" | "taylor" (see `targets`)
-    # "one_point": value, score, curvature, 3rd derivative at z (default). "two_point": score at
-    # the null end s, score and curvature at z, value at s. The engine re-scores every SER's
-    # null with the parameter re-tuned AT s (glm._fit_effect), so with one_point each log BF is
-    # already (alternative, exact near z) - (null, exact at s); two_point gives up the 3rd
-    # derivative at z for a null match the engine already provides, and was 0.01-0.04 nats
-    # worse in full fits (and its per-row Newton is not jit-cached yet).
+    # Where the four conditions go. s is the predictor mean without the effect being updated
+    # (every feature's null end), z the predictor mean with it (the mode end).
+    #   "one_point" (default): value, score, curvature and 3rd derivative at z.
+    #   "two_point": score at s, score and curvature at z, value at s.
+    #   "null": value, score, curvature and 3rd derivative at s.
+    # The engine re-scores every SER's null with the parameter re-tuned AT s
+    # (glm._fit_effect), so the null side of each log BF is exact under every rule and the
+    # rules differ on the alternative side. In the selection stress tests one_point was at
+    # the GH-61 reference (log BF <= 0.02), two_point within 0.07, null within 1.7 nats.
     rule: str = "one_point"
     takes_row_param = True
     loo_variance = True
@@ -1482,8 +1486,8 @@ class Adjusted(Smoother):
     def __post_init__(self):
         if self.target not in ("gh", "taylor"):
             raise ValueError(f"unknown target {self.target!r}; use 'gh' or 'taylor'")
-        if self.rule not in ("two_point", "one_point"):
-            raise ValueError(f"unknown rule {self.rule!r}; use 'two_point' or 'one_point'")
+        if self.rule not in ("two_point", "one_point", "null"):
+            raise ValueError(f"unknown rule {self.rule!r}; use 'one_point', 'two_point' or 'null'")
 
     def validate(self, base):
         if not isinstance(base, ExponentialFamily):
@@ -1561,19 +1565,26 @@ class Adjusted(Smoother):
         def G(u, h, t2, dt1):
             return a1(u + h * t2 / a2(u)) - a1(u) - dt1
 
-        dG = jax.grad(G)
+        def dG(u, h, t2):
+            # G'(u) = A''(v) (1 - h t2 A'''(u)/A''(u)^2) - A''(u), with v = u + h t2/A''(u)
+            au2 = a2(u)
+            return a2(u + h * t2 / au2) * (1.0 - h * t2 * base.cumulant_derivs(u)[0] / (au2 * au2)) - au2
 
         def solve(u, h, t2, dt1):
-            def body(_, u):
-                g, gp = G(u, h, t2, dt1), dG(u, h, t2, dt1)
+            # damped Newton (step clipped to 1), stopped once the step falls below 1e-12
+            def body(c):
+                i, u, _ = c
+                g, gp = G(u, h, t2, dt1), dG(u, h, t2)
                 step = jnp.where(jnp.abs(gp) > 1e-14, g / jnp.where(gp != 0.0, gp, 1.0), 0.0)
-                return u - jnp.clip(step, -1.0, 1.0)
+                step = jnp.clip(step, -1.0, 1.0)
+                return i + 1, u - step, jnp.abs(step)
 
-            u = jax.lax.fori_loop(0, 50, body, u)
+            _, u, _ = jax.lax.while_loop(
+                lambda c: (c[0] < 50) & (c[2] > 1e-12), body, (0, u, jnp.asarray(jnp.inf, u.dtype))
+            )
             return u, jnp.abs(G(u, h, t2, dt1))
 
-        flat = lambda a: jnp.ravel(a)
-        u, res = jax.vmap(solve)(flat(u0), flat(h), flat(t2z), flat(t1s - t1z))
+        u, res = jax.vmap(solve)(*(jnp.ravel(a) for a in (u0, h, t2z, t1s - t1z)))
         u, res = u.reshape(s.shape), res.reshape(s.shape)
         ok = (jnp.abs(h) >= 0.05) & jnp.isfinite(u) & (res < 1e-8)
         u = jnp.where(ok, u, u0)
@@ -1585,15 +1596,21 @@ class Adjusted(Smoother):
         return delta, nu, kappa, const
 
     def row_param(self, effect_mean, effect_var, base, family=None, null_mean=None):
-        """One-point rule at z = effect_mean + base, or, with `null_mean` (the predictor
-        without the effect being updated, as a mean over the other effects) and
-        `rule="two_point"`, the two-point rule between s = null_mean + base and z."""
+        """`(delta, nu, kappa, C)` per row by `rule`, at z = effect_mean + base and, given
+        `null_mean` (the predictor mean without the effect being updated), s = null_mean +
+        base. "one_point" matches at z, "null" at s, "two_point" between s and z. Without
+        `null_mean` (the intercept step) every rule matches at z. Jit-compiled per
+        (smoother, family)."""
         if family is None:
             raise TypeError("Adjusted.row_param needs the base family (family=...)")
-        z = jnp.asarray(effect_mean) + base
-        if self.rule == "two_point" and null_mean is not None:
-            return self.adjustment_two_point(family, jnp.asarray(null_mean) + base, z, effect_var)
-        return self.adjustment(family, z, effect_var)
+        ov = jnp.asarray(effect_var, float)
+        z = jnp.asarray(effect_mean, float) + base
+        if null_mean is None or self.rule == "one_point":
+            return _adjusted_one_point(self, family, z, ov)
+        s = jnp.asarray(null_mean, float) + base
+        if self.rule == "null":
+            return _adjusted_one_point(self, family, s, ov)
+        return _adjusted_two_point(self, family, s, z, ov)
 
     def terms(self, base, eta, aux):
         y, _, (delta, nu, kappa, const) = aux
@@ -1632,6 +1649,16 @@ class _JJBase(Smoother):
                 f"{type(base).__name__} does not support the JJ/PG bound -- "
                 f"use GH instead."
             )
+
+
+@partial(jax.jit, static_argnums=(0, 1))
+def _adjusted_one_point(smoother, base, z, ov):
+    return smoother.adjustment(base, z, ov)
+
+
+@partial(jax.jit, static_argnums=(0, 1))
+def _adjusted_two_point(smoother, base, s, z, ov):
+    return smoother.adjustment_two_point(base, s, z, ov)
 
 
 @dataclass(frozen=True)

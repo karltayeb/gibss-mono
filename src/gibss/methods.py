@@ -66,9 +66,12 @@ _SMOOTHERS = {
     # and temperature (delta, nu, kappa), tuned each effect update so it matches the
     # offset-smoothed loglik at the current predictor in value, score, curvature and third
     # derivative. The targets are GH averages on `offset_quadrature_points` nodes.
+    # `_adjusted_rule` picks where the parameters are matched (see Adjusted.rule).
     # Non-quadratic, so it runs in the free-form quad kernel.
     "adjusted": lambda cfg: Adjusted(
-        order=cfg["offset_quadrature_points"], target=cfg["_adjusted_target"]
+        order=cfg["offset_quadrature_points"],
+        target=cfg["_adjusted_target"],
+        rule=cfg["_adjusted_rule"],
     ),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
@@ -92,6 +95,7 @@ _DEFAULTS = {
     "_anchor": "update",  # taylor_fixed expansion anchor: "update" | "null"
     "_mean_message": False,  # working-model mode: drop the message variance
     "_adjusted_target": "gh",  # adjusted targets E_o A^(k)(z + o): "gh" | "taylor"
+    "_adjusted_rule": "one_point",  # adjusted matching rule: "one_point" | "two_point" | "null"
 }
 
 # Named methods = partial configs over the same axes; user kwargs override.
@@ -114,6 +118,10 @@ PRESETS = {
     # the same (delta, nu, kappa) rule fed the Taylor-expanded targets A^(k) + ov/2 A^(k+2):
     # like-for-like with offset_integration="taylor2" (closed form, no quadrature)
     "adjusted_taylor": {"offset_integration": "adjusted", "_adjusted_target": "taylor"},
+    # the other matching rules: score at the null end s plus score and curvature at the
+    # mode end z ("two_point"), or all four conditions at s ("null")
+    "adjusted_two_point": {"offset_integration": "adjusted", "_adjusted_rule": "two_point"},
+    "adjusted_null": {"offset_integration": "adjusted", "_adjusted_rule": "null"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
         "offset_integration": "taylor_fixed",
