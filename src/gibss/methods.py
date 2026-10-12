@@ -67,7 +67,9 @@ _SMOOTHERS = {
     # offset-smoothed loglik at the current predictor in value, score, curvature and third
     # derivative. The targets are GH averages on `offset_quadrature_points` nodes.
     # Non-quadratic, so it runs in the free-form quad kernel.
-    "adjusted": lambda cfg: Adjusted(order=cfg["offset_quadrature_points"]),
+    "adjusted": lambda cfg: Adjusted(
+        order=cfg["offset_quadrature_points"], target=cfg["_adjusted_target"]
+    ),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
     # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).
@@ -89,6 +91,7 @@ _DEFAULTS = {
     # preset-only knobs (no public argument; reachable via method=)
     "_anchor": "update",  # taylor_fixed expansion anchor: "update" | "null"
     "_mean_message": False,  # working-model mode: drop the message variance
+    "_adjusted_target": "gh",  # adjusted targets E_o A^(k)(z + o): "gh" | "taylor"
 }
 
 # Named methods = partial configs over the same axes; user kwargs override.
@@ -108,6 +111,9 @@ PRESETS = {
     "gibss_gaussian": {"variational_family": "gaussian", "offset_integration": "none"},
     "globaljj": {"offset_integration": "jj_fixed"},
     "adjusted": {"offset_integration": "adjusted"},
+    # the same (delta, nu, kappa) rule fed the Taylor-expanded targets A^(k) + ov/2 A^(k+2):
+    # like-for-like with offset_integration="taylor2" (closed form, no quadrature)
+    "adjusted_taylor": {"offset_integration": "adjusted", "_adjusted_target": "taylor"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
         "offset_integration": "taylor_fixed",

@@ -232,3 +232,25 @@ def test_logistic_closer_to_exact_cavi_than_gibss(seed):
     lm_a, pip_a = gaps(out["adjusted"])
     assert lm_a < 0.25 * lm_g
     assert pip_a <= pip_g + 1e-3
+
+
+def test_taylor_targets_are_the_second_order_expansion():
+    """`target="taylor"` feeds the same rule the closed-form targets A^(k) + ov/2 A^(k+2):
+    identical to the GH targets for a Gaussian base, the Taylor smoother's O(ov^2) error
+    otherwise (Poisson: nu = log(1 + ov/2) instead of ov/2)."""
+    r, _, z, ov = _rows(5)
+    for base in (Gaussian(variance=0.7), Poisson(), Bernoulli()):
+        gh = Adjusted().targets(base, z, ov)
+        ta = Adjusted(target="taylor").targets(base, z, ov)
+        a2 = base.cumulant_terms(z)[2]
+        a3, a4 = base.cumulant_derivs(z)
+        np.testing.assert_allclose(ta[2], a2 + 0.5 * ov * a4, atol=1e-12)
+        np.testing.assert_allclose(ta[1], -base.cumulant_terms(z)[1] + 0.5 * ov * a3, atol=1e-12)
+        if isinstance(base, Gaussian):
+            for a, b in zip(gh, ta):
+                np.testing.assert_allclose(a, b, atol=1e-12)
+    _, nu, kappa, _ = Adjusted(target="taylor").adjustment(Poisson(), z, ov)
+    np.testing.assert_allclose(nu, jnp.log1p(ov / 2), atol=1e-12)
+    np.testing.assert_allclose(kappa, 1.0, atol=1e-12)
+    with pytest.raises(ValueError, match="target"):
+        Adjusted(target="moments")

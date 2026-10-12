@@ -1438,9 +1438,10 @@ class Adjusted(Smoother):
     param = (delta, nu, kappa, C), each per row and per unit of the cumulant (the Binomial
     trial count scales delta, C and the cumulant term in `terms`).
 
-    Tuning. With the per-unit targets t_k = E_o A^(k)(z + o), k = 0..3 (`targets`:
-    Gauss-Hermite with `order` nodes under o ~ N(0, ov)), and w the point (z + nu)/kappa
-    at which the surrogate's cumulant is evaluated:
+    Tuning. With the per-unit targets t_k ~= E_o A^(k)(z + o), k = 0..3 (`targets`: by
+    default Gauss-Hermite with `order` nodes under o ~ N(0, ov); `target="taylor"` uses the
+    closed-form second-order expansion instead), and w the point (z + nu)/kappa at which
+    the surrogate's cumulant is evaluated:
 
         A'''(w) / A''(w)^2 = t3 / t2^2      (family hook `shape_point`)
         kappa = A''(w) / t2
@@ -1467,8 +1468,13 @@ class Adjusted(Smoother):
     """
 
     order: int = 15
+    target: str = "gh"  # how E_o A^(k)(z + o) is approximated: "gh" | "taylor" (see `targets`)
     takes_row_param = True
     loo_variance = True
+
+    def __post_init__(self):
+        if self.target not in ("gh", "taylor"):
+            raise ValueError(f"unknown target {self.target!r}; use 'gh' or 'taylor'")
 
     def validate(self, base):
         if not isinstance(base, ExponentialFamily):
@@ -1479,14 +1485,26 @@ class Adjusted(Smoother):
             )
 
     def targets(self, base, z, ov):
-        """Per-unit `(t0, t1, t2, t3) = E_o (A, A', A'', A''')(z + o)`, o ~ N(0, ov), by
-        `order`-node Gauss-Hermite. The one place the law of the offset enters."""
-        nodes_np, wts_np = np.polynomial.hermite.hermgauss(self.order)
+        """Per-unit `(t0, t1, t2, t3)` approximating `E_o (A, A', A'', A''')(z + o)`, o ~ N(0, ov):
+        the one place the law of the offset enters, separate from how the parameters are
+        read off it. `target="gh"`: `order`-node Gauss-Hermite on the Gaussian law.
+        `target="taylor"`: the second-order expansion `A^(k) + ov/2 A^(k+2)` (closed form,
+        the same approximation as the `Taylor` smoother, so the two are comparable like for
+        like; A^(5) by autodiff of `cumulant_derivs`). O(ov^2) error, and t2 can turn
+        negative where ov/2 A'''' < -A'' (logistic at p = 1/2 for ov > 4)."""
         z = jnp.asarray(z, dtype=float)
+        ov = jnp.maximum(jnp.asarray(ov, dtype=float), 0.0)
+        if self.target == "taylor":
+            neg_a, neg_a1, a2 = base.cumulant_terms(z)
+            a3, a4 = base.cumulant_derivs(z)
+            a5 = jnp.vectorize(jax.grad(lambda e: base.cumulant_derivs(e)[1]))(z)
+            hv = 0.5 * ov
+            return -neg_a + hv * a2, -neg_a1 + hv * a3, a2 + hv * a4, a3 + hv * a5
+        nodes_np, wts_np = np.polynomial.hermite.hermgauss(self.order)
         lead = (-1,) + (1,) * jnp.ndim(z)
         nodes = jnp.asarray(nodes_np).reshape(lead)
         wts = jnp.asarray(wts_np / np.sqrt(np.pi)).reshape(lead)  # sum to 1
-        sd = jnp.sqrt(2.0 * jnp.maximum(jnp.asarray(ov, dtype=float), 0.0))
+        sd = jnp.sqrt(2.0 * ov)
         pts = z[None, ...] + sd[None, ...] * nodes  # (order, *z.shape)
         neg_a, neg_a1, a2 = base.cumulant_terms(pts)
         a3, _ = base.cumulant_derivs(pts)
