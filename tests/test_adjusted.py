@@ -254,3 +254,51 @@ def test_taylor_targets_are_the_second_order_expansion():
     np.testing.assert_allclose(kappa, 1.0, atol=1e-12)
     with pytest.raises(ValueError, match="target"):
         Adjusted(target="moments")
+
+
+def test_random_intercept_mean_is_in_the_anchor():
+    """With a random intercept, the predictor the kernel sees includes its posterior mean m_i,
+    so the row parameter must be tuned there too. Tuned without m_i, the lead log BF drifted
+    by -0.24 nats at random-intercept variance 4; tuned with it, the fit matches the
+    GH-smoothed fit on the same Gaussian-offset model."""
+    r = np.random.default_rng(0)
+    n, p = 400, 20
+    X = r.standard_normal((n, p))
+    eta = 1.0 * X[:, 3] - 0.8 * X[:, 12] + 2.0 * r.standard_normal(n)
+    y = r.binomial(1, 1 / (1 + np.exp(-eta))).astype(float)
+    kw = {"L": 3, "max_iter": 30, "schedule": _FIXED, "random_intercept": True,
+          "random_intercept_variance": 4.0}
+    a = fit_glm_susie(X, y, method="adjusted", **kw)
+    b = fit_glm_susie(X, y, method="smoothed", offset_quadrature_points=31, **kw)
+
+    def lbf(s):
+        null = np.asarray([float(e.null_log_marginal) for e in s.single_effects])[:, None]
+        return _stack(s, "feature_log_marginal") - null
+
+    np.testing.assert_allclose(_stack(a, "alpha"), _stack(b, "alpha"), atol=2e-3)
+    lead = _stack(b, "alpha") > 0.01
+    assert np.max(np.abs(lbf(a) - lbf(b))[lead]) < 0.02
+
+
+def test_two_point_rule_matches_its_conditions():
+    """rule="two_point": score at the null end s, score and curvature at z, value at s. Exact
+    for Poisson (kappa = 1, nu = ov/2) and Gaussian (kappa = 1, nu = 0)."""
+    r = np.random.default_rng(6)
+    s = jnp.asarray(r.normal(size=9))
+    z = s + jnp.asarray(r.normal(size=9))
+    ov = jnp.asarray(r.uniform(0.5, 4.0, 9))
+    sm = Adjusted(order=60, rule="two_point")
+    y = jnp.zeros(9)
+    param = sm.adjustment_two_point(Bernoulli(), s, z, ov)
+    f = lambda e: Smoothed(Bernoulli(), sm).terms(e, (y, ov, param))  # noqa: E731
+    ref = lambda e: Smoothed(Bernoulli(), GH(60)).terms(e, (y, ov))  # noqa: E731
+    np.testing.assert_allclose(f(s)[0], ref(s)[0], atol=1e-8)
+    np.testing.assert_allclose(f(s)[1], ref(s)[1], atol=1e-8)
+    np.testing.assert_allclose(f(z)[1], ref(z)[1], atol=1e-8)
+    np.testing.assert_allclose(f(z)[2], ref(z)[2], atol=1e-8)
+    d, nu, kappa, _ = Adjusted(rule="two_point").adjustment_two_point(Poisson(), s, z, ov)
+    np.testing.assert_allclose(kappa, 1.0, atol=1e-10)
+    np.testing.assert_allclose(nu, ov / 2, atol=1e-8)
+    d, nu, kappa, _ = Adjusted(rule="two_point").adjustment_two_point(Gaussian(0.7), s, z, ov)
+    np.testing.assert_allclose(kappa, 1.0, atol=1e-12)
+    np.testing.assert_allclose(nu, 0.0, atol=1e-12)

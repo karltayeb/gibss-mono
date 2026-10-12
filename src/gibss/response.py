@@ -1469,12 +1469,21 @@ class Adjusted(Smoother):
 
     order: int = 15
     target: str = "gh"  # how E_o A^(k)(z + o) is approximated: "gh" | "taylor" (see `targets`)
+    # "one_point": value, score, curvature, 3rd derivative at z (default). "two_point": score at
+    # the null end s, score and curvature at z, value at s. The engine re-scores every SER's
+    # null with the parameter re-tuned AT s (glm._fit_effect), so with one_point each log BF is
+    # already (alternative, exact near z) - (null, exact at s); two_point gives up the 3rd
+    # derivative at z for a null match the engine already provides, and was 0.01-0.04 nats
+    # worse in full fits (and its per-row Newton is not jit-cached yet).
+    rule: str = "one_point"
     takes_row_param = True
     loo_variance = True
 
     def __post_init__(self):
         if self.target not in ("gh", "taylor"):
             raise ValueError(f"unknown target {self.target!r}; use 'gh' or 'taylor'")
+        if self.rule not in ("two_point", "one_point"):
+            raise ValueError(f"unknown rule {self.rule!r}; use 'two_point' or 'one_point'")
 
     def validate(self, base):
         if not isinstance(base, ExponentialFamily):
@@ -1523,10 +1532,68 @@ class Adjusted(Smoother):
         const = -kappa * neg_a - delta * jnp.asarray(z) - t0  # kappa A(w) - delta z - t0
         return delta, nu, kappa, const
 
-    def row_param(self, effect_mean, effect_var, base, family=None):
+    def adjustment_two_point(self, base, s, z, ov):
+        """Per-unit `(delta, nu, kappa, C)` matching the smoothed loglik's score at the null
+        end `s` of every feature's path and its score and curvature at the far end `z`; C
+        makes the value at `s` exact. With u = (z + nu)/kappa, kappa = A''(u)/t2(z) and the
+        two scores reduce to one equation in u,
+
+            G(u) = A'(u + (s - z)/kappa(u)) - A'(u) - (t1(s) - t1(z)) = 0,
+
+        solved by damped Newton from the one-point solution at z. Rows with |s - z| < 0.05
+        (no path: the first sweep, or rows the effect does not touch), a quadratic cumulant
+        (G vanishes identically) or a failed solve keep the one-point solution at z, with C
+        moved to the null."""
+        s = jnp.asarray(s, dtype=float)
+        z = jnp.broadcast_to(jnp.asarray(z, dtype=float), s.shape)
+        ov = jnp.broadcast_to(jnp.asarray(ov, dtype=float), s.shape)
+        t0s, t1s, _, _ = self.targets(base, s, ov)
+        _, t1z, t2z, t3z = self.targets(base, z, ov)
+        u0 = base.shape_point(t3z / (t2z * t2z), z)
+        h = s - z
+
+        def a1(u):
+            return -base.cumulant_terms(u)[1]
+
+        def a2(u):
+            return base.cumulant_terms(u)[2]
+
+        def G(u, h, t2, dt1):
+            return a1(u + h * t2 / a2(u)) - a1(u) - dt1
+
+        dG = jax.grad(G)
+
+        def solve(u, h, t2, dt1):
+            def body(_, u):
+                g, gp = G(u, h, t2, dt1), dG(u, h, t2, dt1)
+                step = jnp.where(jnp.abs(gp) > 1e-14, g / jnp.where(gp != 0.0, gp, 1.0), 0.0)
+                return u - jnp.clip(step, -1.0, 1.0)
+
+            u = jax.lax.fori_loop(0, 50, body, u)
+            return u, jnp.abs(G(u, h, t2, dt1))
+
+        flat = lambda a: jnp.ravel(a)
+        u, res = jax.vmap(solve)(flat(u0), flat(h), flat(t2z), flat(t1s - t1z))
+        u, res = u.reshape(s.shape), res.reshape(s.shape)
+        ok = (jnp.abs(h) >= 0.05) & jnp.isfinite(u) & (res < 1e-8)
+        u = jnp.where(ok, u, u0)
+        kappa = a2(u) / t2z
+        nu = kappa * u - z
+        delta = a1(u) - t1z
+        us = (s + nu) / kappa
+        const = kappa * (-base.cumulant_terms(us)[0]) - delta * s - t0s  # value exact at s
+        return delta, nu, kappa, const
+
+    def row_param(self, effect_mean, effect_var, base, family=None, null_mean=None):
+        """One-point rule at z = effect_mean + base, or, with `null_mean` (the predictor
+        without the effect being updated, as a mean over the other effects) and
+        `rule="two_point"`, the two-point rule between s = null_mean + base and z."""
         if family is None:
             raise TypeError("Adjusted.row_param needs the base family (family=...)")
-        return self.adjustment(family, jnp.asarray(effect_mean) + base, effect_var)
+        z = jnp.asarray(effect_mean) + base
+        if self.rule == "two_point" and null_mean is not None:
+            return self.adjustment_two_point(family, jnp.asarray(null_mean) + base, z, effect_var)
+        return self.adjustment(family, z, effect_var)
 
     def terms(self, base, eta, aux):
         y, _, (delta, nu, kappa, const) = aux

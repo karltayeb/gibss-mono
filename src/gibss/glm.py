@@ -1339,19 +1339,24 @@ def estimate_random_intercept_step(data, state):
     )
 
 
-def _tune_row_param(data, fs, mean, ov):
+def _tune_row_param(data, fs, mean, ov, null_mean=None):
     """The smoother's per-row parameter at predictor mean `mean` (+ the non-effect parts of
-    eta) and offset variance `ov`; profiled intercepts tune at the profiled null intercept."""
+    eta: shared nuisance, fixed offset, random-intercept mean) and offset variance `ov`;
+    profiled intercepts tune at the profiled null intercept. `null_mean` (the effects'
+    mean WITHOUT the effect being updated) selects a two-point rule where the smoother has
+    one (Adjusted)."""
     if fs.intercept == "profiled":
         _, param, _ = _null_row_param_solve(
-            mean, ov, _response_aux(data), fs.glm_offset, fs.response, True
+            mean, ov, _response_aux(data), fs.glm_offset + _ri_mean(fs), fs.response, True
         )
     else:
+        kw = {} if null_mean is None else {"null_mean": null_mean}
         param = fs.response.smoother.row_param(
             mean,
             ov,
-            _nuisance_mean(fs) + fs.glm_offset,  # every non-effect part of eta
+            _nuisance_mean(fs) + fs.glm_offset + _ri_mean(fs),  # every non-effect part of eta
             family=fs.response.base,
+            **kw,
         )
     return param
 
@@ -1379,8 +1384,8 @@ def update_row_param_loo_index_step(data, l, state):
     msg = getattr(effect, "cached_message", None)
     if msg is None:
         msg = effect.message(data)
-    mean = jnp.asarray(state.total_message.mean) + jnp.asarray(msg.mean)
-    param = _tune_row_param(data, fs, mean, _offset_var(state))
+    loo = jnp.asarray(state.total_message.mean)
+    param = _tune_row_param(data, fs, loo + jnp.asarray(msg.mean), _offset_var(state), null_mean=loo)
     return replace(state, family_state=replace(fs, row_param=param))
 
 
