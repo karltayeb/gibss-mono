@@ -1313,6 +1313,48 @@ def _random_intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     return m, v
 
 
+def _random_intercept_smoothed(data, state, order=15, n_iter=50, tol=1e-8):
+    """Random-intercept update -- offset smoothers (GH, Taylor, adjusted, the mixtures).
+    Gaussian VI for every row i independently: q(b0i)=N(m_i, v_i) maximizes
+    E_{b0i, o} log p(y_i | mu_i + b0i + o) - KL(q || N(0, sigma^2)) with the other factors'
+    offset o ~ N(0, ov_i) (effects + shared intercept, the variance the effect kernels
+    integrate; the random intercept's OWN v_i excluded, mean-field). b0i + o is Gaussian, so
+    the expectation is one GH average of the BASE loglik over N(mu_i + m_i, ov_i + v_i).
+    The Laplace point update would set m_i to the mode of a one-observation posterior and
+    ignore ov_i: the effects then integrate over the wrong N(m_i, v_i), a per-row error that
+    sums over rows (3 to 24 nats of log BF against cf_cavi at sigma^2 = 2 to 6, n = 500).
+    Returns (m, v), each (n,)."""
+    fs = state.family_state
+    s2 = jnp.asarray(fs.random_intercept_prior_variance)  # scalar or per-row (n,)
+    inv_s2 = 1.0 / s2
+    base = fs.response.base
+    y_o = jax.tree_util.tree_map(lambda a: jnp.asarray(a)[None, ...], _response_aux(data))
+    mu = jnp.asarray(state.total_message.mean) + fs.glm_offset + fs.intercept_value
+    ov = _offset_var(state, include_ri_var=False)
+    nodes_np, logw_np = _gh_rule(order)
+    nodes = jnp.asarray(nodes_np)[:, None]
+    wts = (jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi))[:, None]  # sum to 1
+
+    def body(s):
+        m, v, _, it = s
+        shft = (mu + m)[None, :] + jnp.sqrt(2.0 * (ov + v))[None, :] * nodes  # (order, n)
+        _, g, w = base.terms(shft, y_o)
+        g, w = jnp.sum(wts * g, 0), jnp.sum(wts * w, 0)
+        prec = jnp.maximum(w + inv_s2, 1e-8)
+        step = jnp.clip((g - inv_s2 * m) / prec, -4.0, 4.0)
+        return m + step, 1.0 / prec, jnp.max(jnp.abs(step)), it + 1
+
+    n = data.X.shape[0]
+    m0 = _ri_mean(fs)
+    m0 = jnp.zeros(n) if jnp.ndim(m0) == 0 else jnp.asarray(m0)
+    v0 = fs.random_intercept_var
+    v0 = jnp.broadcast_to(s2, (n,)) if v0 is None else jnp.asarray(v0)
+    m, v, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol), body, (m0, v0, jnp.inf, 0)
+    )
+    return m, v
+
+
 def _random_intercept_point(data, state, n_iter=50, tol=1e-8):
     """Random-intercept update -- plug-in / point (non-table modes). Per-row Laplace of
     q(b0i)=N(m_i, v_i) against the BASE likelihood at the plugged-in MEAN offset (all effects'
@@ -1348,8 +1390,10 @@ def estimate_random_intercept_step(data, state):
     """Update the per-row random intercept q(b0i)=N(m_i, v_i), then (optionally) EM-update
     sigma^2 = mean_i(m_i^2 + v_i). Runs once per sweep (before_sweep). No-op unless the random
     intercept is enabled. Routed like the shared intercept on `_cavi_mode`: the exact Q2 table
-    (Gaussian) vs the plug-in point. Dense and sparse (BCOO) both work (it never touches X);
-    only free-form Q1 (compress_selfnorm) is unsupported -- it has no offset-variance seam."""
+    (Gaussian); Gaussian VI against the Gaussian-smoothed loglik when the effect kernels
+    integrate the offset variance (offset smoothers); else the plug-in Laplace point. Dense
+    and sparse (BCOO) both work (it never touches X); only free-form Q1 (compress_selfnorm)
+    is unsupported -- it has no offset-variance seam."""
     fs = state.family_state
     if not getattr(fs, "random_intercept", False):
         return state
@@ -1363,7 +1407,13 @@ def estimate_random_intercept_step(data, state):
         )
     if mode == "q2":
         m, v = _random_intercept_gaussian(data, state, order=fs.quadrature_order)
-    else:  # plugin / q2_plugin: point offset, no offset-variance integration
+    elif (
+        mode == "plugin"
+        and isinstance(fs.response, Smoothed)
+        and not isinstance(state.total_message, MeanMessage)
+    ):  # the effect kernels integrate the offset variance: so does q(b0i)
+        m, v = _random_intercept_smoothed(data, state, order=fs.quadrature_order)
+    else:  # plain base, q2_plugin or mean-only: point offset, no offset-variance integration
         m, v = _random_intercept_point(data, state)
     s2 = fs.random_intercept_prior_variance
     if fs.estimate_random_intercept_variance:

@@ -256,3 +256,37 @@ def test_free_form_q1_elbo_unsupported():
     st = fit_glm_susie(X, y, L=2, method="logistic", random_intercept=True, max_iter=10)
     with pytest.raises(NotImplementedError, match="random intercept"):
         compute_elbo(glm.prep_data(X, y), st)
+
+
+@pytest.mark.parametrize("method", ["smoothed", "adjusted"])
+def test_smoothed_random_intercept_matches_cavi(method):
+    # the offset smoothers integrate the offset variance in the effect kernels, so q(b0i) must
+    # be the Gaussian-VI factor against the smoothed loglik too: the Laplace point update put
+    # m_i at the mode of a one-observation posterior and ignored the effects' spread, and the
+    # lead log BFs sat 17 nats from cf_cavi here. Fixed sweeps: the
+    # alpha-only stop fires before duplicates settle.
+    from dataclasses import replace
+
+    rng = np.random.default_rng(0)
+    n, p, s2 = 500, 50, 6.0
+    X = rng.standard_normal((n, p))
+    for j in (11, 12):
+        X[:, j] = X[:, 10] + 0.15 * rng.standard_normal(n)
+    eta = 0.7 * X[:, 10] + 0.6 * X[:, 30] + np.sqrt(s2) * rng.standard_normal(n)
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
+    kw = dict(L=5, max_iter=50, random_intercept=True, random_intercept_variance=s2,
+              schedule=replace(glm.default_schedule(), check_convergence=None))
+    ref = fit_glm_susie(X, y, method="cf_cavi", **kw)
+    st = fit_glm_susie(X, y, method=method, **kw)
+
+    def lbf(s):
+        lm = np.stack([np.asarray(e.feature_log_marginal) for e in s.single_effects])
+        return lm - np.asarray([float(e.null_log_marginal) for e in s.single_effects])[:, None]
+
+    alpha = np.stack([np.asarray(e.alpha) for e in ref.single_effects])
+    lead = alpha > 0.01
+    assert np.max(np.abs(lbf(st) - lbf(ref))[lead]) < 0.1
+    np.testing.assert_allclose(st.family_state.random_intercept_mean,
+                               ref.family_state.random_intercept_mean, atol=0.02)
+    np.testing.assert_allclose(st.family_state.random_intercept_var,
+                               ref.family_state.random_intercept_var, atol=0.02)
