@@ -1422,6 +1422,52 @@ class LogNormal(Smoother):
 
 
 @dataclass(frozen=True)
+class MacKay(Smoother):
+    """MacKay's moderated output as a tempered logistic: with `kappa = sqrt(1 + pi ov/8)`,
+
+        Ahat(eta)   = kappa softplus(eta / kappa),
+        Ahat'(eta)  = sigma(eta / kappa)              (MacKay 1992, eq. 2.3)
+        Ahat''(eta) = sigma'(eta / kappa) / kappa.
+
+    MacKay approximates the Gaussian average of the sigmoid, `E_o sigma(eta + o) ~
+    sigma(eta / kappa)`; the cumulant is its antiderivative, fixed by `Ahat -> 0` as
+    `eta -> -inf` like softplus. pi/8 gives the exact slope at eta = 0 as ov -> inf
+    (where the average tends to a probit). aux = (y, ov).
+
+    Row by row this is the logistic loglik itself, weighted and rescaled:
+    `y eta - Ahat = kappa [y theta - softplus(theta)]` with `theta = eta / kappa`, so the
+    surrogate is gIBSS (the plug-in offset) with each row's likelihood weight multiplied
+    by kappa and its linear predictor divided by kappa; at ov = 0 it IS gIBSS. It is the
+    anchor-free member of the tempered-shifted family `kappa A((eta + nu)/kappa)`: by
+    symmetry nu = 0, and kappa depends on ov alone, so there is no row parameter.
+
+    Closed form (one softplus and one sigmoid, no extra likelihood passes) and convex
+    at every ov (Ahat'' > 0), where Taylor's weight turns negative for ov > 4. The mean
+    error is the logistic-probit gap, bounded uniformly in ov rather than growing with it
+    (max |Ahat' - E_o sigma| = 0.005 / 0.010 / 0.013 / 0.015 at ov = 1 / 4 / 9 / 16).
+    `Ahat >= Atilde` held on every grid checked (ov <= 25), but without a proof, so
+    `certified` stays False. In the `vi` kernel the scheme receives the lumped variance
+    `x^2 v + ov`, so Gaussian VI applies MacKay's formula to the effect's uncertainty too.
+    Requires the logistic base (Bernoulli, or Binomial per trial)."""
+
+    def validate(self, base):
+        if not isinstance(base, Bernoulli):
+            raise TypeError(
+                "MacKay approximates the Gaussian average of the LOGISTIC sigmoid; "
+                f"{type(base).__name__} is not logistic -- use GH instead."
+            )
+
+    def terms(self, base, eta, aux):
+        y, ov = aux
+        y, scale = base.unpack(y)  # scale: per-row trial count (1 for Bernoulli)
+        kappa = jnp.sqrt(1.0 + (jnp.pi / 8.0) * jnp.maximum(jnp.asarray(ov), 0.0))
+        theta = eta / kappa
+        mu = jax.nn.sigmoid(theta)
+        ahat = kappa * jax.nn.softplus(theta)
+        return y * eta - scale * ahat, y - scale * mu, scale * mu * (1.0 - mu) / kappa
+
+
+@dataclass(frozen=True)
 class TaylorFixed(Smoother):
     """Quadratic working-model expansion of the (Taylor-smoothed) cumulant at a
     SUPPLIED per-row anchor zhat: aux = (y, ov, zhat), with

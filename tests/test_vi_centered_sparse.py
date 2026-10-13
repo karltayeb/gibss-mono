@@ -19,7 +19,15 @@ from jax.experimental import sparse as jsparse
 
 from gibss.methods import fit_glm_susie
 from gibss.operators import as_operator
-from gibss.response import GH, Bernoulli, JJEnvelope, ProbitMixture, Smoothed, Taylor
+from gibss.response import (
+    GH,
+    Bernoulli,
+    JJEnvelope,
+    MacKay,
+    ProbitMixture,
+    Smoothed,
+    Taylor,
+)
 from gibss.response_ser import glm_vi_center_ser, glm_vi_ser
 
 SCHEMES = {
@@ -27,6 +35,7 @@ SCHEMES = {
     "probit": ProbitMixture(5),
     "taylor": Taylor(),
     "jj_envelope": JJEnvelope(),
+    "mackay": MacKay(),
 }
 
 
@@ -83,7 +92,7 @@ def test_surrogate_rounds_match_exact_when_iterates_leave_the_first_box():
         np.testing.assert_allclose(a, b, atol=1e-7)
 
 
-@pytest.mark.parametrize("integ", ["gh", "probit_mixture"])
+@pytest.mark.parametrize("integ", ["gh", "probit_mixture", "mackay"])
 def test_full_fit_bcoo_center_matches_dense(integ):
     # through the front door: BCOO + gaussian q + a pointwise scheme now centers by default
     # (it used to fall back to uncentered, and raise on an explicit center=True) and equals

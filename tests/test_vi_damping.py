@@ -17,7 +17,7 @@ from scipy.optimize import minimize
 
 from gibss.methods import fit_glm_susie
 from gibss.operators import as_operator
-from gibss.response import GH, Bernoulli, ProbitMixture, Smoothed, Taylor
+from gibss.response import GH, Bernoulli, MacKay, ProbitMixture, Smoothed, Taylor
 from gibss.response_ser import glm_vi_center_ser, glm_vi_profile_ser, glm_vi_ser
 
 jax.config.update("jax_enable_x64", True)
@@ -44,7 +44,7 @@ def _inputs(X, y):
     return c, (jnp.asarray(y), jnp.zeros(n)), jnp.full(n, b0)
 
 
-@pytest.mark.parametrize("scheme", [GH(5), ProbitMixture(5), Taylor()])
+@pytest.mark.parametrize("scheme", [GH(5), ProbitMixture(5), Taylor(), MacKay()])
 @pytest.mark.parametrize("pv", [1.0, 100.0])
 def test_vi_kernels_converge_and_agree_at_large_prior_variance(scheme, pv):
     X, y = _separated_design()
@@ -120,16 +120,16 @@ def test_front_door_gh_gaussian_dense_matches_sparse_at_capped_prior_variance():
     eta = -2.0 + 3.0 * X[:, 5] + 2.0 * X[:, 20]
     y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
     y[:4] = 1.0
-    kw = dict(
-        L=3,
-        family="logistic",
-        center=True,
-        estimate_prior_variance=True,
-        max_prior_variance=100.0,
-        variational_family="gaussian",
-        offset_integration="gh",
-        offset_quadrature_points=5,
-    )
+    kw = {
+        "L": 3,
+        "family": "logistic",
+        "center": True,
+        "estimate_prior_variance": True,
+        "max_prior_variance": 100.0,
+        "variational_family": "gaussian",
+        "offset_integration": "gh",
+        "offset_quadrature_points": 5,
+    }
     fd = fit_glm_susie(X, y, **kw)
     fs = fit_glm_susie(BCOO.fromdense(jnp.asarray(X)), y, **kw)
     for ed, es in zip(fd.single_effects, fs.single_effects):

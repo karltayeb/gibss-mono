@@ -512,3 +512,65 @@ closed-form Gaussian VI for Poisson (the per-feature ELBO `sum_i y_i eta_i - e^{
 (x_i^2 v + ov_i)/2} - KL` is maximized exactly). It is what `"gh"` approximates on this
 family, and it supersedes `"gh"` and `"taylor2"` there. `PoissonLogNormalOffset`
 (`cf_cavi`) remains the exact fold of the other effects' mixture law.
+
+## MacKay: the closed-form temperature for logistic
+
+MacKay (1992, eq. 2.3) approximates the Gaussian average of the sigmoid by a flatter
+sigmoid, `E_{o ~ N(0, ov)} sigma(eta + o) ~ sigma(eta / kappa)` with `kappa = sqrt(1 + pi
+ov / 8)`. Bishop (PRML, section 4.5.2) derives the same constant from a slope-matched probit.
+Integrating once gives the cumulant `Ahat = kappa softplus(eta / kappa)`. `MacKay` is that
+scheme, and `offset_integration="mackay"` selects it on the logistic family (Bernoulli, or
+Binomial per trial).
+
+Row by row it is the logistic loglik itself: `y eta - Ahat = kappa [y theta -
+softplus(theta)]` with `theta = eta / kappa`. So it is gIBSS with each row's weight
+multiplied by kappa and its linear predictor divided by kappa, and gIBSS exactly at ov = 0.
+It is the anchor-free member of the tempered family `kappa A((eta + nu) / kappa)` in
+`adjusted glm surrogate.md`: symmetry forces nu = 0 and kappa depends on ov alone, so it
+needs no row parameter and runs in every kernel that takes a pointwise scheme. In the `vi`
+kernel it receives the lumped variance `x^2 v + ov`, which is MacKay's moderated output
+with the effect's own uncertainty folded in.
+
+Accuracy of the scheme against a dense reference:
+
+| ov | max mean error | max weight error | min (Ahat - Atilde) |
+|---|---|---|---|
+| 0.25 | 0.0014 | 0.0025 | 0 (roundoff) |
+| 1 | 0.0046 | 0.0052 | +9e-12 |
+| 4 | 0.0101 | 0.0059 | +1e-8 |
+| 9 | 0.0132 | 0.0050 | +2e-6 |
+| 16 | 0.0148 | 0.0041 | +4e-5 |
+| 25 | 0.0157 | 0.0034 | +4e-4 |
+
+The mean error is the logistic-probit gap, bounded uniformly in ov, and the weight stays
+positive at every ov. `Ahat >= Atilde` held on every grid, but there is no proof, so the
+scheme is not flagged `certified`.
+
+Fits, against `probit_mixture` with 8 components (6e-9 from the exact Gaussian offset).
+Each cell is max |delta log BF| / max |delta PIP| over the L = 5 effects:
+
+| design | q | gIBSS | mackay | taylor2 |
+|---|---|---|---|---|
+| strong Gaussian design, seed 1 | Q1 | 0.76 / 0.000 | 0.12 / 0.000 | 0.009 / 0.000 |
+| | Q2 | | 0.24 / 0.000 | 202 / 0.008 |
+| strong Gaussian design, seed 2 | Q1 | 65 / 0.024 | 0.22 / 0.000 | 0.60 / 0.001 |
+| | Q2 | | 0.36 / 0.000 | 144 / 0.033 |
+| rare outcome (b0 = -3), seed 1 | Q1 | 0.22 / 0.002 | 0.18 / 0.001 | 0.004 / 0.000 |
+| | Q2 | | 0.34 / 0.001 | 0.037 / 0.000 |
+| rare outcome (b0 = -3), seed 2 | Q1 | 0.45 / 0.012 | 0.30 / 0.004 | 0.013 / 0.000 |
+| | Q2 | | 0.45 / 0.005 | 0.048 / 0.000 |
+| strong binary design, seed 1 | Q1 | 0.32 / 0.000 | 0.007 / 0.000 | 0.007 / 0.000 |
+| | Q2 | | 0.041 / 0.000 | 0.015 / 0.000 |
+| strong binary design, seed 2 | Q1 | 0.58 / 0.018 | 0.028 / 0.000 | 0.21 / 0.006 |
+| | Q2 | | 0.23 / 0.009 | 0.21 / 0.006 |
+
+(n = 300 to 500, p = 50, two or three effects of size 1 to 2.5, prior variance
+estimated. `gh` with 15 nodes was within 1e-3 of the reference in every cell.)
+
+MacKay is the robust closed-form choice: it never missed by more than 0.45 nats.
+Taylor2 is more accurate when the offset variances are small, but in Q2 with strong
+effects its weight goes negative at the lumped variance and the fit misses by 100+ nats.
+MacKay's weak spot is the rare-outcome rows deep in the sigmoid tail, where the local
+temperature is far from `sqrt(1 + pi ov / 8)`; the local two-parameter fit in the adjusted
+note is the fix there. When accuracy matters more than cost, `probit_mixture` is exact to
+the table error at every variance.

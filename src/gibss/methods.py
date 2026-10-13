@@ -19,9 +19,9 @@ from __future__ import annotations
 
 from . import glm
 from .cf_offset import CharFnGaussRef, CharFnOffset, CharFnSelfNorm
-from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
+from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .response import (
     GH,
     Adjusted,
@@ -33,6 +33,7 @@ from .response import (
     JJEnvelope,
     JJFixed,
     LogNormal,
+    MacKay,
     MixtureGH,
     PGMixture,
     Poisson,
@@ -72,6 +73,11 @@ _SMOOTHERS = {
     # lognormal: the exact single-Gaussian offset for the Poisson base, E e^{eta+o} =
     # e^{eta+ov/2}; closed form and certified, so it is what "gh" approximates there.
     "lognormal": lambda cfg: LogNormal(),
+    # mackay: MacKay's moderated output for the logistic base, kappa softplus(eta/kappa)
+    # with kappa = sqrt(1 + pi ov/8) -- gIBSS with each row reweighted by kappa and its
+    # predictor divided by kappa. Closed form, no row parameter, convex at every ov; mean
+    # error <= 0.016 at any ov (the logistic-probit gap), where taylor2 grows as ov^2.
+    "mackay": lambda cfg: MacKay(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
     # adjusted gIBSS: the family's own GLM with a per-row response shift, predictor shift
     # and temperature (delta, nu, kappa), tuned each effect update so it matches the
@@ -319,7 +325,7 @@ def _resolve(cfg):
         raise ValueError(
             "variational_family='gaussian' needs an offset-integration scheme "
             "(the scheme is the variational expectation operator E_q): set "
-            "offset_integration to 'gh', 'taylor2', 'jj', 'lognormal' (single-Gaussian "
+            "offset_integration to 'gh', 'taylor2', 'mackay', 'jj', 'lognormal' (single-Gaussian "
             "offset), "
             "'cf'/'compress' (exact-mixture CAVI), or 'none' (plug-in mean)."
         )
@@ -389,6 +395,9 @@ def fit_glm_susie(
     falls with the per-entry variance x^2 v + ov (a near-separated feature at prior
     variance 100 puts its posterior variance 3-4x off); "probit_mixture" keeps its 6e-7
     at any variance and is the better choice there.
+    For the logistic family offset_integration="mackay" is MacKay's closed-form
+    moderated output, kappa softplus(eta / kappa) with kappa = sqrt(1 + pi ov / 8): no
+    quadrature, convex at every variance, mean error within 0.016 of the exact offset.
     For the Poisson family offset_integration="lognormal" is the exact single-Gaussian
     offset, e^{eta + ov/2}, closed form and certified; "gh" only approximates it.
     Axis arguments not consulted by the resolved configuration are ignored (tuning
@@ -425,16 +434,16 @@ def fit_glm_susie(
     """
     explicit = {
         k: v
-        for k, v in dict(
-            family=family,
-            intercept=intercept,
-            variational_family=variational_family,
-            offset_integration=offset_integration,
-            offset_quadrature_points=offset_quadrature_points,
-            effect_quadrature_points=effect_quadrature_points,
-            mixture_order=mixture_order,
-            background=background,
-        ).items()
+        for k, v in {
+            "family": family,
+            "intercept": intercept,
+            "variational_family": variational_family,
+            "offset_integration": offset_integration,
+            "offset_quadrature_points": offset_quadrature_points,
+            "effect_quadrature_points": effect_quadrature_points,
+            "mixture_order": mixture_order,
+            "background": background,
+        }.items()
         if v is not None
     }
     if method is not None and method not in PRESETS:
@@ -521,21 +530,21 @@ def fit_glm_susie(
         L=L_alloc,
         response=response,
         prior_variance=prior_variance,
-        family_state_kwargs=dict(
-            kernel=kernel,
-            intercept=cfg["intercept"],
-            quadrature_order=cfg["effect_quadrature_points"],
-            background=cfg["background"],
-            glm_offset=offset,
-            estimate_intercept=estimate_intercept,
-            random_intercept=random_intercept,
-            random_intercept_prior_variance=random_intercept_variance,
-            estimate_random_intercept_variance=estimate_random_intercept_variance,
-            estimate_prior_variance=estimate_prior_variance,
-            prior_variance_scale=prior_variance_scale,
-            max_prior_variance=max_prior_variance,
-            skl_tolerance=tol,
-        ),
+        family_state_kwargs={
+            "kernel": kernel,
+            "intercept": cfg["intercept"],
+            "quadrature_order": cfg["effect_quadrature_points"],
+            "background": cfg["background"],
+            "glm_offset": offset,
+            "estimate_intercept": estimate_intercept,
+            "random_intercept": random_intercept,
+            "random_intercept_prior_variance": random_intercept_variance,
+            "estimate_random_intercept_variance": estimate_random_intercept_variance,
+            "estimate_prior_variance": estimate_prior_variance,
+            "prior_variance_scale": prior_variance_scale,
+            "max_prior_variance": max_prior_variance,
+            "skl_tolerance": tol,
+        },
     )
     if initial_state is not None:
         if greedy:
@@ -554,6 +563,7 @@ def fit_glm_susie(
         # once an effect's prior variance shrinks below the threshold, drop it from
         # update_order so large-L fits stop re-fitting the null effects (ARD-pruned).
         from functools import partial
+
         from .engine import add_step, freeze_shrunk_effects_step
         sched = add_step(
             sched,
