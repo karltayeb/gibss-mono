@@ -24,6 +24,7 @@ from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
 from .response import (
     GH,
+    Adjusted,
     Bernoulli,
     Binomial,
     Compress,
@@ -72,6 +73,17 @@ _SMOOTHERS = {
     # e^{eta+ov/2}; closed form and certified, so it is what "gh" approximates there.
     "lognormal": lambda cfg: LogNormal(),
     "taylor_fixed": lambda cfg: TaylorFixed(anchor=cfg["_anchor"]),
+    # adjusted gIBSS: the family's own GLM with a per-row response shift, predictor shift
+    # and temperature (delta, nu, kappa), tuned each effect update so it matches the
+    # offset-smoothed loglik at the current predictor in value, score, curvature and third
+    # derivative. The targets are GH averages on `offset_quadrature_points` nodes.
+    # `_adjusted_rule` picks where the parameters are matched (see Adjusted.rule).
+    # Non-quadratic, so it runs in the free-form quad kernel.
+    "adjusted": lambda cfg: Adjusted(
+        order=cfg["offset_quadrature_points"],
+        target=cfg["_adjusted_target"],
+        rule=cfg["_adjusted_rule"],
+    ),
     "jj": lambda cfg: JJEnvelope(),
     "jj_fixed": lambda cfg: JJFixed(),
     # fixed normal scale mixtures of the logistic law (Bernoulli/Binomial only): the
@@ -103,6 +115,8 @@ _DEFAULTS = {
     # preset-only knobs (no public argument; reachable via method=)
     "_anchor": "update",  # taylor_fixed expansion anchor: "update" | "null"
     "_mean_message": False,  # working-model mode: drop the message variance
+    "_adjusted_target": "gh",  # adjusted targets E_o A^(k)(z + o): "gh" | "taylor"
+    "_adjusted_rule": "one_point",  # adjusted matching rule: "one_point" | "two_point" | "null"
 }
 
 # Named methods = partial configs over the same axes; user kwargs override.
@@ -121,6 +135,14 @@ PRESETS = {
     # offset integration; the effect b is Gaussian-VI-integrated (glm_vi_gh_ser, plain base).
     "gibss_gaussian": {"variational_family": "gaussian", "offset_integration": "none"},
     "globaljj": {"offset_integration": "jj_fixed"},
+    "adjusted": {"offset_integration": "adjusted"},
+    # the same (delta, nu, kappa) rule fed the Taylor-expanded targets A^(k) + ov/2 A^(k+2):
+    # like-for-like with offset_integration="taylor2" (closed form, no quadrature)
+    "adjusted_taylor": {"offset_integration": "adjusted", "_adjusted_target": "taylor"},
+    # the other matching rules: score at the null end s plus score and curvature at the
+    # mode end z ("two_point"), or all four conditions at s ("null")
+    "adjusted_two_point": {"offset_integration": "adjusted", "_adjusted_rule": "two_point"},
+    "adjusted_null": {"offset_integration": "adjusted", "_adjusted_rule": "null"},
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
         "offset_integration": "taylor_fixed",
