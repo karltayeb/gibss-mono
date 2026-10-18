@@ -1083,10 +1083,10 @@ def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     if isinstance(response.smoother, CharFnSpectral):
         if has_icpt and W.shape[1] == 1:
             return _intercept_spectral(data, state, total_mean)
-        if response.smoother.offset_law == "gaussian":
+        if response.smoother.offset_law != "mixture":
             raise ValueError(
-                "the Gaussian-offset spectral mode does not support fixed covariates yet; "
-                "use method='cf_cavi_spectral' (exact offset law)."
+                f"the offset_law={response.smoother.offset_law!r} spectral mode does not "
+                "support fixed covariates yet; use method='cf_cavi_spectral' (exact offset law)."
             )
     aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
     nodes_np, logw_np = _gh_rule(order)

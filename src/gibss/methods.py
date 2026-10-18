@@ -125,6 +125,12 @@ _SMOOTHERS = {
         M=cfg["compress_degree"], offset_law="gaussian",
         reference=cfg["spectral_reference"], mixture_order=cfg["mixture_order"],
     ),
+    # spectral_point: the same kernel with the plug-in offset law (phi = 1): gIBSS-Q2 with
+    # the collapsed Newton and no CF build.
+    "spectral_point": lambda cfg: CharFnSpectral(
+        M=cfg["compress_degree"], offset_law="point",
+        reference=cfg["spectral_reference"], mixture_order=cfg["mixture_order"],
+    ),
 }
 
 _DEFAULTS = {
@@ -185,6 +191,11 @@ PRESETS = {
     "spectral_gaussian_offset": {
         "variational_family": "gaussian",
         "offset_integration": "spectral_gaussian",
+    },
+    # and the plug-in counterpart (gIBSS-Q2 in the spectral form): offset law = its mean.
+    "spectral_point_offset": {
+        "variational_family": "gaussian",
+        "offset_integration": "spectral_point",
     },
     # exact free-form CAVI in Q1 through the CF product over the node laws (the CF
     # replacement for offset_integration="compress_selfnorm").
@@ -303,7 +314,7 @@ def _resolve(cfg):
                     f"(the probit mixture tables); got family={fam!r}."
                 )
             return Smoothed(base, _SMOOTHERS["cf_gaussref"](cfg)), "vi_gh"
-        elif integ in ("cf_spectral", "spectral_gaussian"):
+        elif integ in ("cf_spectral", "spectral_gaussian", "spectral_point"):
             # CAVI in Q2 by the collapsed spectral effect update (CharFnSpectral); the
             # intercept keeps the inherited CF table, so it rides the same vi_gh seam.
             if vfam != "gaussian":

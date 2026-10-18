@@ -1206,14 +1206,19 @@ class CharFnSpectral(CharFnOffset):
     (`glm._spectral_solve`), on the dyadic grid ladder. Logistic / Binomial base only;
     shared or null intercept.
 
-    `offset_law="gaussian"` replaces each row's offset law by its moment-matched Gaussian
-    `N(0, V_i)` (same mean, same mixture variance), so `phi_i = exp(-t^2 V_i / 2)`: the
-    Gaussian-offset approximation to the same Q2 update, with no per-effect CF factors.
-    Everything else is shared, so the two laws differ only in `phi`. Fixed covariates are
-    not supported in this mode."""
+    `offset_law` is the law of the other effects' offset the Fourier sum integrates, the
+    three Q2 methods of the paper in one kernel, differing only in `phi`:
+      "mixture"   the exact Gaussian-mixture law (CAVI in Q2): the CF product of the
+                  per-effect factors;
+      "gaussian"  its moment-matched Gaussian `N(0, V_i)`, `phi_i = exp(-t^2 V_i / 2)`
+                  (the Gaussian-offset approximation, gIBSS-GO), no per-effect factors;
+      "point"     the point mass at the offset mean, `phi_i = 1` (the plug-in, gIBSS-Q2):
+                  no factors, no offset variance at all, the intercept's included, which
+                  is what the plain-base Gaussian-VI kernel (`gibss_gaussian`) computes.
+    Fixed covariates are not supported under the two approximate laws."""
 
     max_refits: int = 6
-    offset_law: str = "mixture"  # "mixture" (exact CAVI in Q2) | "gaussian"
+    offset_law: str = "mixture"  # "mixture" (exact CAVI in Q2) | "gaussian" | "point"
     reference: str = "null"  # "null" | "plugin" | "gaussian"
     mixture_order: int = 8  # probit-mixture order of the gaussian reference's cumulant
     alias_tol: float = 1e-8
@@ -1229,9 +1234,9 @@ class CharFnSpectral(CharFnOffset):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.offset_law not in ("mixture", "gaussian"):
+        if self.offset_law not in ("mixture", "gaussian", "point"):
             raise ValueError(
-                f"CharFnSpectral: offset_law must be 'mixture' or 'gaussian'; got "
+                f"CharFnSpectral: offset_law must be 'mixture', 'gaussian' or 'point'; got "
                 f"{self.offset_law!r}."
             )
         if self.dense_kernel not in ("chebyshev", "exact"):
@@ -1280,7 +1285,9 @@ class CharFnSpectral(CharFnOffset):
         sparse = isinstance(X, jsparse.BCOO)
         op = BCOOOperator(X) if sparse else None
         c_arr = None if colmean is None else jnp.asarray(colmean)
-        for (alpha, mu, var), slot in zip(effects, keys):
+        if self.offset_law == "point":
+            V0 = jnp.zeros(n)  # no offset variance under the plug-in, the intercept's included
+        for (alpha, mu, var), slot in zip(effects if self.offset_law != "point" else [], keys):
             refs = (jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var))
             if sparse:
                 mom = lambda r=refs: _sparse_effect_moments(op, *r, c_arr)  # noqa: E731
@@ -1297,6 +1304,10 @@ class CharFnSpectral(CharFnOffset):
         if self.offset_law == "gaussian":
             phi = jnp.exp(-0.5 * V0[:, None] * tau[None, :] ** 2).astype(jnp.complex128)
             return SpectralAux(y, phi, V0, tau, wq, psi)
+        if self.offset_law == "point":
+            # the plug-in: every offset (the effects' AND the intercept's) at its mean
+            zero = jnp.zeros(n)
+            return SpectralAux(y, jnp.ones((n, tau.shape[0]), jnp.complex128), zero, tau, wq, psi)
         if sparse:
             phi, _, V = offset_cf_sparse(
                 X, effects, tau, n=n, offset_var=offset_var, colmean=colmean,
