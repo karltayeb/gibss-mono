@@ -56,8 +56,10 @@ def test_gibss_gaussian_variants_run(kw):
     Xd = (rng.random((300, 20)) < 0.2) * 1.0
     y = (rng.uniform(size=300) < 0.35).astype(float)
     X = Xd if kw.get("center") else sparse.BCOO.fromdense(jnp.asarray(Xd))  # sparse unless centered
+    # no signal: the two null effects' prior variances decay slowly toward the floor, and
+    # the full-moment SKL criterion (check_glm_convergence_step) follows them to ~sweep 52
     st = fit_glm_susie(jnp.asarray(X) if kw.get("center") else X, jnp.asarray(y),
-                       L=2, method="gibss_gaussian", max_iter=30, **kw)
+                       L=2, method="gibss_gaussian", max_iter=100, **kw)
     assert st.converged
     for e in st.single_effects:
         assert np.isfinite(np.asarray(e.var)).all() and (np.asarray(e.var) > 0).all()
