@@ -657,25 +657,22 @@ def test_point_offset_law_is_gibss_q2():
     """offset_law="point" (preset spectral_point_offset) is gIBSS-Q2 in the spectral form:
     every component, the intercept included, enters the others at its mean only, and the
     fixed point is the plain-base Gaussian-VI kernel's (`gibss_gaussian`, GH over b, here
-    at 51 nodes so its quadrature is not the limit), with no CF build. The two fit the
-    intercept's own factor q(b0) differently: `gibss_gaussian` takes the plug-in route's
-    MAP Newton with a Laplace covariance (`glm._intercept_point`), the spectral kernel the
-    Gaussian-VI update (stationarity `m0 / tau = E_q l'`, not `l'(m0) = 0`), an O(v0)
-    difference in m0 (~0.01 here) that moves every log BF by ~0.05. So the exact
-    comparison fixes the intercept and the estimated-intercept one is loose."""
+    at 51 nodes so its quadrature is not the limit), with no CF build. Both fit the
+    intercept's own factor q(b0) by the Gaussian-VI update (the Q2 update of the b0
+    component), so the estimated-intercept fits agree too."""
     rng = np.random.default_rng(5)
     B, y = _sparse_logit(rng, 400, 40)
     X = jsparse.BCOO.fromdense(jnp.asarray(B))
     flm = lambda st: np.stack([np.asarray(e.feature_log_marginal) for e in st.single_effects])  # noqa: E731
-    kw = {"L": 3, "max_iter": 60, "tol": 1e-7, "center": True, "estimate_intercept": False}
-    ref = fit_glm_susie(X, y, method="gibss_gaussian", effect_quadrature_points=51, **kw)
-    spec = fit_glm_susie(X, y, method="spectral_point_offset", **kw)
-    np.testing.assert_allclose(flm(spec), flm(ref), atol=1e-6)
-    np.testing.assert_allclose(np.asarray(spec.pip), np.asarray(ref.pip), atol=1e-7)
-    kw["estimate_intercept"] = True
-    ref = fit_glm_susie(X, y, method="gibss_gaussian", effect_quadrature_points=51, **kw)
-    spec = fit_glm_susie(X, y, method="spectral_point_offset", **kw)
-    assert abs(float(spec.family_state.intercept_value) - float(ref.family_state.intercept_value)) < 0.02
-    np.testing.assert_allclose(np.asarray(spec.pip), np.asarray(ref.pip), atol=0.02)
+    for estimate in (False, True):
+        kw = {"L": 3, "max_iter": 60, "tol": 1e-7, "center": True, "estimate_intercept": estimate}
+        ref = fit_glm_susie(X, y, method="gibss_gaussian", effect_quadrature_points=51, **kw)
+        spec = fit_glm_susie(X, y, method="spectral_point_offset", **kw)
+        np.testing.assert_allclose(flm(spec), flm(ref), atol=1e-6)
+        np.testing.assert_allclose(np.asarray(spec.pip), np.asarray(ref.pip), atol=1e-7)
+        np.testing.assert_allclose(
+            float(spec.family_state.intercept_value), float(ref.family_state.intercept_value),
+            atol=1e-7,
+        )
     with pytest.raises(ValueError, match="offset_law"):
         CharFnSpectral(offset_law="plugin")

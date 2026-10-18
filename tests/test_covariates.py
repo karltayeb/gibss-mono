@@ -179,8 +179,14 @@ def test_q2_elbo_ascends_and_beats_plugin():
     ]
     assert all(np.isfinite(elbos))
     assert all(b >= a - 1e-6 for a, b in zip(elbos, elbos[1:])), elbos
-    plug = fit_glm_susie(X, y, L=2, method="gibss_gaussian", max_iter=30, covariates=Z)
-    assert elbos[-1] >= compute_elbo(data, plug) - 1e-6
+    # at matched sweep counts (early stopping off: the alpha criterion halts ~sweep 9
+    # while the ELBO still climbs) the exact fit's ELBO is above the plug-in's; the
+    # margin is small (~3e-4 nats here) because the plug-in's q(b0, gamma) is the same
+    # Gaussian-VI factor and only its effect updates drop the offset variance
+    kw = {"L": 2, "max_iter": 30, "tol": 0.0, "covariates": Z}
+    cavi = fit_glm_susie(X, y, method="cf_cavi", **kw)
+    plug = fit_glm_susie(X, y, method="gibss_gaussian", **kw)
+    assert compute_elbo(data, cavi) >= compute_elbo(data, plug) - 1e-6
 
 
 def test_covariate_spread_flows_into_offset_variance_and_elbo():

@@ -1369,10 +1369,19 @@ class CharFnSpectral(CharFnOffset):
                 return cd
         return design
 
-    def grid_ok(self, err, v) -> bool:
+    def grid_ok(self, err, v, aux=None, base=Bernoulli()) -> bool:
         """Does the solved update's measured aliasing (`glm_spectral_ser`'s `err`) meet
-        `alias_tol`?"""
-        return bool(_within(jnp.asarray(err), jnp.sqrt(jnp.asarray(v)), self.alias_tol))
+        `alias_tol`? With `aux`, the tolerance is floored at the roundoff of the rung
+        difference itself: the sums run over `ntau` nodes of `sum_i s_i`-sized row weights,
+        so two rungs differ by `~ eps sum_i s_i ntau` even with no aliasing at all, and a
+        tolerance below that would climb the ladder forever (`alias_tol=1e-13` at n = 5000
+        reached ntau = 8193 with a 3e-9 difference)."""
+        tol = self.alias_tol
+        if aux is not None:
+            n, ntau = aux.phi.shape
+            ns = float(jnp.sum(_unpack(base, aux.y, n)[1]))
+            tol = max(tol, 8.0 * 2.2e-16 * (1.0 + ns) * ntau)
+        return bool(_within(jnp.asarray(err), jnp.sqrt(jnp.asarray(v)), tol))
 
     def mark_reach(self, offset, design, m, v, V):
         """Record the effect-shift part of a solved update's reach in the fit's high-water

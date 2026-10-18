@@ -1080,7 +1080,7 @@ def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     # offset mean s: effects' mean + glm_offset + the random intercept mean (m_i rides in eta);
     # the factor's own mean W m is added inside the solve.
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
-    if isinstance(response.smoother, CharFnSpectral):
+    if isinstance(getattr(response, "smoother", None), CharFnSpectral):
         if has_icpt and W.shape[1] == 1:
             return _intercept_spectral(data, state, total_mean)
         if response.smoother.offset_law != "mixture":
@@ -1088,7 +1088,12 @@ def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
                 f"the offset_law={response.smoother.offset_law!r} spectral mode does not "
                 "support fixed covariates yet; use method='cf_cavi_spectral' (exact offset law)."
             )
-    aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
+    if isinstance(response, Smoothed):
+        aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
+    else:
+        # plug-in Q2 (a plain base, gibss_gaussian): the effects enter at their means,
+        # already in total_mean; the factor q(b0) is still integrated by GH over b0
+        aux = _response_aux(data)
     nodes_np, logw_np = _gh_rule(order)
     nodes = jnp.asarray(nodes_np)
     wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
@@ -1208,8 +1213,9 @@ def _cavi_mode(fs):
     truth routed on by both `estimate_intercept_step` and `update_effect_index_step`.
       'q2'       -- Gaussian q, exact CAVI in Q2 (vi_gh + CharFnOffset/Compress table).
       'q2_plugin'-- Gaussian q, PLUG-IN Q2 (vi_gh on a plain base): the offset is the
-                    other effects' MEAN (no table), so the effect aux is plain y and the
-                    intercept is the plain point strategy -- same routing as 'plugin'.
+                    other effects' MEAN (no table), so the effect aux is plain y; the
+                    intercept is the Gaussian-VI factor q(b0) (its Q2 update), whose MEAN
+                    is what the effects see.
       'q1'       -- free-form q, exact CAVI in Q1 (offset_integration='compress_selfnorm').
       'plugin'   -- everything else (gh / taylor / jj / none): classic point intercept
                     and the aggregate-message offset."""
@@ -1242,7 +1248,9 @@ def _estimate_shared_intercept(data, state):
         return dict(intercept_value=m0, intercept_var=v0, intercept_kl=kl,
                     intercept_b_nodes=b0n, intercept_log_node_weight=lw0)
     # Gaussian q(b0, gamma) = N(m, V) over W = [1 | Z]: closed-form KL against N(0, tau I).
-    fit = _intercept_gaussian if mode == "q2" else _intercept_point
+    # Inference in Q2 (exact or plug-in) owes the b0 component its Q2 update, the
+    # Gaussian-VI factor; the point/Laplace strategy is for the non-variational routes.
+    fit = _intercept_gaussian if mode in ("q2", "q2_plugin") else _intercept_point
     m, V = fit(data, state)
     return _nuisance_fields(data, fs, m, V)
 
@@ -1743,7 +1751,7 @@ def _spectral_solve(data, state, keys, offset, design, law, prior_variance, offs
             kd = nxt
         m, v, elbo_rel, kl, err = out
         sm.mark_reach(offset, design, m, v, aux.V)
-        if sm.grid_ok(err, v):
+        if sm.grid_ok(err, v, aux, base):
             return aux, (m, v, elbo_rel, kl)
         law, init = (m, v), (m, v)
         ntau = 2 * (aux.tau.shape[0] - 1) + 1  # the next rung
