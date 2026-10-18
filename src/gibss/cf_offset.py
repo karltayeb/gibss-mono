@@ -358,7 +358,7 @@ def _effect_factor_dense(x, alpha, mu, var, tau, binary):
     return _effect_cf((x, alpha, mu, var), tau)
 
 
-def offset_cf(effects, tau, n=None, offset_var=0.0, keys=None, cache=None):
+def offset_cf(effects, tau, n=None, offset_var=0.0, keys=None, cache=None, factor=None):
     """Zero-mean offset characteristic function, eq. (2): the PRODUCT of the per-effect
     factors, centered by the total offset mean `s`. Returns `(phi, s, V)` with
     `phi` `(n, ntau)` complex (centered), and `s, V` `(n,)`.
@@ -372,7 +372,10 @@ def offset_cf(effects, tau, n=None, offset_var=0.0, keys=None, cache=None):
     `offset_var` (scalar or `(n,)`) adds one extra HOMOGENEOUS zero-mean Gaussian
     `N(0, offset_var)` to the offset -- e.g. the shared intercept's posterior variance
     `q(b0) = N(m0, v0)` on the all-ones column (its mean m0 lives in eta). A zero-mean
-    Gaussian has CF `exp(-1/2 t^2 offset_var)`, so it just scales `phi` and adds to `V`."""
+    Gaussian has CF `exp(-1/2 t^2 offset_var)`, so it just scales `phi` and adds to `V`.
+
+    `factor(x, alpha, mu, var, tau)` replaces the per-effect factor builder on a non-0/1
+    design (the spectral smoother's Chebyshev collapse over the features)."""
     tau = jnp.asarray(tau)
     if n is None:
         if not effects:
@@ -390,7 +393,10 @@ def offset_cf(effects, tau, n=None, offset_var=0.0, keys=None, cache=None):
         eff = (x, alpha, mu, var)
         binary = cache.is_binary(x) if cache is not None else _is_binary_design(x)
         mom = lambda e=eff: effect_moments(e)  # noqa: E731
-        fac = lambda e=eff: _effect_factor_dense(*e, tau, binary)  # noqa: E731
+        if factor is not None and not binary:
+            fac = lambda e=eff: factor(*e, tau)  # noqa: E731
+        else:
+            fac = lambda e=eff, b=binary: _effect_factor_dense(*e, tau, b)  # noqa: E731
         if cache is None:
             mean, v = mom()
             f = fac()

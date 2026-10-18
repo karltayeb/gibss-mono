@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from . import glm
 from .cf_offset import CharFnGaussRef, CharFnOffset, CharFnSelfNorm
+from .cf_spectral import CharFnSpectral
 from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
 from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
@@ -110,6 +111,14 @@ _SMOOTHERS = {
     "cf_gaussref": lambda cfg: CharFnGaussRef(
         M=cfg["compress_degree"], order=cfg["mixture_order"]
     ),
+    # cf_spectral: the same CAVI in Q2 with the effect b folded into the CF, so the effect
+    # update is one Fourier sum per column (logistic only; sparse X must be 0/1).
+    "cf_spectral": lambda cfg: CharFnSpectral(M=cfg["compress_degree"]),
+    # spectral_gaussian: the same spectral Q2 update with each row's offset law replaced by
+    # its moment-matched Gaussian N(0, V_i) (no per-effect CF factors).
+    "spectral_gaussian": lambda cfg: CharFnSpectral(
+        M=cfg["compress_degree"], offset_law="gaussian"
+    ),
 }
 
 _DEFAULTS = {
@@ -145,6 +154,15 @@ PRESETS = {
         "variational_family": "gaussian",
         "offset_integration": "cf_gaussref",
         "mixture_order": 8,
+    },
+    # the same CAVI-in-Q2 fixed point by the spectral effect update: no Chebyshev table,
+    # no GH over b. On a two-level (0/1, possibly centered) design each Newton step costs
+    # O(p ntau) independent of n; on any other dense design, O(n p ntau) per entry.
+    "cf_cavi_spectral": {"variational_family": "gaussian", "offset_integration": "cf_spectral"},
+    # its Gaussian-offset counterpart: identical kernel and grid, offset law N(0, V_i).
+    "spectral_gaussian_offset": {
+        "variational_family": "gaussian",
+        "offset_integration": "spectral_gaussian",
     },
     # exact free-form CAVI in Q1 through the CF product over the node laws (the CF
     # replacement for offset_integration="compress_selfnorm").
@@ -263,6 +281,25 @@ def _resolve(cfg):
                     f"(the probit mixture tables); got family={fam!r}."
                 )
             return Smoothed(base, _SMOOTHERS["cf_gaussref"](cfg)), "vi_gh"
+        elif integ in ("cf_spectral", "spectral_gaussian"):
+            # CAVI in Q2 by the collapsed spectral effect update (CharFnSpectral); the
+            # intercept keeps the inherited CF table, so it rides the same vi_gh seam.
+            if vfam != "gaussian":
+                raise ValueError(
+                    f"offset_integration={integ!r} is a Q2 update; it needs "
+                    "variational_family='gaussian'."
+                )
+            if not isinstance(base, Bernoulli):
+                raise ValueError(
+                    f"offset_integration={integ!r} needs the logistic family (the "
+                    f"logistic Fourier kernel); got family={fam!r}."
+                )
+            if cfg["intercept"] == "profiled":
+                raise ValueError(
+                    f"offset_integration={integ!r} supports intercept='shared' or "
+                    "'null', not 'profiled'."
+                )
+            return Smoothed(base, _SMOOTHERS[integ](cfg)), "vi_gh"
         elif integ == "compress":
             # CAVI in Q2 (gaussian): the Compress peel as the offset-integrated-cumulant
             # builder, interchangeable with "cf" behind the same table seam; GH over b.

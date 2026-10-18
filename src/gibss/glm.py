@@ -35,6 +35,12 @@ from .engine import (
 )
 from ._numerics import _gh_rule
 from .cf_offset import CharFnOffset, CharFnSelfNorm
+from .cf_spectral import (
+    CharFnSpectral,
+    TwoLevelDesign,
+    glm_spectral_ser,
+    spectral_null_loglik,
+)
 from .poisson_offset import (
     PoissonLogNormalOffset,
     PoissonSelfNormOffset,
@@ -1071,10 +1077,18 @@ def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     W, has_icpt = _nuisance_design(data, fs)
     inv_tau = 1.0 / fs.intercept_prior_variance  # diffuse Gaussian prior N(0, tau I)
     response = fs.response
-    aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
     # offset mean s: effects' mean + glm_offset + the random intercept mean (m_i rides in eta);
     # the factor's own mean W m is added inside the solve.
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
+    if isinstance(response.smoother, CharFnSpectral):
+        if has_icpt and W.shape[1] == 1:
+            return _intercept_spectral(data, state, total_mean)
+        if response.smoother.offset_law == "gaussian":
+            raise ValueError(
+                "the Gaussian-offset spectral mode does not support fixed covariates yet; "
+                "use method='cf_cavi_spectral' (exact offset law)."
+            )
+    aux = _intercept_offset_aux(data, state)  # table over ALL effects (obar=0)
     nodes_np, logw_np = _gh_rule(order)
     nodes = jnp.asarray(nodes_np)
     wts = jnp.exp(jnp.asarray(logw_np)) / jnp.sqrt(jnp.pi)  # GH weights, sum to 1
@@ -1694,6 +1708,93 @@ def _selfnorm_effect_aux(data, state, l):
     )
 
 
+def _spectral_solve(data, state, keys, offset, design, law, prior_variance, offset_var,
+                    init=None):
+    """One `glm_spectral_ser` solve against the effects in `keys` (their Gaussian mixtures
+    folded into the CF, plus the homogeneous `offset_var`), on a grid sized for `law`, and
+    refit on a wider grid while the solved `(m, v)` outruns it (the Fourier sum aliases
+    once its period no longer clears `|eta| + |xt m|`). On a dense design the kernel runs
+    on the Chebyshev-in-x collapse when `dense_kernel="chebyshev"`. Returns `(aux, (m, v,
+    elbo_rel, kl))`."""
+    fs = state.family_state
+    sm, base = fs.response.smoother, fs.response.base
+    others = [
+        (state.single_effects[j].alpha, state.single_effects[j].mu,
+         state.single_effects[j].var)
+        for j in keys
+    ]
+    cbar = getattr(data, "column_center", None)
+    for _ in range(sm.max_refits):
+        aux = sm.build_spectral_aux(
+            base, _response_aux(data), data.X, others, offset, design, law,
+            offset_var=offset_var, colmean=cbar, keys=keys,
+        )
+        # a dense design's Chebyshev collapse is sized for `law` and re-checked at the
+        # solved (m, v): a larger N (or the exact kernel) re-solves on the same aux
+        kd = sm.kernel_design(design, aux, base, law)
+        while True:  # N only grows and the exact kernel is a fixed point: terminates
+            out = glm_spectral_ser(kd, aux, offset, prior_variance, base, init=init)
+            nxt = sm.kernel_design(design, aux, base, (out[0], out[1]), floor=kd)
+            if nxt is kd:
+                break
+            kd = nxt
+        if sm.grid_ok(aux, offset, design, out[0], out[1]):
+            return aux, out
+        law = (out[0], out[1])
+    raise RuntimeError(
+        f"cf_spectral: the frequency grid still aliases after {sm.max_refits} refits."
+    )
+
+
+def _fit_effect_spectral(data, state, l, offset, prior_variance):
+    """CAVI-in-Q2 effect update by the collapsed spectral kernel (`CharFnSpectral`). The
+    offset mean rides in `offset`; the shared and random intercepts' variances fold into
+    the CF."""
+    fs = state.family_state
+    if fs.intercept == "profiled":
+        raise ValueError(
+            "offset_integration='cf_spectral' supports intercept='shared' or 'null' "
+            "(the profiled intercept re-fits b0 per feature, which breaks the collapse)."
+        )
+    design = fs.response.smoother.design(data.X, getattr(data, "column_center", None))
+    keys = [j for j in range(len(state.single_effects)) if j != l]
+    e = state.single_effects[l]
+    offset = jnp.asarray(offset)
+    # warm start at the effect's last posterior (a fresh effect has var = 0: cold start
+    # at (0, prior_variance)); the solve is a monotone ascent, so the start only sets the
+    # path, and on a dense design each Newton step is a full pass over X.
+    mu0, var0 = jnp.asarray(e.mu), jnp.asarray(e.var)
+    warm = jnp.isfinite(mu0) & jnp.isfinite(var0) & (var0 > 0)
+    init = (jnp.where(warm, mu0, 0.0), jnp.where(warm, var0, prior_variance))
+    # size the grid for where the solve ends, not for a cold start's v = prior_variance:
+    # the pad absorbs the transient iterates' wider spread, the guard catches the end
+    # point, and the ntau ratchet would otherwise keep a first-sweep grid all fit long.
+    law = (init[0], jnp.where(warm, var0, 0.0))
+    aux, (mu, var, log_bf, kl) = _spectral_solve(
+        data, state, keys, offset, design, law, prior_variance,
+        _intercept_ov(state) + _ri_var(state), init=init,
+    )
+    null = float(spectral_null_loglik(aux, offset, fs.response.base))
+    return build_ser_state(mu, var, log_bf, kl, prior_variance, null_log_marginal=null)
+
+
+def _intercept_spectral(data, state, total_mean):
+    """The shared intercept q(b0) = N(m0, v0) by the spectral kernel: b0 is a column of
+    ones, so the collapse is the plain row total. Its offset is every effect (plus the
+    random intercept's variance); warm-started at the current factor."""
+    fs = state.family_state
+    n = jnp.shape(jnp.asarray(data.y))[0]
+    design = TwoLevelDesign(jnp.ones((n, 1)), jnp.ones(1), jnp.ones(1))
+    m0 = jnp.asarray(fs.intercept_value, dtype=jnp.float64).reshape(1)
+    nv = jnp.asarray(_nuisance_var(fs), dtype=jnp.float64).reshape(-1)[:1]
+    v0 = jnp.where(nv > 0, nv, 1.0)
+    _, (m, v, _, _) = _spectral_solve(
+        data, state, list(range(len(state.single_effects))), jnp.asarray(total_mean),
+        design, (m0, v0), fs.intercept_prior_variance, _ri_var(state), init=(m0, v0),
+    )
+    return m, v.reshape(1, 1)
+
+
 def update_effect_index_step(data, l, state):
     effect = state.single_effects[l]
     fs = state.family_state
@@ -1708,6 +1809,9 @@ def update_effect_index_step(data, l, state):
     # `_cavi_mode` the intercept step routes on selects the offset aux here.
     offset = _effect_offset(fs, state)
     mode = _cavi_mode(fs)
+    if mode == "q2" and isinstance(fs.response.smoother, CharFnSpectral):
+        new_effect = _fit_effect_spectral(data, state, l, offset, effect.prior_variance)
+        return replace_effect_in_gibss_state(state, l, new_effect)
     if mode == "q2":
         aux = _offset_table_aux(data, state, l)
     elif mode == "q1":
