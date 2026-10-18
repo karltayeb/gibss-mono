@@ -108,11 +108,13 @@ def test_q1_snapshots_keep_nodes_and_resume(make_logistic_data):
     assert e.b_nodes is not None and e.log_node_weight is not None
     assert isinstance(e.b_nodes, np.ndarray)
 
-    # resume from the first completed sweep -> same pip as a full run
+    # resume from the first completed sweep for the remaining 29 -> same pip as a full
+    # 30-sweep run (the sweep budgets must match: a null effect keeps drifting below the
+    # convergence tolerance, so an extra sweep moves its pip at the 1e-4 level)
     data = prep_data(X, y, center=True)
     mid = hist.by_phase("sweep")[0].state
     resume_init = replace(mid, converged=False, update_order=())
-    resumed = fit_ibss(data, resume_init, default_schedule(), max_iter=30)
+    resumed = fit_ibss(data, resume_init, default_schedule(), max_iter=29)
     full = fit_glm_susie(X, y, L=3, max_iter=30)
     np.testing.assert_allclose(np.asarray(resumed.pip), np.asarray(full.pip), atol=1e-4)
 
