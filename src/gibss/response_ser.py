@@ -223,6 +223,56 @@ def _joint_newton_step(m, v, G, W, S3, S4, inv_pv, max_step: float = 4.0):
     return m + dm, 1.0 / lam_new, resid
 
 
+def _monotone_newton(evaluate, m0, v0, inv_pv, n_iter, tol, noise):
+    """Joint (m, 1/v) Newton (`_joint_newton_step`) with a per-column backtracking line
+    search in (m, log v) on the ELBO, for the Gaussian-VI kernels.
+
+    `evaluate(m, v) -> (f, G, W, S3, S4)`: the per-column ELBO (any per-column constant
+    dropped) and the score, Price weight and Stein sums the Newton step reads. A proposal
+    is accepted only where it does not lower `f` (within `noise`, the roundoff floor of
+    the row sums), else its step is halved; the accepted candidate's sums feed the next
+    proposal, so a converging solve costs one evaluation per iteration as before. Without
+    the line search the Newton map 2-cycles on a (near-)separated column at large prior
+    variance: the curvature collapses as |m| grows, v jumps toward the prior variance, the
+    curvature recovers, and the iterates never settle (the cycle loses O(1) nats per
+    step, far above the floor). Returns `(m, v)`."""
+    m0 = jnp.asarray(m0)
+    v0 = jnp.asarray(v0)
+
+    def body(state):
+        m, v, f, G, W, S3, S4, _, it = state
+        m_n, v_n, _ = _joint_newton_step(m, v, G, W, S3, S4, inv_pv)
+        dm, dlv = m_n - m, jnp.log(v_n) - jnp.log(v)
+
+        def shrink(ls):
+            a, done, acc, k = ls
+            mc, vc = m + a * dm, v * jnp.exp(a * dlv)
+            cand = evaluate(mc, vc)
+            fc = cand[0]
+            take = (~done) & jnp.isfinite(fc) & (fc >= f - noise * (1.0 + jnp.abs(f)))
+            new = tuple(jnp.where(take, c, o) for c, o in zip((mc, vc) + tuple(cand), acc))
+            return jnp.where(take | done, a, 0.5 * a), done | take, new, k + 1
+
+        one = jnp.ones_like(m)
+        _, _, (m_new, v_new, f_new, G_new, W_new, S3_new, S4_new), _ = jax.lax.while_loop(
+            lambda ls: (ls[3] < 30) & ~jnp.all(ls[1]),
+            shrink,
+            (one, jnp.zeros_like(m, dtype=bool), (m, v, f, G, W, S3, S4), 0),
+        )
+        resid = jnp.maximum(
+            jnp.max(jnp.abs(m_new - m)), jnp.max(jnp.abs(jnp.log(v_new) - jnp.log(v)))
+        )
+        return m_new, v_new, f_new, G_new, W_new, S3_new, S4_new, resid, it + 1
+
+    f0, G0, W0, S30, S40 = evaluate(m0, v0)
+    m, v, *_ = jax.lax.while_loop(
+        lambda st: (st[8] < n_iter) & (st[7] > tol),
+        body,
+        (m0, v0, f0, G0, W0, S30, S40, jnp.inf, 0),
+    )
+    return m, v
+
+
 def _background(response, offset, aux, c, mode: str = "exact", degree: int = 40):
     """All-rows sums (W, G, L) of (weight, grad, loglik) at eta = offset + c, per c_j.
 
@@ -1323,9 +1373,15 @@ def glm_vi_gh_ser(
         Ell, Eg, Ew, T3, T4 = acc
         return Ell, Eg, jnp.maximum(Ew, 0.0), T3, T4
 
-    def body(state):
-        m, v, _, it = state
-        _, g, w, T3, T4 = node_terms(m, v)
+    # the b = 0 baseline of the ELBO: ve = 0, so no GH is needed (the offset is already in
+    # the table -> terms at offset)
+    ll0 = response.terms(off_e, aux_e)[0]
+    L0 = op.local_moment(0, ll0)
+
+    def evaluate(m, v):
+        # the per-column ELBO (GH-averaged ll minus the b = 0 baseline, minus the KL) and
+        # the sums the joint Newton reads, from one node pass
+        ll, g, w, T3, T4 = node_terms(m, v)
         vb = op.broadcast_cols(v)
         G = op.local_moment(1, g)
         Wm = op.local_moment(2, w)
@@ -1333,22 +1389,18 @@ def glm_vi_gh_ser(
         # and the odd Stein sum carries sign(x); the even one does not.
         S3 = op.local_moment(2, jnp.sign(x) * jnp.sqrt(2.0 / vb) * T3)  # sum_i x^3 E[A''']
         S4 = op.local_moment(2, T4 / vb)  # sum_i x^4 E[A'''']
-        m_new, v_new, resid = _joint_newton_step(m, v, G, Wm, S3, S4, inv_pv)
-        return m_new, v_new, resid, it + 1
+        kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+        return op.local_moment(0, ll) - L0 - kl, G, Wm, S3, S4
 
-    m, v, _, _ = jax.lax.while_loop(
-        lambda s: (s[3] < n_iter) & (s[2] > tol),
-        body,
-        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    noise = 1e-12 * (1.0 + offset.shape[0])  # roundoff floor of the row sums
+    m, v = _monotone_newton(
+        evaluate, jnp.zeros(op.p), jnp.full(op.p, prior_variance), inv_pv, n_iter, tol, noise
     )
     ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
     m = jnp.where(ok, m, 0.0)
     v = jnp.where(ok, v, prior_variance)
 
-    # ELBO - baseline: E_q[ll] is the GH-averaged ll at (m, v); baseline is b = 0, where
-    # ve = 0 so no GH is needed (the offset is already in the table -> terms at offset).
     ll = node_terms(m, v)[0]
-    ll0 = response.terms(off_e, aux_e)[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
     # A feature that failed to converge (reset to the null m=0) carries no evidence -> 0,
     # never the large-negative ELBO evaluated at the reset point.
@@ -1422,26 +1474,25 @@ def glm_vi_gh_center_ser(
         Ell, Esc, Ecv, T3, T4 = acc
         return Ell, Esc, jnp.maximum(Ecv, 0.0), T3, T4
 
-    def body(state):
-        m, v, _, it = state
-        _, score, curv, T3, T4 = node_terms(m, v)
+    ll0 = sc_at(jnp.zeros(op.p))[0]  # the b = 0 null, per feature
+
+    def evaluate(m, v):
+        # the per-feature ELBO (GH-averaged centered loglik minus the null, minus the KL)
+        # and the sums the joint Newton reads, from one node pass
+        ll, score, curv, T3, T4 = node_terms(m, v)
         S3 = jnp.sqrt(2.0 / v) * T3  # sum_i (x-c)^3 E[A''']
         S4 = T4 / v  # sum_i (x-c)^4 E[A'''']
-        m_new, v_new, resid = _joint_newton_step(m, v, score, curv, S3, S4, inv_pv)
-        return m_new, v_new, resid, it + 1
+        kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
+        return (ll - ll0) - kl, score, curv, S3, S4
 
-    m, v, _, _ = jax.lax.while_loop(
-        lambda s: (s[3] < n_iter) & (s[2] > tol),
-        body,
-        (jnp.zeros(op.p), jnp.full(op.p, prior_variance), jnp.inf, 0),
+    noise = 1e-12 * (1.0 + offset.shape[0])  # roundoff floor of the row sums
+    m, v = _monotone_newton(
+        evaluate, jnp.zeros(op.p), jnp.full(op.p, prior_variance), inv_pv, n_iter, tol, noise
     )
     ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
     m = jnp.where(ok, m, 0.0)
     v = jnp.where(ok, v, prior_variance)
-    # ELBO - baseline: GH-averaged centered loglik at (m, v) minus the b=0 null (already
-    # per-feature summed inside `sc_at`), minus the KL.
     ll = node_terms(m, v)[0]
-    ll0 = sc_at(jnp.zeros(op.p))[0]
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
     return m, v, (ll - ll0) - kl, kl
 

@@ -1,63 +1,87 @@
-r"""Spectral CAVI-in-Q2 effect update: collapsed on two-level designs, per-entry on dense.
+r"""Spectral CAVI-in-Q2 effect update: Newton in (m, s) on a fixed-grid Fourier surrogate.
 
 `CharFnOffset` + `glm_vi_gh_ser` reach the Q2 CAVI update in three discretizations: the
-CF quadrature in t builds a Chebyshev table of the offset-integrated cumulant in z, and
-a GH rule integrates the effect `b ~ N(m, v)` against that table inside every Newton
+CF quadrature in t builds a Chebyshev table of the offset-integrated cumulant in z, and a
+GH rule integrates the effect `b ~ N(m, s^2)` against that table inside every Newton
 step. This module drops the last two. The effect's own law is Gaussian, so it enters the
-characteristic function in closed form, and the whole expectation is one Fourier sum.
+characteristic function in closed form; the whole expectation is one Fourier sum on a
+fixed frequency grid, and that trapezoid sum IS the objective: a fixed smooth surrogate
+of the Q2 ELBO whose (m, s)-gradient and Hessian are the same sums with the integrand
+multiplied by powers of `i t`. Newton with a backtracking line search converges to the
+surrogate's exact stationary point. (A GH rule's nodes move with (m, s), so its error
+is iterate-dependent noise that a Newton near the optimum has to chase.)
 
 The identity
 ------------
-For laws P, Q of a shift with characteristic functions phi_P, phi_Q and a cumulant whose
-second derivative has Fourier transform `psi` (logistic: `psi(t) = pi t / sinh(pi t)`),
+For laws P, Q of a shift with characteristic functions phi_P, phi_Q and a cumulant A
+whose second derivative has Fourier transform `psi` (logistic: `psi(t) = pi t / sinh(pi
+t)`; the probit mixture: `psihat(t) = sum_k pi_k e^{-t^2 / 2 s_k^2}`),
 
     E_P A(z + X) - E_Q A(z + Y)
         = -(1/pi) INT_0^inf psi(t) Re[(phi_P - phi_Q)(t) e^{itz}] / t^2 dt + (mu_P - mu_Q)/2.
 
-`A''` fixes `A` only up to an affine term; the logistic tail slopes are 0 and 1, so the
-term is the mean difference times 1/2. The half-line integrand stays bounded at t = 0
-even when the means differ: it tends to `-(s_P^2 - s_Q^2)/2 - (mu_P - mu_Q) z`, with
-`s^2` the second moments.
+`A''` fixes `A` only up to an affine term; the tail slopes are 0 and 1, so the term is
+the mean difference times 1/2. The half-line integrand stays bounded at t = 0 even when
+the means differ: it tends to `-(s_P^2 - s_Q^2)/2 - (mu_P - mu_Q) z`, `s^2` the second
+moments.
 
-The SER takes Q = the null (b = 0): the other effects' offset `o'_i` with CF `phi_i`
-(mean carried in `eta_i`), and P = `o'_i + xt_ij b`, with CF `phi_i h_ij`,
+The SER update of effect j on a column with design value `u_ij` takes P = `o'_i + u_ij
+b`: the other effects' offset (CF `phi_i`, mean carried in `eta_i`) plus the effect,
+`phi_P = phi_i h_ij`, `h_ij(t) = exp(i t u_ij m_j - t^2 u_ij^2 s_j^2 / 2)`.
 
-    h_ij(t) = exp(i t xt_ij m_j - t^2 xt_ij^2 v_j / 2).
+References
+----------
+Q is a REFERENCE law whose cumulant expectation is cheap; the Fourier sum carries only
+the residual `phi_P - phi_Q`. The reference is the module's one free choice
+(`Reference`):
 
-So `phi_P - phi_Q = phi_i (h_ij - 1)`, and the evidence against the null is a single CF
-difference; `A(eta_i)` never appears.
+  null      Q = o' (b = 0). phi_Q = phi_i, and E_Q A is the null the log BF is measured
+            against, so it never has to be evaluated: the Fourier sum IS the evidence.
+            Residual `phi_i (h_ij - 1)`, of size O(|u m|).
+  plugin    Q = the point mass at the effect's plug-in shift. E_Q A = A(eta_i + a_ij m),
+            closed form; residual `phi_i h_ij - e^{i t a_ij m}`, of size O((V_i + u^2
+            s^2) A''/2), the gIBSS plug-in error.
+  gaussian  Q = N(a_ij m, V_i + b_ij s^2) under the probit-mixture cumulant, whose
+            Gaussian expectation is closed form (`response.ProbitMixture`). Residual
+            `(phi_i - gamma_i) h_ij`, the offset's non-Gaussian part only, and the
+            kernel's Gaussian tail shortens `Tmax`.
+
+Each reference is anchored at a per-column level `ell_j`: `a_ij = u_ij - ell_j`, `b_ij =
+u_ij^2 - ell_j^2`. On a two-level design `ell = lo`, so off the support set (`u = lo`)
+the reference is the offset at rest and its cumulant a constant that cancels in the
+null-relative objective: the closed-form reference sum runs over the support set only,
+O(nnz) per Newton evaluation. On a dense design `ell = 0`.
+
+A smaller residual tolerates a coarser grid, since the aliasing error scales with the
+residual profile's size. That is the point of a non-null reference: the grid ladder
+below measures the aliasing, and the reference decides how far down the ladder a fit
+sits. All three references share one kernel and one fixed point.
 
 Collapse over rows
 ------------------
 On a two-level design each column takes the value `hi_j` on its support set `B_j` and
 `lo_j` elsewhere (0/1: hi = 1, lo = 0; centered 0/1: hi = 1 - c_j, lo = -c_j). `h_ij`
-then depends on the row only through membership in `B_j`, and the row sum factors:
+and the reference factor depend on the row only through membership in `B_j`, so
 
-    sum_i s_i phi_i(t) e^{i t eta_i} (h_ij - 1)
-        = (h1_j - 1) S1_j(t) + (h0_j - 1) S0_j(t),
-    S1_j = sum_{i in B_j} s_i phi_i e^{i t eta_i},   S0_j = (sum_i ...) - S1_j,
+    sum_i [W_ik h_ij - Z_ik q_ij] = sum_{levels u} [h_j(u) S_uj(t_k) - q_j(u) Z_uj(t_k)],
+    W_ik = s_i phi_i(t_k) e^{i t_k eta_i},   Z_ik = s_i zeta_i(t_k) e^{i t_k eta_i},
 
-with `s_i` the Binomial trial count (1 for Bernoulli). `S1 = B^T [s phi e^{i t eta}]` is
-one (Sp)MM per effect update; each Newton step on `(m, v)` is then `O(p ntau)`, with no
-`n` in it. The m- and v-derivatives multiply the integrand by `i t u` and `-t^2 u^2 / 2`.
+`zeta` the reference's own row factor (phi, 1 or gamma), `S, Z` the group sums over `B_j`
+and its complement from ONE `M^T B` (Sp)MM per effect update. Each Newton step on `(m,
+s)` is then O(p ntau), with no `n` in it. A dense continuous design collapses the same
+way after interpolating `h` in x at Chebyshev nodes of each column's range
+(`ChebDesign`), or runs per entry (`DenseDesign`, O(n p ntau) per step).
 
-General dense designs
----------------------
-A continuous column takes a different value in every row, so nothing collapses: the
-kernel evaluates `h_ij(t_k)` per entry, `O(n p ntau)` per Newton step (`DenseDesign`).
-`h` comes from a recurrence on the uniform grid, `h_{k+1} = h_k r g^{2k+1}` with
-`r = e^{i dt x m}`, `g = e^{-dt^2 x^2 v / 2}`, so a step costs one complex multiply per
-entry, not an exponential. The loop runs over column blocks and, inside each, over `k`,
-so peak memory is one `(n, block)` slab. The line search evaluates every channel at its
-candidates and the next Newton step reuses the accepted one, so a dense update pays one
-pass over `X` per iteration.
-
-The only discretization left is the trapezoid in t. Its error is aliasing: the sum
-periodizes the z-profile with period `2 pi / dt`. The profile does not decay (it tends
-to `+-(mu_P - mu_Q)/2`), so the period must clear the farthest row by a margin,
-`2 pi / dt >= max_i |eta_i| + max |xt m| + kappa sqrt(V + xt^2 v) + pad` (`spectral_ntau`).
-`m` is not known until the Newton solve ends, so the engine checks the grid against the
-solved `(m, v)` and refits on a larger grid if it fell short (`grid_ok`).
+The grid ladder
+---------------
+The only discretization is the trapezoid in t, and its error is aliasing: the sum
+periodizes the residual's z-profile with period `2 pi / dt`, so the period must clear
+the farthest row, `max_i |eta_i| + max |u m| + kappa sd`. Grids live on the dyadic
+ladder `ntau = 2^k + 1` on `[0, Tmax]`, so every grid contains the one below: dropping
+every other node is a free second estimate of the same sums, and the difference at the
+solved `(m, s)` measures the coarser grid's aliasing (`grid_error`). The engine starts
+at the reach heuristic, solves, and climbs one rung while the measured error exceeds
+`alias_tol`.
 """
 
 from __future__ import annotations
@@ -70,26 +94,29 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 from jax.experimental import sparse as jsparse
+from jax.ops import segment_sum
 
+from ._numerics import _ndtr
 from .cf_offset import (
     CharFnOffset,
-    _bucket_size,
     _effect_cf,
     _frequency_grid,
+    _mixture_tail_Tmax,
     _psi_tail_Tmax,
+    _reference_grid,
     _sparse_effect_moments,
     effect_moments,
     offset_cf,
     offset_cf_sparse,
 )
 from .operators import BCOOOperator
-from .response import Bernoulli
-from .response_ser import _joint_newton_step
+from .response import _PROBIT_MIXTURES, Bernoulli
 
 __all__ = [
     "CharFnSpectral",
     "ChebDesign",
     "DenseDesign",
+    "Reference",
     "SpectralAux",
     "TwoLevelDesign",
     "cheb_design",
@@ -98,17 +125,97 @@ __all__ = [
     "cheb_factor_tail",
     "dense_design",
     "glm_spectral_ser",
+    "grid_error",
+    "ladder_ntau",
+    "ones_design",
     "spectral_ntau",
     "spectral_null_loglik",
     "two_level_design",
 ]
 
 
+# ----------------------------------------------------------------------------------------
+# references
+# ----------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Reference:
+    """The reference law Q of the Fourier residual (module docstring, "References").
+    `kind` is "null", "plugin" or "gaussian"; `order` is the probit-mixture order the
+    gaussian reference's cumulant uses (ignored otherwise). Hashable, so it is a static
+    argument of the jitted kernels."""
+
+    kind: str = "null"
+    order: int = 8
+
+    def __post_init__(self):
+        if self.kind not in ("null", "plugin", "gaussian"):
+            raise ValueError(
+                f"Reference: kind must be 'null', 'plugin' or 'gaussian'; got {self.kind!r}."
+            )
+        if self.kind == "gaussian" and self.order not in _PROBIT_MIXTURES:
+            raise ValueError(
+                f"Reference: no probit mixture of order {self.order}; have "
+                f"{sorted(_PROBIT_MIXTURES)}."
+            )
+
+    @property
+    def logistic(self) -> bool:
+        """Does the kernel run under the logistic cumulant (else the probit mixture)?"""
+        return self.kind != "gaussian"
+
+    def tail_Tmax(self, tol: float) -> float:
+        """Frequency cutoff of the kernel: the logistic `psi` tail, or the mixture's."""
+        if self.logistic:
+            return _psi_tail_Tmax(tol)
+        return _mixture_tail_Tmax(self.order, tol)
+
+    def grid(self, Tmax: float, ntau: int):
+        """`(tau, wq, kernel)` on `[0, Tmax]`."""
+        if self.logistic:
+            return _frequency_grid(Tmax, ntau)
+        return _reference_grid(self.order, Tmax, ntau)
+
+    def pad(self, tol: float) -> float:
+        """Margin the grid's period must clear beyond the reach (`spectral_ntau`): an
+        image of the residual profile at distance d contributes ~ amplitude x e^{-d}. The
+        null residual does not decay (its profile tends to +-(u m)/2), hence the extra
+        margin; the plug-in and Gaussian residuals are localized and smaller."""
+        base = math.log(1.0 / tol)
+        return base + 10.0 if self.kind == "null" else base
+
+
+def _factor_ab(ref: Reference, u, ell):
+    """`(a, b)` of the reference CF factor `q = exp(i t a m - t^2 b s^2 / 2)` at design
+    level `u`, anchored at `ell` (module docstring)."""
+    if ref.kind == "null":
+        return jnp.zeros_like(u), jnp.zeros_like(u)
+    if ref.kind == "plugin":
+        return u - ell, jnp.zeros_like(u)
+    return u - ell, u * u - ell * ell
+
+
+def _zeta(ref: Reference, aux):
+    """The reference's row factor `zeta_i(t)` (n, ntau), or None when it is `phi` itself
+    (the null reference, whose `Z` sums are the `S` sums)."""
+    if ref.kind == "null":
+        return None
+    if ref.kind == "plugin":
+        return jnp.ones_like(aux.phi)
+    return jnp.exp(-0.5 * aux.V[:, None] * aux.tau[None, :] ** 2).astype(aux.phi.dtype)
+
+
+# ----------------------------------------------------------------------------------------
+# aux, designs
+# ----------------------------------------------------------------------------------------
+
+
 class SpectralAux(NamedTuple):
     """Per-update data for `glm_spectral_ser`: the observation leaf `y` (`y`, or `(y,
     n_trials)`), the zero-mean offset CF `phi` (n, ntau) of the OTHER effects (and any
     homogeneous Gaussian offset), its per-row variance `V` (n,), and the frequency grid
-    `(tau, wq, psi)`."""
+    `(tau, wq, psi)` (`psi` the kernel: logistic, or the probit mixture's)."""
 
     y: Any
     phi: Any
@@ -119,11 +226,15 @@ class SpectralAux(NamedTuple):
 
 
 class TwoLevelDesign(NamedTuple):
-    """`x_ij = lo_j + (hi_j - lo_j) B_ij` with `B` 0/1 (dense or BCOO, (n, p))."""
+    """`x_ij = lo_j + (hi_j - lo_j) B_ij` with `B` 0/1 (dense or BCOO, (n, p)); `rows,
+    cols` index the support set (the nonzeros of `B`), for the reference's closed-form
+    sums."""
 
     B: Any
     lo: Any
     hi: Any
+    rows: Any
+    cols: Any
 
 
 def two_level_design(X, colmean=None):
@@ -138,14 +249,23 @@ def two_level_design(X, colmean=None):
             return None
         p = X.shape[1]
         c = jnp.zeros(p) if colmean is None else jnp.asarray(colmean)
-        return TwoLevelDesign(X, -c, 1.0 - c)
+        return TwoLevelDesign(X, -c, 1.0 - c, X.indices[:, 0], X.indices[:, 1])
     X = jnp.asarray(X)
     lo = jnp.min(X, axis=0)
     hi = jnp.max(X, axis=0)
     if not bool(jnp.all((X == lo[None, :]) | (X == hi[None, :]))):
         return None
-    B = ((X == hi[None, :]) & (hi > lo)[None, :]).astype(X.dtype)
-    return TwoLevelDesign(B, lo, hi)
+    mask = (X == hi[None, :]) & (hi > lo)[None, :]
+    rows, cols = jnp.nonzero(mask)
+    return TwoLevelDesign(mask.astype(X.dtype), lo, hi, rows, cols)
+
+
+def ones_design(n: int):
+    """The intercept's design: one column of ones (`lo = 0, hi = 1`, every row in the
+    support set), so the collapse is the plain row total."""
+    return TwoLevelDesign(
+        jnp.ones((n, 1)), jnp.zeros(1), jnp.ones(1), jnp.arange(n), jnp.zeros(n, dtype=int)
+    )
 
 
 class DenseDesign(NamedTuple):
@@ -215,6 +335,15 @@ def _umax(design):
     return jnp.maximum(jnp.abs(design.lo), jnp.abs(design.hi))
 
 
+def _dense_of(design):
+    return design.dense if isinstance(design, ChebDesign) else design
+
+
+# ----------------------------------------------------------------------------------------
+# grid sizing
+# ----------------------------------------------------------------------------------------
+
+
 def _reach(offset, design, m, v, V, kappa):
     """Half-width of the z-range the Fourier sum must represent without aliasing: the
     farthest row `|eta|`, plus the largest effect shift `|xt m|`, plus `kappa` sd of the
@@ -225,22 +354,33 @@ def _reach(offset, design, m, v, V, kappa):
     return float(jnp.max(jnp.abs(offset))) + shift + kappa * math.sqrt(max(spread, 0.0))
 
 
-def spectral_ntau(reach, Tmax, tol, safety=1.3, min_ntau=32, max_ntau=1 << 14):
+def spectral_ntau(reach, Tmax, pad, safety=1.3, max_ntau=1 << 14):
     """Smallest trapezoid grid on `[0, Tmax]` whose period `2 pi (ntau - 1) / Tmax` covers
-    `safety * reach + pad`, `pad = log(1/tol) + 10` (an image of the non-decaying profile
-    at distance d contributes ~ e^{-d})."""
-    period = safety * reach + math.log(1.0 / tol) + 10.0
+    `safety * reach + pad` (`pad` from `Reference.pad`)."""
+    period = safety * reach + pad
     ntau = math.ceil(period * Tmax / (2.0 * math.pi)) + 1
     if ntau > max_ntau:
         raise ValueError(
             f"cf_spectral: required ntau={ntau} exceeds max_ntau={max_ntau} (reach "
             f"{reach:.1f}); the linear predictor or an effect is too large for the grid."
         )
-    return max(ntau, min_ntau)
+    return ntau
+
+
+def ladder_ntau(ntau: int, min_ntau: int = 33) -> int:
+    """The rung `2^k + 1 >= ntau` of the dyadic grid ladder (every rung's nodes contain
+    the rung below's, so `grid_error` can drop every other node)."""
+    need = max(int(ntau), int(min_ntau)) - 1
+    return (1 << max(0, (need - 1).bit_length())) + 1
 
 
 def _period(tau):
     return 2.0 * math.pi / float(tau[1] - tau[0])
+
+
+# ----------------------------------------------------------------------------------------
+# the Fourier sums
+# ----------------------------------------------------------------------------------------
 
 
 def _unpack(base, y, n):
@@ -262,6 +402,61 @@ def _weights(tau, wq, psi):
     )
 
 
+def _channels(a, b, s, t, re, im, cv, c1, c2, axis):
+    """The six (m, s)-channels `(val, d_m, d_s, d_mm, d_ms, d_ss)` of a Fourier sum
+    `sum_k w_k psi_k Re[F S] / t_k^2` for a factor `F = exp(i t a m - t^2 b s^2 / 2)`:
+    each m-derivative multiplies the integrand by `i t a`, each s-derivative by `-t^2 b
+    s` (plus the product rule), so every channel is the same `(re, im) = (Re, Im)[F S]`
+    under a different real weight. `axis` is the axis reduced (the grid, or the rows)."""
+    return jnp.stack(
+        [
+            jnp.sum(cv * re, axis=axis),
+            jnp.sum(c1 * (-a * im), axis=axis),
+            jnp.sum(c2 * (-b * s * re), axis=axis),
+            jnp.sum(c2 * (-a * a * re), axis=axis),
+            jnp.sum(c2 * (t * a * b * s * im), axis=axis),
+            jnp.sum(c2 * ((-b + t * t * b * b * s * s) * re), axis=axis),
+        ]
+    )
+
+
+def _edge(ref: Reference, M0, M1, M2, E0, E1, V0, ell, m, s):
+    """The t = 0 node's analytic limit `lim` and the affine term `aff` of the Fourier
+    identity, in the six channels, from the weighted design moments over the rows they
+    cover: `M_k = sum s_i u^k`, `E_k = sum s_i u^k eta_i`, `V0 = sum s_i V_i`.
+
+    With `Dmu = mu_P - mu_Q` and `Ds2 = s_P^2 - s_Q^2` per row (module docstring), the
+    limit is `sum_i s_i [-Ds2_i/2 - Dmu_i eta_i]` and the affine term `sum_i s_i Dmu_i /
+    2`. Per reference, `Dmu = (u - a) m` and `Ds2 = (V - V_zeta) + (u^2 - a^2) m^2 + (u^2
+    - b) s^2`, which reduce to the moment combinations below."""
+    if ref.kind == "null":  # a = b = 0, V_zeta = V
+        dmu_eta, dmu, dq_m, dq_s, dV = E1, M1, M2, M2, 0.0
+    elif ref.kind == "plugin":  # a = u - ell, b = 0, V_zeta = 0
+        dmu_eta, dmu = ell * E0, ell * M0
+        dq_m, dq_s, dV = 2.0 * ell * M1 - ell**2 * M0, M2, V0
+    else:  # a = u - ell, b = u^2 - ell^2, V_zeta = V
+        dmu_eta, dmu = ell * E0, ell * M0
+        dq_m, dq_s, dV = 2.0 * ell * M1 - ell**2 * M0, ell**2 * M0, 0.0
+    zero = jnp.zeros_like(m)
+    lim = jnp.stack(
+        [
+            -0.5 * (dV + m * m * dq_m + s * s * dq_s) - m * dmu_eta,
+            -m * dq_m - dmu_eta,
+            -s * dq_s,
+            -dq_m + zero,
+            zero,
+            -dq_s + zero,
+        ]
+    )
+    aff = jnp.stack([0.5 * m * dmu, 0.5 * dmu + zero, zero, zero, zero, zero])
+    return lim, aff
+
+
+def _finish(trap, lim, aff, wq0):
+    """Assemble `-(1/pi) [trapezoid + t=0 node] + affine`."""
+    return -(trap + wq0 * lim) / jnp.pi + aff
+
+
 def _row_weights(aux, offset, base):
     """`W_ik = s_i phi_i(t_k) e^{i t_k eta_i}` (n, ntau), with `y` and `s`."""
     n = aux.phi.shape[0]
@@ -269,69 +464,246 @@ def _row_weights(aux, offset, base):
     return s[:, None] * aux.phi * jnp.exp(1j * aux.tau[None, :] * offset[:, None]), y, s
 
 
-def _collapse(design, aux, offset, base):
-    """The two levels `u = (hi, lo)` with their group sums `S` (2, p, ntau) (the support
-    group and the rest) and the moment sums the t = 0 limit and the affine term need, all
-    from ONE `M^T B` product."""
+def _ref_weights(ref, aux, offset, s):
+    """`Z_ik = s_i zeta_i(t_k) e^{i t_k eta_i}` (n, ntau), or None for the null reference."""
+    zeta = _zeta(ref, aux)
+    if zeta is None:
+        return None
+    return s[:, None] * zeta * jnp.exp(1j * aux.tau[None, :] * offset[:, None])
+
+
+# --- closed-form reference sums --------------------------------------------------------
+
+
+class SupportClosed(NamedTuple):
+    """The reference's closed-form sum over a two-level design's support set: entry
+    `(rows[e], cols[e])` has row weight `sw`, offset `eta`, offset variance `V`, and the
+    column's anchored `a = hi - lo`, `b = hi^2 - lo^2`."""
+
+    cols: Any
+    sw: Any
+    eta: Any
+    V: Any
+    a: Any
+    b: Any
+
+
+class EntryClosed(NamedTuple):
+    """The reference's closed-form sum over every entry of a dense design (`a = x`, `b =
+    x^2`; anchored at 0)."""
+
+    Xb: Any
+    sw: Any
+    eta: Any
+    V: Any
+
+
+def _closed_prepare(ref, design, aux, offset, s):
+    if ref.kind == "null":
+        return None
+    if isinstance(design, TwoLevelDesign):
+        r, c = design.rows, design.cols
+        return SupportClosed(
+            c, s[r], offset[r], aux.V[r], design.hi - design.lo,
+            design.hi**2 - design.lo**2,
+        )
+    d = _dense_of(design)
+    return EntryClosed(d.Xb, s, offset, aux.V)
+
+
+def _plugin_channels(z, a, sw):
+    """`sum sw A(z)` with `z = eta + a m` under the logistic cumulant: the value and its
+    m-derivatives; no s-dependence."""
+    sig = jax.nn.sigmoid(z)
+    zero = jnp.zeros_like(z)
+    return jnp.stack(
+        [sw * jax.nn.softplus(z), sw * a * sig, zero, sw * a * a * sig * (1.0 - sig),
+         zero, zero]
+    )
+
+
+def _gauss_channels(order, z, w, a, b, s, sw):
+    """`sum sw E_{N(z, w)} A_K` with `z = eta + a m`, `w = V + b s^2`, `A_K` the order-K
+    probit mixture, and its (m, s)-derivatives: with `G_k = d^k/dz^k E_{N(z, w)} A_K`
+    (closed form, `response.ProbitMixture.integrated_terms`) and `dG/dw = G_2 / 2`,
+
+        d_m = a G_1,  d_s = b s G_2,  d_mm = a^2 G_2,  d_ms = a b s G_3,
+        d_ss = b G_2 + b^2 s^2 G_4."""
+    sk, pik, _ = _PROBIT_MIXTURES[order]
+    lead = (-1,) + (1,) * jnp.ndim(z)
+    sk = jnp.asarray(sk).reshape(lead)
+    pik = jnp.asarray(pik).reshape(lead)
+    r = jnp.sqrt(1.0 + sk**2 * w[None, ...])
+    zh = sk * z[None, ...] / r
+    q = sk / r
+    cdf = _ndtr(zh)
+    pdf = jnp.exp(-0.5 * zh * zh) / jnp.sqrt(2.0 * jnp.pi)
+    G0 = jnp.sum(pik * (zh * cdf + pdf) / q, 0)
+    G1 = jnp.sum(pik * cdf, 0)
+    G2 = jnp.sum(pik * q * pdf, 0)
+    G3 = -jnp.sum(pik * q**2 * zh * pdf, 0)
+    G4 = jnp.sum(pik * q**3 * (zh * zh - 1.0) * pdf, 0)
+    return jnp.stack(
+        [sw * G0, sw * a * G1, sw * b * s * G2, sw * a * a * G2, sw * a * b * s * G3,
+         sw * (b * G2 + b * b * s * s * G4)]
+    )
+
+
+def _closed_terms(ref, closed, m, s):
+    """The reference's closed-form `sum_i s_i E_Q A` per column, six channels (6, p);
+    zeros for the null reference."""
+    p = m.shape[0]
+    if closed is None:
+        return jnp.zeros((6, p))
+    if isinstance(closed, SupportClosed):
+        c = closed.cols
+        a, b = closed.a[c], closed.b[c]
+        z = closed.eta + a * m[c]
+        if ref.kind == "plugin":
+            ch = _plugin_channels(z, a, closed.sw)
+        else:
+            ch = _gauss_channels(ref.order, z, closed.V + b * s[c] ** 2, a, b, s[c], closed.sw)
+        return segment_sum(ch.T, c, num_segments=p).T
+    nb, _, pb = closed.Xb.shape
+    pad = nb * pb - p
+    mb = jnp.pad(m, (0, pad)).reshape(nb, pb)
+    sb = jnp.pad(s, (0, pad)).reshape(nb, pb)
+
+    def block(args):
+        x, mj, sj = args
+        z = closed.eta[:, None] + x * mj[None, :]
+        sw = closed.sw[:, None]
+        if ref.kind == "plugin":
+            ch = _plugin_channels(z, x, sw)
+        else:
+            w = closed.V[:, None] + x * x * sj[None, :] ** 2
+            ch = _gauss_channels(ref.order, z, w, x, x * x, sj[None, :], sw)
+        return jnp.sum(ch, axis=1)  # (6, pb)
+
+    out = jax.lax.map(block, (closed.Xb, mb, sb))  # (nb, 6, pb)
+    return out.transpose(1, 0, 2).reshape(6, nb * pb)[:, :p]
+
+
+# --- the per-update data of the kernel --------------------------------------------------
+
+
+class LevelPre(NamedTuple):
+    """A collapsed design's per-update data: K levels `u` (K, p) with their group sums
+    `S`, `Z` (K, p, ntau) of the row weights `W`, `Z` and the weighted moments `ng, eg,
+    vg = sum s, sum s eta, sum s V` over each group (K, p); the anchor `ell` (p,); the
+    reference's closed-form data."""
+
+    u: Any
+    S: Any
+    Z: Any
+    ng: Any
+    eg: Any
+    vg: Any
+    ell: Any
+    closed: Any
+
+
+class EntryPre(NamedTuple):
+    """A dense design's per-entry data: the row weights transposed for the scan over the
+    grid, `WT` (ntau, n) and `ZT` (ntau, n) or None, the column-free `sum_i Re W_ik`, the
+    moments `(M0, E0, V0)` (scalars) and `(M1, M2, E1)` (p,), the closed-form data."""
+
+    WT: Any
+    ZT: Any
+    sum_re: Any
+    mom: Any
+    closed: Any
+
+
+def _collapse(ref, design, aux, offset, base):
+    """Two-level collapse: the group sums over the support set and its complement from ONE
+    `M^T B` product, `M = [Re W, Im W, (Re Z, Im Z), s, s eta, s V, y]`."""
     ntau = aux.phi.shape[1]
-    Wk, y, s = _row_weights(aux, offset, base)
-    M = jnp.concatenate(
-        [jnp.real(Wk), jnp.imag(Wk), jnp.stack([s, s * offset, y], axis=1)], axis=1
-    )  # (n, 2 ntau + 3)
-    R = M.T @ design.B  # (2 ntau + 3, p); dense @ BCOO keeps the u @ X form
+    W, y, s = _row_weights(aux, offset, base)
+    Z = _ref_weights(ref, aux, offset, s)
+    cols = [jnp.real(W), jnp.imag(W)]
+    if Z is not None:
+        cols += [jnp.real(Z), jnp.imag(Z)]
+    cols.append(jnp.stack([s, s * offset, s * aux.V, y], axis=1))
+    M = jnp.concatenate(cols, axis=1)
+    R = M.T @ design.B  # (c, p); dense @ BCOO keeps the u @ X form
     tot = jnp.sum(M, axis=0)
     S1 = (R[:ntau] + 1j * R[ntau : 2 * ntau]).T
     S_all = (tot[:ntau] + 1j * tot[ntau : 2 * ntau])[None, :]
-    n1, e1, y1 = R[2 * ntau], R[2 * ntau + 1], R[2 * ntau + 2]
-    n0, e0, y0 = tot[2 * ntau] - n1, tot[2 * ntau + 1] - e1, tot[2 * ntau + 2] - y1
+    off = 2 * ntau
+    S = jnp.stack([S1, S_all - S1])
+    if Z is not None:
+        Z1 = (R[off : off + ntau] + 1j * R[off + ntau : off + 2 * ntau]).T
+        Z_all = (tot[off : off + ntau] + 1j * tot[off + ntau : off + 2 * ntau])[None, :]
+        Zs = jnp.stack([Z1, Z_all - Z1])
+        off += 2 * ntau
+    else:
+        Zs = S
+    n1, e1, v1, y1 = R[off], R[off + 1], R[off + 2], R[off + 3]
+    n0, e0, v0, y0 = (tot[off + k] - R[off + k] for k in range(4))
     hi, lo = design.hi, design.lo
     ytil = hi * y1 + lo * y0  # sum_i y_i xt_ij
-    mom = (hi**2 * n1 + lo**2 * n0, hi * e1 + lo * e0, hi * n1 + lo * n0)
-    return (jnp.stack([hi, lo]), jnp.stack([S1, S_all - S1])) + mom, ytil
-
-
-def _dense_prepare(design, aux, offset, base):
-    """Per-update data of the per-entry kernel: the row weights `s phi e^{i t eta}`
-    (transposed to (ntau, n) for the scan over k), their column-free real sum, and the
-    moment sums `sum s x^2`, `sum s x eta`, `sum s x`."""
-    Wk, y, s = _row_weights(aux, offset, base)
-    mom, ytil = _dense_moments(design, y, s, offset)
-    return (Wk.T, jnp.sum(jnp.real(Wk), axis=0)) + mom, ytil
-
-
-def _dense_moments(design, y, s, offset):
-    """`(sum s x^2, sum s x eta, sum s x)` and `ytil = sum y x` per column, exactly."""
-    p = design.lo.shape[0]
-    Xb = design.Xb
-
-    def colsum(w, X):  # sum_i w_i X_ij over the blocks -> (p,)
-        return jnp.einsum("i,bij->bj", w, X).reshape(-1)[:p]
-
-    return (colsum(s, Xb * Xb), colsum(s * offset, Xb), colsum(s, Xb)), colsum(y, Xb)
+    pre = LevelPre(
+        jnp.stack([hi, lo]), S, Zs, jnp.stack([n1, n0]), jnp.stack([e1, e0]),
+        jnp.stack([v1, v0]), lo, _closed_prepare(ref, design, aux, offset, s),
+    )
+    return pre, ytil
 
 
 def _blocked(design, a, fill):
-    """`a` (p,) padded and reshaped to the column blocks (nb, pb)."""
     nb, _, pb = design.Xb.shape
-    return jnp.pad(a, (0, nb * pb - a.shape[0]), constant_values=fill).reshape(nb, pb)
+    p = a.shape[0]
+    return jnp.pad(a, (0, nb * pb - p), constant_values=fill).reshape(nb, pb)
 
 
-def _cheb_prepare(design, aux, offset, base):
+def _dense_moments(design, y, s, offset):
+    """`(ytil, M1, M2, E1)` = `sum_i y x`, `sum_i s x`, `sum_i s x^2`, `sum_i s x eta`
+    (p,) over the column blocks."""
+    p = design.lo.shape[0]
+    nb, _, pb = design.Xb.shape
+
+    def colsum(w, X):  # sum_i w_i X_ij over the blocks -> (p,)
+        out = jax.lax.map(lambda x: w @ x, X)
+        return out.reshape(nb * pb)[:p]
+
+    X2 = design.Xb * design.Xb
+    return colsum(y, design.Xb), colsum(s, design.Xb), colsum(s, X2), colsum(s * offset, design.Xb)
+
+
+def _dense_prepare(ref, design, aux, offset, base):
+    W, y, s = _row_weights(aux, offset, base)
+    Z = _ref_weights(ref, aux, offset, s)
+    ytil, M1, M2, E1 = _dense_moments(design, y, s, offset)
+    mom = (jnp.sum(s), jnp.sum(s * offset), jnp.sum(s * aux.V), M1, M2, E1)
+    pre = EntryPre(
+        W.T, None if Z is None else Z.T, jnp.sum(jnp.real(W), axis=0), mom,
+        _closed_prepare(ref, design, aux, offset, s),
+    )
+    return pre, ytil
+
+
+def _cheb_prepare(ref, design, aux, offset, base):
     """The Chebyshev-in-x collapse. With `h` interpolated at the nodes `u_q` of each
     column's range, `h(x) ~ sum_q l_q(x) h(u_q)` (`l_q` the Lagrange polynomials), so
 
         sum_i W_ik h(x_ij) ~ sum_q h(u_qj) N_qjk,    N_qjk = sum_i W_ik l_q(xhat_ij),
 
     a sum over N levels like the two-level collapse, with exact level sums `sum_q N_q =
-    sum_i W` (constants interpolate exactly). `N = C^T M` from the Chebyshev moments
-    `M_r = T_r(Xhat)^T W`: one GEMM per degree, the `T_r` by their recurrence, block by
-    block over the columns. The moment sums stay exact (from X)."""
+    sum_i W` (constants interpolate exactly, and so do the quadratic design moments the
+    edge terms need). `N = C^T M` from the Chebyshev moments `M_r = T_r(Xhat)^T [W, Z,
+    s, s eta, s V]`: one GEMM per degree, the `T_r` by their recurrence, block by block
+    over the columns."""
     d = design.dense
     ntau = aux.phi.shape[1]
     N = design.theta.shape[0]
     p = d.lo.shape[0]
-    Wk, y, s = _row_weights(aux, offset, base)
-    Wri = jnp.concatenate([jnp.real(Wk), jnp.imag(Wk)], axis=1)  # (n, 2 ntau)
+    W, y, s = _row_weights(aux, offset, base)
+    Z = _ref_weights(ref, aux, offset, s)
+    cols = [jnp.real(W), jnp.imag(W)]
+    if Z is not None:
+        cols += [jnp.real(Z), jnp.imag(Z)]
+    cols.append(jnp.stack([s, s * offset, s * aux.V], axis=1))
+    Wri = jnp.concatenate(cols, axis=1)  # (n, c)
     C = _cheb_matrix(design.theta)
     mid, half = _mid_half(d)
 
@@ -347,235 +719,307 @@ def _cheb_prepare(design, aux, offset, base):
 
         _, Ms = jax.lax.scan(step, (T0, T1), None, length=max(N - 2, 0))
         M = jnp.concatenate([(T0.T @ Wri)[None], (T1.T @ Wri)[None], Ms])[:N]
-        return jnp.einsum("rq,rjk->qjk", C, M)  # (N, pb, 2 ntau)
+        return jnp.einsum("rq,rjk->qjk", C, M)  # (N, pb, c)
 
     nb, _, pb = d.Xb.shape
     Nq = jax.lax.map(block, (d.Xb, _blocked(d, mid, 0.0), _blocked(d, half, 1.0)))
-    Nq = Nq.transpose(1, 0, 2, 3).reshape(N, nb * pb, 2 * ntau)[:, :p]
-    S = Nq[..., :ntau] + 1j * Nq[..., ntau:]
+    Nq = Nq.transpose(1, 0, 2, 3).reshape(N, nb * pb, -1)[:, :p]
+    S = Nq[..., :ntau] + 1j * Nq[..., ntau : 2 * ntau]
+    off = 2 * ntau
+    if Z is not None:
+        Zs = Nq[..., off : off + ntau] + 1j * Nq[..., off + ntau : off + 2 * ntau]
+        off += 2 * ntau
+    else:
+        Zs = S
+    ng, eg, vg = Nq[..., off], Nq[..., off + 1], Nq[..., off + 2]
     u = mid[None, :] + half[None, :] * jnp.cos(design.theta)[:, None]  # (N, p)
-    mom, ytil = _dense_moments(d, y, s, offset)
-    return (u, S) + mom, ytil
+    ytil = _dense_moments(d, y, s, offset)[0]
+    pre = LevelPre(u, S, Zs, ng, eg, vg, jnp.zeros(p), _closed_prepare(ref, design, aux, offset, s))
+    return pre, ytil
 
 
-@partial(jax.jit, static_argnames=("base",))
-def _prepare(design, aux, offset, base):
-    """Everything the kernel's Newton loop reads that does not depend on `(m, v)`:
+@partial(jax.jit, static_argnames=("ref", "base"))
+def _prepare(ref, design, aux, offset, base):
+    """Everything the kernel's Newton loop reads that does not depend on `(m, s)`:
     `(pre, ytil)` with `ytil = sum_i y_i xt_ij`."""
     if isinstance(design, DenseDesign):
-        return _dense_prepare(design, aux, offset, base)
+        return _dense_prepare(ref, design, aux, offset, base)
     if isinstance(design, ChebDesign):
-        return _cheb_prepare(design, aux, offset, base)
-    return _collapse(design, aux, offset, base)
+        return _cheb_prepare(ref, design, aux, offset, base)
+    return _collapse(ref, design, aux, offset, base)
 
 
-def _spectral_terms(design, aux, pre, m, v):
-    """`sum_i s_i [E A(eta_i + xt_ij b + o'_i) - E A(eta_i + o'_i)]` for each column at
-    `b ~ N(m, v)`, with its derivatives `(d/dm, d/dv, d2/dm dv, d2/dv2)`. Returns (5, p).
-    `pre` is `_prepare`'s first output for the same design."""
-    if isinstance(design, DenseDesign):
-        out = _dense_sums(design, aux, pre, m, v)
-    else:
-        out = _level_sums(pre[0], pre[1], aux, m, v)
-    return _finish(out, aux.wq, pre[-3:], m, v)
-
-
-def _level_sums(levels, sums, aux, m, v):
-    """The trapezoid sums of a collapsed design: column j takes the values `levels[:, j]`
-    (K, p) with group sums `sums` (K, p, ntau); one term per level, scanned so the
-    working set is one (p, ntau) slab."""
+def _level_sums(ref, pre, aux, m, s):
+    """The trapezoid sums of a collapsed design: column j takes the values `pre.u[:, j]`
+    (K, p) with group sums `pre.S, pre.Z` (K, p, ntau); one term per level, scanned so the
+    working set is one (p, ntau) slab. Returns `(trap, lim, aff)`, each (6, p)."""
     cv, c1, c2 = _weights(aux.tau, aux.wq, aux.psi)
     t = aux.tau[None, :]
-    mm, vv = m[:, None], v[:, None]
+    mm, ss = m[:, None], s[:, None]
+    ell = pre.ell
 
-    def step(out, level):
-        u, S = level
-        u = u[:, None]
-        h = jnp.exp(1j * t * u * mm - 0.5 * t**2 * u**2 * vv)
-        hS = h * S
-        re, im = jnp.real(hS), jnp.imag(hS)
-        val = jnp.sum(cv * (re - jnp.real(S)), axis=1)
-        d_m = jnp.sum(c1 * (-u * im), axis=1)
-        d_v = jnp.sum(c2 * (-0.5 * u**2 * re), axis=1)
-        d_mv = jnp.sum(c2 * t * (0.5 * u**3 * im), axis=1)
-        d_vv = jnp.sum(c2 * t**2 * (0.25 * u**4 * re), axis=1)
-        return out + jnp.stack([val, d_m, d_v, d_mv, d_vv]), None
+    def step(carry, level):
+        trap, lim, aff = carry
+        u, S, Z, ng, eg, vg = level
+        uu = u[:, None]
+        P = jnp.exp(1j * t * uu * mm - 0.5 * t**2 * uu**2 * ss**2)
+        PS = P * S
+        trap = trap + _channels(uu, uu * uu, ss, t, jnp.real(PS), jnp.imag(PS), cv, c1, c2, 1)
+        a, b = _factor_ab(ref, uu, ell[:, None])
+        Q = jnp.exp(1j * t * a * mm - 0.5 * t**2 * b * ss**2)
+        QZ = Q * Z
+        trap = trap - _channels(a, b, ss, t, jnp.real(QZ), jnp.imag(QZ), cv, c1, c2, 1)
+        lim_u, aff_u = _edge(ref, ng, u * ng, u * u * ng, eg, u * eg, vg, ell, m, s)
+        return (trap, lim + lim_u, aff + aff_u), None
 
-    out, _ = jax.lax.scan(step, jnp.zeros((5, m.shape[0])), (levels, sums))
-    return out
-
-
-@jax.jit
-def cheb_error(design, aux, wabs, m, v):
-    """Estimated error of the Chebyshev collapse at `(m, v)`, per column: for each
-    channel (`x^q h`, q = 0..4, with its trapezoid x kernel weight) the interpolant's
-    `_tail_bound` at each frequency, weighted by `wabs_k = sum_i |W_ik|` and summed over
-    the grid. Returns (5, p). Cost O(N p ntau), no n."""
-    cv, c1, c2 = _weights(aux.tau, aux.wq, aux.psi)
-    C = _cheb_matrix(design.theta)
-    N = design.theta.shape[0]
-    mid, half = _mid_half(design)
-    u = mid[None, :] + half[None, :] * jnp.cos(design.theta)[:, None]  # (N, p)
-
-    def step(err, k):
-        t = aux.tau[k]
-        h = jnp.exp(1j * t * u * m[None, :] - 0.5 * t**2 * u**2 * v[None, :])
-        ws = jnp.stack([cv[k], c1[k], 0.5 * c2[k], 0.5 * c2[k] * t, 0.25 * c2[k] * t * t])
-        umax = jnp.max(jnp.abs(u), axis=0)
-        ok = _sampled(N, t, m, v, mid, half)
-        tails = jnp.stack(  # the bound is for |f| <= 1: scale x^q h by umax^q
-            [umax**q * _tail_bound(C @ (h * (u / umax) ** q), ok) for q in range(5)]
-        )  # (5, p)
-        return err + wabs[k] * ws[:, None] * tails, None
-
-    err, _ = jax.lax.scan(step, jnp.zeros((5, m.shape[0])), jnp.arange(aux.tau.shape[0]))
-    return err / jnp.pi
+    zero = jnp.zeros((6, m.shape[0]))
+    (trap, lim, aff), _ = jax.lax.scan(
+        step, (zero, zero, zero), (pre.u, pre.S, pre.Z, pre.ng, pre.eg, pre.vg)
+    )
+    return trap, lim, aff
 
 
-def _dense_sums(design, aux, pre, m, v):
+def _dense_sums(ref, design, aux, pre, m, s):
     """The trapezoid sums of a dense design, per entry: over column blocks (`lax.map`)
-    and, inside each, over the grid (`lax.scan`), with `h` by its recurrence in k."""
-    WT, sum_re = pre[:2]
+    and, inside each, over the grid (`lax.scan`), with the effect factor `h` and the
+    reference phase `e^{i t x m}` by their recurrences on the uniform grid (`h_{k+1} =
+    h_k r g^{2k+1}`, `r = e^{i dt x m}`, `g = e^{-dt^2 x^2 s^2 / 2}`): one complex
+    multiply per entry and node, not an exponential."""
     cv, c1, c2 = _weights(aux.tau, aux.wq, aux.psi)
     tau = aux.tau
     dt = tau[1] - tau[0]
     nb, n, pb = design.Xb.shape
     p = m.shape[0]
-    pad = nb * pb - p
-    mb = jnp.pad(m, (0, pad)).reshape(nb, pb)
-    vb = jnp.pad(v, (0, pad)).reshape(nb, pb)
+    mb, sb = _blocked(design, m, 0.0), _blocked(design, s, 0.0)
+    ZT = pre.WT if pre.ZT is None else pre.ZT  # null: unused (handled by sum_re)
+    kind = ref.kind
 
     def block(args):
-        x, mj, vj = args
+        x, mj, sj = args
         x2 = x * x
+        sj_ = sj[None, :]
         r = jnp.exp(1j * dt * x * mj[None, :])
-        g = jnp.exp(-0.5 * dt**2 * x2 * vj[None, :])
+        g = jnp.exp(-0.5 * dt**2 * x2 * sj_**2)
         g2 = g * g
 
         def step(carry, inp):
-            h, gk, acc = carry  # h = h_k, gk = g^{2k+1}
-            w, a0, a1, a2, t = inp
-            hw = h * w[:, None]
-            re, im = jnp.real(hw), jnp.imag(hw)
-            xi = x * im
-            x2re = x2 * re
-            acc = acc + jnp.stack([
-                a0 * jnp.sum(re, axis=0),
-                a1 * -jnp.sum(xi, axis=0),
-                a2 * -0.5 * jnp.sum(x2re, axis=0),
-                a2 * t * 0.5 * jnp.sum(x2 * xi, axis=0),
-                a2 * t * t * 0.25 * jnp.sum(x2 * x2re, axis=0),
-            ])
-            return (h * r * gk, gk * g2, acc), None
+            h, e, gk, acc = carry  # h = h_k, e = r^k, gk = g^{2k+1}
+            w, z, a0, a1, a2, t = inp
+            if kind == "gaussian":
+                PW = h * (w - z)[:, None]  # P (W - Z): the reference factor is h itself
+            else:
+                PW = h * w[:, None]
+            acc = acc + _channels(x, x2, sj_, t, jnp.real(PW), jnp.imag(PW), a0, a1, a2, 0)
+            if kind == "plugin":
+                QZ = e * z[:, None]
+                acc = acc - _channels(x, 0.0, sj_, t, jnp.real(QZ), jnp.imag(QZ), a0, a1, a2, 0)
+            return (h * r * gk, e * r, gk * g2, acc), None
 
-        init = (jnp.ones((n, pb), WT.dtype), g, jnp.zeros((5, pb)))
-        (_, _, acc), _ = jax.lax.scan(step, init, (WT, cv, c1, c2, tau))
+        ones = jnp.ones((n, pb), pre.WT.dtype)
+        init = (ones, ones, g, jnp.zeros((6, pb)))
+        (_, _, _, acc), _ = jax.lax.scan(step, init, (pre.WT, ZT, cv, c1, c2, tau))
         return acc
 
-    out = jax.lax.map(block, (design.Xb, mb, vb))  # (nb, 5, pb)
-    out = out.transpose(1, 0, 2).reshape(5, nb * pb)[:, :p]
-    # the "- 1" of (h - 1): every row's weight, the same for every column
-    return out.at[0].add(-(cv @ sum_re))
+    out = jax.lax.map(block, (design.Xb, mb, sb))  # (nb, 6, pb)
+    trap = out.transpose(1, 0, 2).reshape(6, nb * pb)[:, :p]
+    if kind == "null":
+        # the "- 1" of (h - 1): every row's weight, the same for every column
+        trap = trap.at[0].add(-(cv @ pre.sum_re))
+    M0, E0, V0, M1, M2, E1 = pre.mom
+    lim, aff = _edge(ref, M0, M1, M2, E0, E1, V0, jnp.zeros_like(m), m, s)
+    return trap, lim, aff
 
 
-def _finish(out, wq, mom, m, v):
-    """Add the t = 0 node (analytic limit) and the affine term to the trapezoid sums.
-    `mom = (sum s xt^2, sum s xt eta, sum s xt)` per column."""
-    quad, lin, sx = mom
-    zero = jnp.zeros_like(m)
-    # t = 0 node: lim Re[phi e^{itz}(h - 1)] / t^2 = -(xt^2 (m^2 + v))/2 - xt m eta
-    lim = jnp.stack([-(m**2 + v) / 2 * quad - m * lin, -m * quad - lin, -0.5 * quad,
-                     zero, zero])
-    # affine term (mu_P - mu_Q)/2 = xt m / 2 per row (zero on a centered column)
-    aff = jnp.stack([0.5 * m * sx, 0.5 * sx, zero, zero, zero])
-    return -(out + wq[0] * lim) / jnp.pi + aff
+def _spectral_terms(ref, design, aux, pre, m, s):
+    """`sum_i s_i E A(eta_i + xt_ij b + o'_i)` for each column at `b ~ N(m, s^2)` up to a
+    per-column constant, with its (m, s)-derivatives: `(val, d_m, d_s, d_mm, d_ms,
+    d_ss)`, (6, p). The constant is the reference's off-support contribution and cancels
+    against `terms(0, 0)`, the null. `pre` is `_prepare`'s first output for the same
+    reference and design."""
+    if isinstance(pre, EntryPre):
+        trap, lim, aff = _dense_sums(ref, design, aux, pre, m, s)
+    else:
+        trap, lim, aff = _level_sums(ref, pre, aux, m, s)
+    return _finish(trap, lim, aff, aux.wq[0]) + _closed_terms(ref, pre.closed, m, s)
 
 
-@partial(jax.jit, static_argnames=("base", "n_iter"))
-def glm_spectral_ser(design, aux, offset, prior_variance, base=Bernoulli(), n_iter=100,
-                     tol=1e-8, init=None):
-    """Gaussian-VI SER (CAVI in Q2) by the spectral Fourier sum: collapsed on a
-    `TwoLevelDesign`, per entry on a `DenseDesign`.
+def _coarsen(aux, pre):
+    """The same sums on the ladder rung below: every other node (`ntau = 2^k + 1`, so
+    both endpoints stay), trapezoid weights doubled."""
+    aux_c = SpectralAux(
+        aux.y, aux.phi[:, ::2], aux.V, aux.tau[::2], 2.0 * aux.wq[::2], aux.psi[::2]
+    )
+    if isinstance(pre, EntryPre):
+        pre_c = pre._replace(
+            WT=pre.WT[::2], ZT=None if pre.ZT is None else pre.ZT[::2], sum_re=pre.sum_re[::2]
+        )
+    else:
+        pre_c = pre._replace(S=pre.S[..., ::2], Z=pre.Z[..., ::2])
+    return aux_c, pre_c
 
-    Same stationarity conditions and joint (m, 1/v) Newton as `glm_vi_gh_ser`: the score
-    `G = sum_i xt (y - s E A')`, the Price weight `W = sum_i s xt^2 E A''` and the Stein
-    sums `S3, S4` are the m/v-derivatives of `sum_i s E A` (`W = 2 d/dv`, `S3 = 2 d2/dm dv`,
-    `S4 = 4 d2/dv2`). `init = (m, v)` warm-starts the solve (default `(0, prior_variance)`,
-    the vi_gh convention). Each Newton proposal is accepted only if it raises the column's
-    ELBO, halving the step in (m, log v) until it does, so the solve is monotone. Returns `(m, v, elbo_rel, coefficient_kl)`, `elbo_rel` against the
-    b = 0 null at `offset` (the `build_ser_state` contract)."""
+
+def _grid_error(ref, design, aux, pre, m, s):
+    """Estimated aliasing of this rung's sums at `(m, s)`, six channels (6, p), from the
+    two rungs below (free: every other node, then every fourth). With `d1 = |T_k -
+    T_{k-1}|` (the rung below's error) and `d2 = |T_{k-1} - T_{k-2}|`, the aliasing of a
+    trapezoid sum decays exponentially in the node count once the period clears the
+    reach, so doubling the grid squares the error and `err_k ~ d1 (d1/d2)^2`. The
+    estimate takes one factor of the ratio, `d1 min(1, d1/d2)`: conservative, and it
+    falls back to `d1` itself where the rungs are not yet converging (`d1 >= d2`)."""
+    aux_1, pre_1 = _coarsen(aux, pre)
+    aux_2, pre_2 = _coarsen(aux_1, pre_1)
+    fine = _spectral_terms(ref, design, aux, pre, m, s)
+    T1 = _spectral_terms(ref, design, aux_1, pre_1, m, s)
+    T2 = _spectral_terms(ref, design, aux_2, pre_2, m, s)
+    d1 = jnp.abs(fine - T1)
+    d2 = jnp.abs(T1 - T2)
+    ratio = jnp.where(d2 > 0.0, jnp.minimum(d1 / jnp.where(d2 > 0.0, d2, 1.0), 1.0), 1.0)
+    return d1 * ratio
+
+
+@partial(jax.jit, static_argnames=("ref", "base"))
+def grid_error(ref, design, aux, offset, base, m, s):
+    """`_grid_error` from scratch (builds the per-update data); the kernel returns the
+    same quantity at its solution without the rebuild."""
+    pre, _ = _prepare(ref, design, aux, offset, base)
+    return _grid_error(ref, design, aux, pre, m, s)
+
+
+def _within(err, s, tol):
+    """Is a channel error within `tol` where it matters: the value (the log BF) and the
+    score / s-gradient channels as the shifts they cause in the fixed point (`dm ~ err_m
+    v`, `ds ~ err_s s^2 / 2`, from the curvature `~1/v` of the ELBO in m and `~2/s^2` in
+    s)? The second-derivative channels only steer Newton."""
+    return (
+        (jnp.max(err[0]) <= tol)
+        & (jnp.max(err[1] * s * s) <= tol)
+        & (jnp.max(0.5 * err[2] * s * s) <= tol)
+    )
+
+
+# ----------------------------------------------------------------------------------------
+# the kernel: Newton in (m, s)
+# ----------------------------------------------------------------------------------------
+
+
+def _newton_step(T, ytil, inv_pv, m, s):
+    """One Newton step on the surrogate ELBO `F(m, s) = m ytil - T(m, s) - KL(m, s)`,
+    `KL = [lambda0 (m^2 + s^2) - 1 - log(lambda0 s^2)] / 2`:
+
+        grad F = [ytil - T_m - lambda0 m,  -T_s - lambda0 s + 1/s]
+        hess F = [[-T_mm - lambda0, -T_ms], [-T_ms, -T_ss - lambda0 - 1/s^2]]
+
+    For a concave log-likelihood `F` is strongly concave in `(m, s)` (Challis & Barber
+    2013), so the Hessian is negative definite and the step ascends; the surrogate
+    inherits this up to its aliasing error, so the Hessian is shifted to keep its largest
+    eigenvalue below `-eps` where that fails. The s-step is scaled so `s` keeps at least a
+    quarter of its value (the line search then backtracks from there)."""
+    g1 = ytil - T[1] - inv_pv * m
+    g2 = -T[2] - inv_pv * s + 1.0 / s
+    h11 = -T[3] - inv_pv
+    h12 = -T[4]
+    h22 = -T[5] - inv_pv - 1.0 / (s * s)
+    half = 0.5 * (h11 + h22)
+    disc = jnp.sqrt(jnp.square(0.5 * (h11 - h22)) + h12 * h12)
+    eps = 1e-10 * (jnp.abs(h11) + jnp.abs(h22))
+    shift = jnp.maximum(half + disc + eps, 0.0)
+    h11, h22 = h11 - shift, h22 - shift
+    det = h11 * h22 - h12 * h12
+    dm = -(h22 * g1 - h12 * g2) / det
+    ds = -(-h12 * g1 + h11 * g2) / det
+    scale = jnp.where(ds < -0.75 * s, 0.75 * s / jnp.maximum(-ds, 1e-300), 1.0)
+    return dm * scale, ds * scale
+
+
+@partial(jax.jit, static_argnames=("base", "ref", "n_iter"))
+def glm_spectral_ser(design, aux, offset, prior_variance, base=Bernoulli(), ref=Reference(),
+                     n_iter=100, tol=1e-8, init=None):
+    """Gaussian-VI SER (CAVI in Q2) by Newton in `(m, s)` on the spectral surrogate:
+    collapsed on a `TwoLevelDesign` or `ChebDesign`, per entry on a `DenseDesign`, under
+    the reference `ref`.
+
+    `init = (m, v)` warm-starts the solve (default `(0, prior_variance)`, the vi_gh
+    convention). Each Newton proposal is accepted only if it raises the column's
+    surrogate ELBO, halving the step until it does, so the solve is monotone. Returns `(m,
+    v, elbo_rel, coefficient_kl, err)`: `v = s^2`; `elbo_rel` against the `b = 0` null at
+    `offset` (the `build_ser_state` contract); `err` the grid's aliasing estimate at the
+    solution (`grid_error`, (6, p)) for the engine's ladder."""
     offset = jnp.asarray(offset)
-    pre, ytil = _prepare(design, aux, offset, base)
+    pre, ytil = _prepare(ref, design, aux, offset, base)
     inv_pv = 1.0 / prior_variance
+    p = ytil.shape[0]
     # The ELBO is a difference of row sums, so it carries roundoff ~ eps * sum_i s_i. Near
     # the optimum a Newton step gains less than that; the line search must not read noise
     # as a decrease (each rejected trial is a full evaluation, a pass over X when dense).
     # The 2-cycle it guards against loses O(1) nats per step, far above this floor.
     noise = 1e-12 * (1.0 + jnp.sum(_unpack(base, aux.y, aux.phi.shape[0])[1]))
 
-    def terms(m, v):
-        return _spectral_terms(design, aux, pre, m, v)
+    def terms(m, s):
+        return _spectral_terms(ref, design, aux, pre, m, s)
 
-    def elbo(m, v, val):
-        kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
-        return m * ytil - val - kl
+    T00 = terms(jnp.zeros(p), jnp.zeros(p))[0]  # the null (b = 0), per column
+
+    def elbo(m, s, val):
+        kl = 0.5 * (inv_pv * (m * m + s * s) - 1.0 - jnp.log(inv_pv * s * s))
+        return m * ytil - (val - T00) - kl
 
     def body(state):
-        # Joint Newton proposal, then a per-column backtracking line search in (m, log v)
-        # on the exact ELBO. Without it the Newton/alternation map 2-cycles on
-        # (near-)separated columns at large prior variance: W collapses as |m| grows, v
-        # jumps to ~pv, W recovers. Candidates get every channel, so the accepted one's
+        # Newton proposal, then a per-column backtracking line search in (m, s) on the
+        # surrogate ELBO. Without it the Newton map 2-cycles on (near-)separated columns
+        # at large prior variance. Candidates get every channel, so the accepted one's
         # derivatives feed the next proposal (one evaluation per accepted step).
-        m, v, f, T, _, it = state
-        m_n, v_n, _ = _joint_newton_step(
-            m, v, ytil - T[1], jnp.maximum(2.0 * T[2], 0.0), 2.0 * T[3], 4.0 * T[4], inv_pv
-        )
-        dm, dlv = m_n - m, jnp.log(v_n) - jnp.log(v)
+        m, s, f, T, _, it = state
+        dm, ds = _newton_step(T, ytil, inv_pv, m, s)
 
         def shrink(ls):
-            s, done, mb, vb, fb, Tb, k = ls
-            mc, vc = m + s * dm, v * jnp.exp(s * dlv)
-            Tc = terms(mc, vc)
-            fc = elbo(mc, vc, Tc[0])
-            take = (~done) & jnp.isfinite(fc) & (fc >= f - noise * (1.0 + jnp.abs(f)))
+            a, done, mb, sb, fb, Tb, k = ls
+            mc, sc = m + a * dm, s + a * ds
+            Tc = terms(mc, sc)
+            fc = elbo(mc, sc, Tc[0])
+            take = (~done) & (sc > 0.0) & jnp.isfinite(fc) & (fc >= f - noise * (1.0 + jnp.abs(f)))
             return (
-                jnp.where(take | done, s, 0.5 * s),
+                jnp.where(take | done, a, 0.5 * a),
                 done | take,
                 jnp.where(take, mc, mb),
-                jnp.where(take, vc, vb),
+                jnp.where(take, sc, sb),
                 jnp.where(take, fc, fb),
                 jnp.where(take[None, :], Tc, Tb),
                 k + 1,
             )
 
         one = jnp.ones_like(m)
-        _, _, m_new, v_new, f_new, T_new, _ = jax.lax.while_loop(
+        _, _, m_new, s_new, f_new, T_new, _ = jax.lax.while_loop(
             lambda ls: (ls[6] < 30) & ~jnp.all(ls[1]),
             shrink,
-            (one, jnp.zeros_like(m, dtype=bool), m, v, f, T, 0),
+            (one, jnp.zeros_like(m, dtype=bool), m, s, f, T, 0),
         )
-        resid = jnp.maximum(
-            jnp.max(jnp.abs(m_new - m)), jnp.max(jnp.abs(jnp.log(v_new) - jnp.log(v)))
-        )
-        return m_new, v_new, f_new, T_new, resid, it + 1
+        resid = jnp.maximum(jnp.max(jnp.abs(m_new - m)), jnp.max(jnp.abs(s_new - s) / s))
+        return m_new, s_new, f_new, T_new, resid, it + 1
 
-    p = ytil.shape[0]
     if init is None:
-        m0, v0 = jnp.zeros(p), jnp.full(p, prior_variance)
+        m0, s0 = jnp.zeros(p), jnp.full(p, jnp.sqrt(prior_variance))
     else:
-        m0, v0 = (jnp.broadcast_to(jnp.asarray(a, dtype=jnp.float64), (p,)) for a in init)
-    T0 = terms(m0, v0)
-    m, v, _, T, _, _ = jax.lax.while_loop(
-        lambda s: (s[5] < n_iter) & (s[4] > tol),
+        m0 = jnp.broadcast_to(jnp.asarray(init[0], dtype=jnp.float64), (p,))
+        s0 = jnp.sqrt(jnp.broadcast_to(jnp.asarray(init[1], dtype=jnp.float64), (p,)))
+    T0 = terms(m0, s0)
+    m, s, _, T, _, _ = jax.lax.while_loop(
+        lambda st: (st[5] < n_iter) & (st[4] > tol),
         body,
-        (m0, v0, elbo(m0, v0, T0[0]), T0, jnp.inf, 0),
+        (m0, s0, elbo(m0, s0, T0[0]), T0, jnp.inf, 0),
     )
-    ok = jnp.isfinite(m) & jnp.isfinite(v) & (v > 0)
+    ok = jnp.isfinite(m) & jnp.isfinite(s) & (s > 0)
     m = jnp.where(ok, m, 0.0)
-    v = jnp.where(ok, v, prior_variance)
+    s = jnp.where(ok, s, jnp.sqrt(prior_variance))
+    v = s * s
     kl = 0.5 * (jnp.log(prior_variance / v) + (v + m**2) / prior_variance - 1.0)
-    elbo_rel = jnp.where(ok, m * ytil - T[0] - kl, 0.0)
-    return m, v, elbo_rel, kl
+    elbo_rel = jnp.where(ok, m * ytil - (T[0] - T00) - kl, 0.0)
+    err = _grid_error(ref, design, aux, pre, m, s)
+    return m, v, elbo_rel, kl, err
+
+
+# ----------------------------------------------------------------------------------------
+# Chebyshev-in-x collapse: error estimates
+# ----------------------------------------------------------------------------------------
 
 
 _RESOLVED = 1e-3  # trailing / leading coefficient ratio below which a series counts as
@@ -600,6 +1044,43 @@ def _tail_bound(c, sampled, axis=0):
     tail = jnp.sum(jnp.take(a, jnp.arange(-3, 0), axis=axis), axis=axis)
     resolved = sampled & (tail <= _RESOLVED * jnp.max(a, axis=axis))
     return jnp.where(resolved, tail, 1.0 + jnp.sum(a, axis=axis))
+
+
+@jax.jit
+def cheb_error(design, aux, wabs, m, s):
+    """Estimated error of the Chebyshev collapse at `(m, s)`, per column, six channels
+    (6, p): for each channel's factor `x^q h` (q = 0..4) the interpolant's `_tail_bound`
+    at each frequency under the channel's weight, weighted by `wabs_k = sum_i (|W_ik| +
+    |Z_ik|)` and summed over the grid. The reference phase `e^{i t x m}` has the same
+    content as `h` without the Gaussian factor, so `h`'s tails cover it. Cost O(N p
+    ntau), no n."""
+    cv, c1, c2 = _weights(aux.tau, aux.wq, aux.psi)
+    C = _cheb_matrix(design.theta)
+    N = design.theta.shape[0]
+    mid, half = _mid_half(design)
+    u = mid[None, :] + half[None, :] * jnp.cos(design.theta)[:, None]  # (N, p)
+    v = s * s
+
+    def step(err, k):
+        t = aux.tau[k]
+        h = jnp.exp(1j * t * u * m[None, :] - 0.5 * t**2 * u**2 * v[None, :])
+        umax = jnp.max(jnp.abs(u), axis=0)
+        ok = _sampled(N, t, m, v, mid, half)
+        tails = jnp.stack(  # the bound is for |f| <= 1: scale x^q h by umax^q
+            [umax**q * _tail_bound(C @ (h * (u / umax) ** q), ok) for q in range(5)]
+        )  # (5, p)
+        ch = jnp.stack([
+            cv[k] * tails[0],
+            c1[k] * tails[1],
+            c2[k] * s * tails[2],
+            c2[k] * tails[2],
+            c2[k] * t * s * tails[3],
+            c2[k] * (tails[2] + t * t * s * s * tails[4]),
+        ])
+        return err + wabs[k] * ch, None
+
+    err, _ = jax.lax.scan(step, jnp.zeros((6, m.shape[0])), jnp.arange(aux.tau.shape[0]))
+    return err / jnp.pi
 
 
 def _factor_coeffs(design, alpha, mu, var, tau):
@@ -653,30 +1134,45 @@ def cheb_factor(design, alpha, mu, var, tau):
     return out[:, :ntau] + 1j * out[:, ntau:]
 
 
-def _cheb_within(err, v, tol):
-    """Is the estimated Chebyshev error within `tol` where it matters: the value (the log
-    BF), and the score / Price channels as the shifts they cause in the fixed point
-    (`dm ~ err / W ~ err v`, `d log v ~ 2 err v`)? The (m, v) cross terms only steer
-    Newton."""
-    return bool(
-        (jnp.max(err[0]) <= tol)
-        & (jnp.max(err[1] * v) <= tol)
-        & (jnp.max(2.0 * err[2] * v) <= tol)
-    )
+def _cheb_within(err, s, tol):
+    return bool(_within(err, s, tol))
 
 
-@partial(jax.jit, static_argnames=("base",))
-def spectral_null_loglik(aux, offset, base=Bernoulli()):
+# ----------------------------------------------------------------------------------------
+# the null
+# ----------------------------------------------------------------------------------------
+
+
+@partial(jax.jit, static_argnames=("base", "ref"))
+def spectral_null_loglik(aux, offset, base=Bernoulli(), ref=Reference()):
     """`sum_i [y_i eta_i - s_i E A(eta_i + o'_i)]` at b = 0 (the null the kernel's log BF
-    is measured against), by the same Fourier sum with the point mass at 0 as reference
-    (zero mean, so no affine term)."""
+    is measured against), by the Fourier identity against a closed-form reference at
+    rest: the point mass at the mean under the logistic cumulant (null and plug-in
+    references; the limit at t = 0 is `-V/2`), or `N(eta, V)` under the probit mixture
+    (gaussian reference; the residual is O(t^3) at 0)."""
     offset = jnp.asarray(offset)
     n = aux.phi.shape[0]
     y, s = _unpack(base, aux.y, n)
     cv, _, _ = _weights(aux.tau, aux.wq, aux.psi)
-    resid = jnp.real((aux.phi - 1.0) * jnp.exp(1j * aux.tau[None, :] * offset[:, None]))
-    corr = (resid @ cv + aux.wq[0] * (-0.5 * aux.V)) / jnp.pi  # A - E A
-    return jnp.sum(y * offset - s * (jax.nn.softplus(offset) - corr))
+    phase = jnp.exp(1j * aux.tau[None, :] * offset[:, None])
+    if ref.logistic:
+        resid = jnp.real((aux.phi - 1.0) * phase)
+        corr = (resid @ cv + aux.wq[0] * (-0.5 * aux.V)) / jnp.pi  # A - E A
+        ref_val = jax.nn.softplus(offset)
+    else:
+        gamma = jnp.exp(-0.5 * aux.V[:, None] * aux.tau[None, :] ** 2)
+        resid = jnp.real((aux.phi - gamma) * phase)
+        corr = (resid @ cv) / jnp.pi
+        ref_val = _gauss_channels(
+            ref.order, offset, aux.V, jnp.zeros_like(offset), jnp.zeros_like(offset),
+            jnp.zeros_like(offset), jnp.ones_like(offset),
+        )[0]
+    return jnp.sum(y * offset - s * (ref_val - corr))
+
+
+# ----------------------------------------------------------------------------------------
+# the smoother
+# ----------------------------------------------------------------------------------------
 
 
 CHEB_LADDER = (8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
@@ -695,24 +1191,32 @@ class _ReachMark:
 
 @dataclass(frozen=True)
 class CharFnSpectral(CharFnOffset):
-    """CAVI in Q2 by the spectral effect update: collapsed on a two-level design (0/1,
-    possibly centered), per entry on any other dense design.
+    """CAVI in Q2 by the spectral effect update (module docstring): Newton in (m, s) on
+    the fixed-grid Fourier surrogate, collapsed on a two-level design (0/1, possibly
+    centered) or a Chebyshev-in-x collapse of a dense design, per entry otherwise.
 
-    The effect updates bypass the Chebyshev table: `build_spectral_aux` hands
-    `glm_spectral_ser` the other effects' CF on a grid sized for the update's reach. The
-    shared intercept still uses the inherited table (`build_aux*`), on the SAME frequency
-    grid (shared `Tmax` and ntau ratchet), so the per-effect factor memo serves both.
-    Logistic / Binomial base only; shared or null intercept.
+    `reference` picks the Fourier residual's reference law: "null" (the sum is the
+    evidence itself), "plugin" (point mass at the plug-in shift, logistic cumulant) or
+    "gaussian" (moment-matched Gaussian under the order-`mixture_order` probit mixture
+    cumulant). All three share the kernel and the fixed point; a smaller residual lets the
+    grid ladder stop at a coarser rung. `alias_tol` is the measured aliasing (nats, on the
+    log BF and the fixed point) a rung must meet.
+
+    The effect updates and the shared intercept both run through `glm_spectral_ser`
+    (`glm._spectral_solve`), on the dyadic grid ladder. Logistic / Binomial base only;
+    shared or null intercept.
 
     `offset_law="gaussian"` replaces each row's offset law by its moment-matched Gaussian
     `N(0, V_i)` (same mean, same mixture variance), so `phi_i = exp(-t^2 V_i / 2)`: the
     Gaussian-offset approximation to the same Q2 update, with no per-effect CF factors.
-    Everything else (the kernel, the grid, the spectral intercept) is shared, so the two
-    laws differ only in `phi`. Fixed covariates are not supported in this mode (their
-    shared factor would fall back to the exact-law table)."""
+    Everything else is shared, so the two laws differ only in `phi`. Fixed covariates are
+    not supported in this mode."""
 
-    max_refits: int = 4
+    max_refits: int = 6
     offset_law: str = "mixture"  # "mixture" (exact CAVI in Q2) | "gaussian"
+    reference: str = "null"  # "null" | "plugin" | "gaussian"
+    mixture_order: int = 8  # probit-mixture order of the gaussian reference's cumulant
+    alias_tol: float = 1e-8
     # dense non-two-level X: "chebyshev" (interpolate h in x at N nodes per column, N
     # from CHEB_LADDER by `cheb_tol`; past the ladder, the exact kernel) | "exact" (per
     # entry, O(n p ntau) per Newton step)
@@ -735,6 +1239,11 @@ class CharFnSpectral(CharFnOffset):
                 f"CharFnSpectral: dense_kernel must be 'chebyshev' or 'exact'; got "
                 f"{self.dense_kernel!r}."
             )
+        Reference(self.reference, self.mixture_order)  # validates
+
+    @property
+    def ref(self) -> Reference:
+        return Reference(self.reference, self.mixture_order)
 
     def design(self, X, colmean=None):
         """Cached kernel design for `X`: the two-level split when every column takes at
@@ -757,11 +1266,13 @@ class CharFnSpectral(CharFnOffset):
         return d
 
     def build_spectral_aux(self, base, y, X, effects, offset, design, law, offset_var=0.0,
-                           colmean=None, keys=None):
+                           colmean=None, keys=None, ntau=None):
         """The `SpectralAux` for one effect update. `effects` are the OTHER effects as
         `(alpha, mu, var)` over the shared design `X`; `law = (m, v)` is the updated
-        effect's current (or trial) posterior, used only to size the grid."""
-        Tmax = _psi_tail_Tmax(self.tol)
+        effect's current (or trial) posterior, used only to size the grid. `ntau` pins a
+        rung of the ladder (the engine's refit); None sizes it from the reach."""
+        ref = self.ref
+        Tmax = ref.tail_Tmax(self.tol)
         n = X.shape[0]
         memo = self._memo()
         keys = [None] * len(effects) if keys is None else list(keys)
@@ -772,19 +1283,17 @@ class CharFnSpectral(CharFnOffset):
         for (alpha, mu, var), slot in zip(effects, keys):
             refs = (jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var))
             if sparse:
-                mom = lambda r=refs: _sparse_effect_moments(op, *r, c_arr)
+                mom = lambda r=refs: _sparse_effect_moments(op, *r, c_arr)  # noqa: E731
             else:
-                mom = lambda r=refs: effect_moments((jnp.asarray(X),) + r)
+                mom = lambda r=refs: effect_moments((jnp.asarray(X),) + r)  # noqa: E731
             V0 = V0 + (mom() if memo is None else memo.moments(slot, refs, mom))[1]
-        m, v = law
-        reach = max(_reach(offset, design, m, v, V0, self.kappa),
-                    float(jnp.max(jnp.abs(offset))) + self._mark.value)
-        ntau = spectral_ntau(reach, Tmax, self.tol, self.safety)
-        b = _bucket_size(self.ntau_bucket)
-        if b > 1:
-            ntau = int(math.ceil(ntau / b) * b)
-        ntau = self._ratchet.apply(ntau, 1 << 14)
-        tau, wq, psi = _frequency_grid(Tmax, ntau)
+        if ntau is None:
+            m, v = law
+            reach = max(_reach(offset, design, m, v, V0, self.kappa),
+                        float(jnp.max(jnp.abs(offset))) + self._mark.value)
+            ntau = spectral_ntau(reach, Tmax, ref.pad(self.tol), self.safety)
+        ntau = self._ratchet.apply(ladder_ntau(ntau), 1 << 14)
+        tau, wq, psi = ref.grid(Tmax, ntau)
         if self.offset_law == "gaussian":
             phi = jnp.exp(-0.5 * V0[:, None] * tau[None, :] ** 2).astype(jnp.complex128)
             return SpectralAux(y, phi, V0, tau, wq, psi)
@@ -834,23 +1343,28 @@ class CharFnSpectral(CharFnOffset):
         if isinstance(floor, DenseDesign):
             return floor
         m, v = (jnp.asarray(a, dtype=jnp.float64) for a in law)
-        s = _unpack(base, aux.y, aux.phi.shape[0])[1]
-        wabs = jnp.abs(aux.phi).T @ s  # sum_i s_i |W_ik|
+        s = jnp.sqrt(v)
+        n = aux.phi.shape[0]
+        sw = _unpack(base, aux.y, n)[1]
+        zeta = _zeta(self.ref, aux)
+        amp = jnp.abs(aux.phi) + (0.0 if zeta is None else jnp.abs(zeta))
+        wabs = amp.T @ sw  # sum_i s_i (|W_ik| + |Z_ik|)
         lo = 0 if floor is None else floor.theta.shape[0]
         for N in CHEB_LADDER:
             if N < lo:
                 continue
             cd = floor if (floor is not None and N == lo) else cheb_design(design, N)
-            if _cheb_within(cheb_error(cd, aux, wabs, m, v), v, self.cheb_tol):
+            if _cheb_within(cheb_error(cd, aux, wabs, m, s), s, self.cheb_tol):
                 return cd
         return design
 
-    def grid_ok(self, aux, offset, design, m, v):
-        """Does the grid's period cover the solved update's reach? Records the shift part
-        in the fit's high-water mark either way."""
-        reach = _reach(offset, design, m, v, aux.V, self.kappa)
-        self._mark.value = max(
-            self._mark.value, reach - float(jnp.max(jnp.abs(offset)))
-        )
-        need = self.safety * reach + math.log(1.0 / self.tol) + 10.0
-        return _period(aux.tau) >= need
+    def grid_ok(self, err, v) -> bool:
+        """Does the solved update's measured aliasing (`glm_spectral_ser`'s `err`) meet
+        `alias_tol`?"""
+        return bool(_within(jnp.asarray(err), jnp.sqrt(jnp.asarray(v)), self.alias_tol))
+
+    def mark_reach(self, offset, design, m, v, V):
+        """Record the effect-shift part of a solved update's reach in the fit's high-water
+        mark, so later updates start on a rung that covers it."""
+        reach = _reach(offset, design, m, v, V, self.kappa)
+        self._mark.value = max(self._mark.value, reach - float(jnp.max(jnp.abs(offset))))

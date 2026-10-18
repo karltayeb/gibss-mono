@@ -113,11 +113,17 @@ _SMOOTHERS = {
     ),
     # cf_spectral: the same CAVI in Q2 with the effect b folded into the CF, so the effect
     # update is one Fourier sum per column (logistic only; sparse X must be 0/1).
-    "cf_spectral": lambda cfg: CharFnSpectral(M=cfg["compress_degree"]),
+    # `spectral_reference` picks the Fourier residual's reference law (null / plugin /
+    # gaussian; the gaussian one runs under the order-`mixture_order` probit mixture).
+    "cf_spectral": lambda cfg: CharFnSpectral(
+        M=cfg["compress_degree"], reference=cfg["spectral_reference"],
+        mixture_order=cfg["mixture_order"],
+    ),
     # spectral_gaussian: the same spectral Q2 update with each row's offset law replaced by
     # its moment-matched Gaussian N(0, V_i) (no per-effect CF factors).
     "spectral_gaussian": lambda cfg: CharFnSpectral(
-        M=cfg["compress_degree"], offset_law="gaussian"
+        M=cfg["compress_degree"], offset_law="gaussian",
+        reference=cfg["spectral_reference"], mixture_order=cfg["mixture_order"],
     ),
 }
 
@@ -130,6 +136,7 @@ _DEFAULTS = {
     "effect_quadrature_points": 15,
     "mixture_order": 5,  # components of the probit_mixture / pg_mixture logistic tables
     "compress_degree": 48,  # Chebyshev degree M for the compress/cf offset tables
+    "spectral_reference": "null",  # cf_spectral residual reference: "null" | "plugin" | "gaussian"
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
@@ -159,6 +166,21 @@ PRESETS = {
     # no GH over b. On a two-level (0/1, possibly centered) design each Newton step costs
     # O(p ntau) independent of n; on any other dense design, O(n p ntau) per entry.
     "cf_cavi_spectral": {"variational_family": "gaussian", "offset_integration": "cf_spectral"},
+    # the same fixed point with the plug-in point mass as the Fourier residual's reference
+    # (the sum carries only the gIBSS plug-in error, so the grid ladder stops lower)...
+    "cf_cavi_spectral_plugin": {
+        "variational_family": "gaussian",
+        "offset_integration": "cf_spectral",
+        "spectral_reference": "plugin",
+    },
+    # ...or the moment-matched Gaussian under the order-8 probit-mixture cumulant (the
+    # residual is the offset's non-Gaussian part; the Gaussian kernel tail shortens Tmax).
+    "cf_cavi_spectral_gaussref": {
+        "variational_family": "gaussian",
+        "offset_integration": "cf_spectral",
+        "spectral_reference": "gaussian",
+        "mixture_order": 8,
+    },
     # its Gaussian-offset counterpart: identical kernel and grid, offset law N(0, V_i).
     "spectral_gaussian_offset": {
         "variational_family": "gaussian",
