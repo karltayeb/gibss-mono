@@ -27,7 +27,6 @@ from .engine import (
     Message,
     Schedule,
     add_message_index_step,
-    check_alpha_skl_convergence_step,
     check_skl_convergence_step,
     replace_effect_in_gibss_state,
     subtract_message_index_step,
@@ -1842,20 +1841,15 @@ def update_effect_index_step(data, l, state):
 
 
 def check_glm_convergence_step(data, prev_state, state):
-    """Sweep-level convergence for the GLM families. Kernels whose per-column fit is exact
-    given the offset (quad / jj / vi / vi_gh / plain linear) converge on alpha alone: once
-    the selection stops moving, (mu, var) have followed. The row-parameterized global
-    schemes (globaljj's tilt, IRLS's anchor) are different: the engine-tuned row parameter
-    and the posterior co-converge, linearly and slowly (a saturated PIP freezes alpha at
-    sweep 1 while mu is still a third of the way to its fixed point, contraction ~0.7-0.85
-    per sweep), so they converge on the full distributional SKL (alpha AND the Gaussian
-    moments), the only statistic that sees the parameter still moving."""
-    check = (
-        check_skl_convergence_step
-        if _row_param_retuned(state.family_state)
-        else check_alpha_skl_convergence_step
-    )
-    return check(data, prev_state, state)
+    """Sweep-level convergence for the GLM families: the full distributional SKL between the
+    sweep's start and end (alpha AND the alpha-weighted Gaussian moments, plus the random
+    intercept when enabled). Alpha alone is not enough. Each per-column fit is exact given
+    its offset, but at L > 1 the offsets are coupled: effect l's (mu, var) feeds the other
+    effects' offsets, so a saturated selection freezes alpha at sweep 1 or 2 while the
+    effect sizes are still moving and the ELBO still climbing. The row-parameterized
+    schemes (globaljj's tilt, IRLS's anchor) add a second slow mode on top of that, the
+    engine-tuned row parameter co-converging with the posterior; the moment SKL sees both."""
+    return check_skl_convergence_step(data, prev_state, state)
 
 
 def default_schedule() -> Schedule:

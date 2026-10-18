@@ -215,19 +215,23 @@ def test_q1_point_intercept_matches_bruteforce():
 
 
 def test_gibss_q1_does_not_beat_cavi():
-    # The invariant this guards: CAVI maximizes F, so ELBO(CAVI) >= ELBO(gIBSS) up to local
-    # optima. It broke when the Q1 fold dropped a point intercept's spread -- the plug-in
-    # gIBSS-Q1 ELBO was inflated ~0.5 nat and spuriously beat every CAVI fit. (test_family_
-    # ordering only covered the Q2 plug-in path, which folds b0 via offset_var.)
+    # The invariant this guards: CAVI maximizes F over its family, so ELBO(CAVI) >=
+    # ELBO(gIBSS) within the SAME family, up to local optima. It broke when the Q1 fold
+    # dropped a point intercept's spread -- the plug-in gIBSS-Q1 ELBO was inflated ~0.5 nat
+    # and spuriously beat every CAVI fit. (test_family_ordering only covered the Q2 plug-in
+    # path, which folds b0 via offset_var.) Across families there is no such ordering: Q1
+    # contains Q2, so a fully converged gIBSS-Q1 fit sits a few mnats ABOVE the Q2 CAVI
+    # optimum on this problem.
     X, y = _bern_data(0)
     data = glm.prep_data(X, y, center=False)
     kw = _fit_kw(max_iter=500, tol=1e-12)
     e_gibss_q1 = compute_elbo(data, fit_glm_susie(X, y, L=2, **kw))  # gIBSS in Q1
     e_cavi_q1 = compute_elbo(data, fit_glm_susie(X, y, L=2, offset_integration="compress_selfnorm", **kw))
+    e_gibss_q2 = compute_elbo(data, fit_glm_susie(X, y, L=2, method="gibss_gaussian", **kw))
     e_cavi_q2 = compute_elbo(data, fit_glm_susie(X, y, L=2, method="cf_cavi", **kw))
     slack = 1e-3
     assert e_cavi_q1 >= e_gibss_q1 - slack
-    assert e_cavi_q2 >= e_gibss_q1 - slack
+    assert e_cavi_q2 >= e_gibss_q2 - slack
 
 
 def test_l1_q2_matches_bruteforce():
