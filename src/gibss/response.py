@@ -10,7 +10,8 @@ ResponseModel exposes it as three functions of the linear predictor:
       weight : Newton/Laplace curvature >0 -- Fisher / MM majorizer (Hessian)
 
 `aux` is the per-observation auxiliary data (y for Bernoulli/Poisson, the pair
-`(y, n_trials)` for Binomial, the log-likelihood ratio `llr` for the two-group marginal;
+`(y, n_trials)` for Binomial, `(y, dispersion)` for NegativeBinomial, the log-likelihood
+ratio `llr` for the two-group marginal;
 the smoother's contract for `Smoothed`). It may be any pytree of per-row arrays: the
 kernels and smoothers broadcast it leaf-wise and never look inside, so a family that
 needs two per-row arrays (Binomial) rides through unchanged. Responses are stateless
@@ -60,6 +61,7 @@ __all__ = [
     "JJFixed",
     "LogNormal",
     "MixtureGH",
+    "NegativeBinomial",
     "PGMixture",
     "Poisson",
     "ProbitMixture",
@@ -2171,6 +2173,75 @@ class Binomial(Bernoulli):
         t = template[0] if isinstance(template, tuple) else template
         z = jnp.zeros_like(jnp.asarray(t))
         return z, jnp.ones_like(z)
+
+
+@dataclass(frozen=True)
+class NegativeBinomial(Bernoulli):
+    """Negative binomial counts, log link, KNOWN (plug-in) dispersion: y_i ~ NB(mean
+    mu_i = e^{eta_i}, size r_i), Var y_i = mu_i + mu_i^2 / r_i. aux = (y, r), both per-row
+    ((n,) arrays; r may be a scalar).
+
+    In eta the NB log-likelihood is the LOGISTIC cumulant at a shifted predictor:
+
+        loglik = y * eta' - (y + r) * softplus(eta'),    eta' = eta - log r,
+
+    up to the eta-free base measure lgamma(y + r) - lgamma(r) - lgamma(y + 1) (which
+    `elbo._base_measure` adds back). So an NB row is a Binomial row with y + r non-integer
+    "trials" and success probability sigmoid(eta') = mu / (mu + r). The scale y + r depends
+    on the data but not on eta, and every scheme that scales the unit logistic cumulant per
+    trial (the `isinstance(base, Bernoulli)` gates: the JJ bounds, the CF offset tables, the
+    probit / PG mixtures, the spectral kernel) applies unchanged -- NB inherits the whole
+    logistic menu, while the Poisson analytic paths (`PoissonLogNormalOffset`,
+    `shift_sums`) do not apply (the cumulant is not `exp`).
+
+    The shift -log r is NOT applied inside `terms`: the kernels evaluate every family at the
+    predictor they are handed, and the offset tables are folded in that same variable, so the
+    shift rides in the fixed per-row offset (`GLMFamilyState.glm_offset`; `glm.initialize_state`
+    adds -log r to it when `data.dispersion` is set). A scalar r would be absorbed by a shared
+    intercept anyway; the explicit offset keeps `intercept_value` = log mean at the null and
+    makes a per-row r_i (edgeR / DESeq2 dispersions) work.
+
+    The dispersion is a plug-in, as in edgeR / DESeq2: estimated once under the null model
+    (`negbin.estimate_null_dispersion`) or supplied, and never moved by the sweeps. It must
+    stay OUT of this frozen dataclass (a jit static arg: a float here would recompile every
+    kernel per value) -- it rides in the aux as a traced array.
+
+    Scale caveat: the per-row scale y + r multiplies the approximation error of every scheme
+    that is not exact on the unit cumulant -- the Q2 Chebyshev / CF tables (cf_cavi,
+    compress_cavi: fine to scale ~1e4, wrong by 1e6) and the JJ bound (localjj / globaljj:
+    already loose at 1e4). The exact-GH Q1 kernel (the default 'logistic' quad kernel) and
+    the spectral kernel (cf_cavi_spectral / spectral_point_offset / spectral_gaussian_offset:
+    clean 1/r convergence to the Poisson fit through scale 1e6) have no such term. Realistic
+    dispersions (r in 0.1 .. 100) with moderate counts are far inside every scheme's safe
+    range; near-Poisson data (`estimate_null_dispersion` at its cap) or very large counts
+    want `family="poisson"`, whose kernels are analytic."""
+
+    def terms(self, eta, aux):
+        y, r = aux
+        n = y + r  # the per-row scale of the logistic cumulant
+        s = jax.nn.sigmoid(eta)
+        return y * eta - n * jax.nn.softplus(eta), y - n * s, n * s * (1.0 - s)
+
+    def unpack(self, aux):
+        y, r = aux
+        return y, y + r
+
+    def cumulant_terms(self, eta):
+        return Bernoulli.terms(self, eta, jnp.zeros_like(eta))  # per unit of scale
+
+    def unit_aux(self, template):
+        # observation 0 with dispersion 1: scale y + r = 1, the unit cumulant
+        t = template[0] if isinstance(template, tuple) else template
+        z = jnp.zeros_like(jnp.asarray(t))
+        return z, jnp.ones_like(z)
+
+    @staticmethod
+    def base_measure(y, r):
+        """The eta-free constant `sum_i [lgamma(y_i + r_i) - lgamma(r_i) - lgamma(y_i + 1)]`
+        that turns `terms()[0]` (at eta' = eta - log r) into the full NB log pmf."""
+        gl = jax.scipy.special.gammaln
+        y, r = jnp.asarray(y), jnp.broadcast_to(jnp.asarray(r), jnp.shape(y))
+        return jnp.sum(gl(y + r) - gl(r) - gl(y + 1.0))
 
 
 @dataclass(frozen=True)

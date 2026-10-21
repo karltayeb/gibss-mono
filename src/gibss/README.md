@@ -6,6 +6,9 @@
 >   / Poisson / linear GLM SuSiE and the named variants (localjj, globaljj, irls,
 >   score, ...); see `gibss.methods.PRESETS`. Binomial(n_i, p_i) responses: pass the
 >   success counts as `y` and the trial counts as `trials=` (every method applies).
+>   Negative binomial counts: `family="negative_binomial"` with a plug-in dispersion
+>   (estimated once under the null model, or `dispersion=` a number / per-row array);
+>   it is the logistic cumulant at `eta - log r`, so every logistic method applies.
 >   Fixed covariates: `covariates=Z` (dense (n, k)) adjusts for Z with one Gaussian
 >   nuisance factor over (intercept, gamma) -- shared-intercept mode, plug-in and
 >   exact Q2 CAVI, dense and sparse X; also on `cox_poisson.fit_cox_susie`.

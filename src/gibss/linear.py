@@ -77,6 +77,11 @@ class LinearData:
     # single-observation family (Bernoulli y in {0,1}, Poisson counts, Gaussian). The GLM
     # engine packs `(y, n_trials)` as the kernels' observation leaf when set.
     n_trials: Any = None
+    # NegativeBinomial plug-in dispersion r_i (size; Var y = mu + mu^2/r), (n,) or None for
+    # every other family. The GLM engine packs `(y, dispersion)` as the observation leaf and
+    # carries the link shift -log r_i in `GLMFamilyState.glm_offset` (see
+    # `response.NegativeBinomial`). Fixed for the whole fit: a plug-in, never re-estimated.
+    dispersion: Any = None
     # Pre-centering (unweighted column means), applied ONCE up front. This is a
     # fixed reparameterization -- distinct from the per-iteration *weighted*
     # centering (family_state `center`). For dense X the columns are centered
@@ -111,12 +116,16 @@ def _column_means(X) -> Any:
 
 
 def prep_data(
-    X, y, center: bool | None = None, obs_variance=None, n_trials=None, covariates=None
+    X, y, center: bool | None = None, obs_variance=None, n_trials=None, covariates=None,
+    dispersion=None,
 ) -> LinearData:
     """Prepare data for the SER engines.
 
     `n_trials` (Binomial only): per-row trial counts, (n,) or a scalar broadcast to every
     row; `y` is then the success count, 0 <= y_i <= n_i. Leave None for every other family.
+
+    `dispersion` (NegativeBinomial only): the plug-in NB size r_i > 0, (n,) or a scalar
+    broadcast to every row; `y` is then a count >= 0. Leave None for every other family.
 
     `covariates` (GLM engine): a dense (n, k) matrix Z of fixed covariates to adjust for,
     fit jointly with the intercept as one Gaussian nuisance factor (unpenalized, diffuse
@@ -157,9 +166,17 @@ def prep_data(
             raise ValueError("n_trials must be positive on every row")
         if not bool(jnp.all((y >= 0) & (y <= n_trials))):
             raise ValueError("Binomial response needs 0 <= y_i <= n_trials_i on every row")
+    if dispersion is not None:
+        if n_trials is not None:
+            raise ValueError("n_trials (Binomial) and dispersion (NegativeBinomial) are exclusive")
+        dispersion = jnp.broadcast_to(jnp.asarray(dispersion, dtype=y.dtype), y.shape)
+        if not bool(jnp.all(jnp.isfinite(dispersion) & (dispersion > 0))):
+            raise ValueError("dispersion must be finite and positive on every row")
+        if not bool(jnp.all(y >= 0)):
+            raise ValueError("NegativeBinomial response needs counts y_i >= 0 on every row")
     return LinearData(
         X=X, y=y, obs_variance=obs_variance, n_trials=n_trials, column_center=column_center,
-        covariates=_prep_covariates(covariates, y.shape[0]),
+        covariates=_prep_covariates(covariates, y.shape[0]), dispersion=dispersion,
     )
 
 

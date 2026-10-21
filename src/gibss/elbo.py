@@ -63,6 +63,7 @@ from .response import (
     CompressSelfNorm,
     Gaussian,
     MixtureGH,
+    NegativeBinomial,
     Poisson,
     ResponseModel,
     Smoothed,
@@ -91,13 +92,16 @@ class ELBOBreakdown:
 def _base_measure(base: ResponseModel, y) -> float:
     """The eta-free additive constant `c(y)` that turns `terms()[0] = y*eta - A(eta)` into
     the full log-likelihood `log p(y | eta)`. Bernoulli: 0. Binomial: `sum log C(n, y)`.
-    Poisson: `-sum log(y!)`. Gaussian: `-n/2 log(2 pi sigma^2)`. Unknown families: 0 (the
-    ELBO is then correct only up to an additive constant -- fine for comparing two fits on
-    the SAME data). `y` is the observation leaf (`(y, n_trials)` for Binomial)."""
+    Poisson: `-sum log(y!)`. NegativeBinomial: `sum [lgamma(y+r) - lgamma(r) - lgamma(y+1)]`.
+    Gaussian: `-n/2 log(2 pi sigma^2)`. Unknown families: 0 (the ELBO is then correct only
+    up to an additive constant -- fine for comparing two fits on the SAME data). `y` is the
+    observation leaf (`(y, n_trials)` for Binomial, `(y, dispersion)` for NegativeBinomial)."""
     if isinstance(base, Binomial):  # before Bernoulli: Binomial subclasses it
         y, n = jnp.asarray(y[0]), jnp.asarray(y[1])
         gl = jax.scipy.special.gammaln
         return float(jnp.sum(gl(n + 1.0) - gl(y + 1.0) - gl(n - y + 1.0)))
+    if isinstance(base, NegativeBinomial):  # before Bernoulli: it subclasses it too
+        return float(NegativeBinomial.base_measure(y[0], y[1]))
     y = jnp.asarray(y)
     if isinstance(base, Bernoulli):
         return 0.0

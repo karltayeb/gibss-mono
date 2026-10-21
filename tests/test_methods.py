@@ -162,6 +162,10 @@ def test_every_preset_runs_on_sparse(method):
     fam = PRESETS[method].get("family", "logistic")
     X, y = _data(fam)
     X = X * (np.random.default_rng(1).random(X.shape) < 0.4)  # genuinely sparse
+    if PRESETS[method].get("offset_integration", "").startswith(("cf_spectral", "spectral_")):
+        # the spectral kernel is defined on 0/1 set membership and rejects a sparse design
+        # with other stored values (its collapsed two-level form); binarize the support
+        X = (X != 0).astype(float)
     Xs = sparse.BCOO.fromdense(jax.numpy.asarray(X))
     st = fit_glm_susie(Xs, y, L=2, method=method, max_iter=30)
     assert st.family_state.background == "chebyshev"

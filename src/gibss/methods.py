@@ -17,11 +17,14 @@ family, Gaussian q without a smoothing scheme).
 
 from __future__ import annotations
 
+import warnings
+
 from . import glm
 from .cf_offset import CharFnGaussRef, CharFnOffset, CharFnSelfNorm
 from .cf_spectral import CharFnSpectral
 from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
+from .negbin import estimate_null_dispersion
 from .poisson_offset import PoissonLogNormalOffset, PoissonSelfNormOffset
 from .response import (
     GH,
@@ -36,6 +39,7 @@ from .response import (
     LogNormal,
     MacKay,
     MixtureGH,
+    NegativeBinomial,
     PGMixture,
     Poisson,
     ProbitMixture,
@@ -51,6 +55,10 @@ __all__ = ["PRESETS", "fit_glm_susie"]
 _FAMILIES = {
     "logistic": Bernoulli(),
     "binomial": Binomial(),  # y_i successes in trials_i; pass trials= (selects it by default)
+    # counts with a plug-in dispersion r (size): estimated under the null model unless
+    # dispersion= is given; the logistic cumulant at eta - log r, so every logistic scheme
+    # applies (see response.NegativeBinomial / negbin)
+    "negative_binomial": NegativeBinomial(),
     "poisson": Poisson(),
     "gaussian": Gaussian(),
 }
@@ -402,6 +410,36 @@ def _resolve(cfg):
     return response, "vi"
 
 
+def _resolve_dispersion(dispersion, y, offset, covariates):
+    """The NegativeBinomial plug-in r as a positive float or (n,) array: estimated under the
+    null model for None / "null", validated otherwise."""
+    import numpy as _np
+
+    if dispersion is None or (isinstance(dispersion, str) and dispersion == "null"):
+        est = estimate_null_dispersion(y, offset=offset, covariates=covariates)
+        if est.at_cap:
+            warnings.warn(
+                f"the null-model NB dispersion ran to its cap (r = {est.dispersion:.4g}): the "
+                "counts show no overdispersion beyond Poisson. The fit proceeds with the capped "
+                "plug-in (NB at this r is Poisson to O(mu^2/r)); family='poisson' is the "
+                "better model for these data (exact, and cheaper).",
+                stacklevel=3,
+            )
+        return est.dispersion
+    if isinstance(dispersion, str):
+        raise ValueError(f"dispersion must be 'null', a number or an (n,) array; got {dispersion!r}")
+    r = _np.asarray(dispersion, dtype=float)
+    if r.ndim == 1 and r.shape[0] != _np.shape(y)[0]:
+        raise ValueError(
+            f"dispersion as a per-row vector must have length n={_np.shape(y)[0]} (got {r.shape[0]})"
+        )
+    if r.ndim > 1:
+        raise ValueError(f"dispersion must be a scalar or a length-n vector; got shape {r.shape}")
+    if not _np.all(_np.isfinite(r) & (r > 0)):
+        raise ValueError("dispersion must be finite and positive")
+    return float(r) if r.ndim == 0 else r
+
+
 def fit_glm_susie(
     X,
     y,
@@ -423,6 +461,11 @@ def fit_glm_susie(
     # 'binomial' unless a family is named. Every method/kernel applies: the logistic
     # cumulant scales per trial, so a Binomial fit equals the Bernoulli fit on the
     # row-expanded data.
+    dispersion=None,  # NegativeBinomial: the plug-in size r. None (with the family named) or
+    # "null" = estimate it once under the null model (intercept + covariates + offset,
+    # negbin.estimate_null_dispersion); a number or an (n,) array = use as given (e.g. edgeR /
+    # DESeq2 dispersions). A number/array selects family='negative_binomial' unless a family
+    # is named. Never updated by the sweeps.
     offset=0.0,  # fixed per-row offset (Poisson exposure, etc.)
     covariates=None,  # fixed (n, k) covariates Z, fit jointly with the intercept (see below)
     prior_variance=1.0,
@@ -453,6 +496,9 @@ def fit_glm_susie(
         fit_glm_susie(X, y)                          # logistic SuSiE
         fit_glm_susie(X, y, method="localjj")        # classic localjj
         fit_glm_susie(X, y, trials=n)                # Binomial(n_i, p_i) SuSiE
+        fit_glm_susie(X, y, family="negative_binomial",
+                      offset=log_size_factor)        # NB SuSiE, null-model plug-in r
+        fit_glm_susie(X, y, dispersion=r_hat)        # NB SuSiE at a given r (or per-row r_i)
         fit_glm_susie(X, y, family="poisson",
                       intercept="profiled")          # profiled Poisson SuSiE
         fit_glm_susie(X, y, family=Smoothed(Bernoulli(), GH(5)))  # object escape
@@ -531,9 +577,23 @@ def fit_glm_susie(
     family_named = "family" in explicit or (method is not None and "family" in PRESETS[method])
     if trials is not None and not family_named:
         cfg["family"] = "binomial"  # trials= means Binomial unless the family is spelled out
+    if dispersion is not None and not family_named:
+        cfg["family"] = "negative_binomial"  # likewise dispersion= means NegativeBinomial
 
     response, kernel = _resolve(cfg)
     base = response.base if isinstance(response, Smoothed) else response
+    if isinstance(base, NegativeBinomial):
+        if trials is not None:
+            raise ValueError(
+                "trials= is the Binomial trial count; family='negative_binomial' takes dispersion=."
+            )
+        dispersion = _resolve_dispersion(dispersion, y, offset, covariates)
+    elif dispersion is not None:
+        raise ValueError(
+            f"dispersion= is the NegativeBinomial size, but the resolved family is "
+            f"{type(base).__name__}; use family='negative_binomial' (the default when "
+            "dispersion= is given) or drop dispersion=."
+        )
     if isinstance(base, Binomial) and trials is None:
         raise ValueError(
             "family='binomial' needs trials= (per-row trial counts n_i; y_i are the successes)."
@@ -589,7 +649,9 @@ def fit_glm_susie(
     if center is None:
         center = True
 
-    data = glm.prep_data(X, y, center=center, n_trials=trials, covariates=covariates)
+    data = glm.prep_data(
+        X, y, center=center, n_trials=trials, covariates=covariates, dispersion=dispersion
+    )
     init = (
         glm.initialize_state_mean_message if cfg["_mean_message"] else glm.initialize_state
     )

@@ -4,7 +4,8 @@
 likelihood; this module wraps it as a `gibss` engine family so a full SuSiE runs on
 *any* `ResponseModel`. Logistic SuSiE is `GLM(Bernoulli())`, Poisson SuSiE is
 `GLM(Poisson())`, Binomial(n_i, p_i) SuSiE is `GLM(Binomial())` with the trial counts on
-`data.n_trials` -- the same code path, only the response differs.
+`data.n_trials`, negative binomial SuSiE is `GLM(NegativeBinomial())` with the plug-in
+dispersion on `data.dispersion` -- the same code path, only the response differs.
 
 The two-group enrichment model has its own module (`twogroup`) because it needs an
 outer f0/f1 M-step and the special after-effects intercept ordering (its intercept is
@@ -57,6 +58,7 @@ from .response import (
     Binomial,
     Compress,
     CompressSelfNorm,
+    NegativeBinomial,
     Poisson,
     ResponseModel,
     Smoothed,
@@ -179,8 +181,14 @@ class GLMFamilyState:
     node_intercept: str = "linear"
     # glm_offset: fixed (or family-refreshed) per-row BASE offset added to the linear
     # predictor: exposure offsets for Poisson, the Breslow log-cumulative-hazard for
-    # cox_poisson (refreshed each sweep by its update_breslow_step). Scalar 0.0 = none.
+    # cox_poisson (refreshed each sweep by its update_breslow_step), and for NegativeBinomial
+    # the link shift -log r_i that `initialize_state` adds (the NB log-likelihood is the
+    # logistic cumulant at eta - log r; see `response.NegativeBinomial`). Scalar 0.0 = none.
     glm_offset: object = 0.0
+    # dispersion: the NegativeBinomial plug-in size r (scalar, or (n,) per row), recorded
+    # from `data.dispersion` at `initialize_state` for reporting; the kernels read it from
+    # the data. None for every other family.
+    dispersion: object = None
     # row_param: the smoother's per-row engine-tuned parameter (JJFixed: the tilt
     # xi = sqrt(E[eta]^2 + V[eta]), globaljj-style; TaylorFixed: the expansion anchor
     # zhat, IRLS "update" or score "null"), refreshed by update_row_param_step from
@@ -434,11 +442,17 @@ def _response_aux(data):
     matches the response). Everything downstream broadcasts it leaf-wise."""
     y = jnp.asarray(data.y)
     n_trials = getattr(data, "n_trials", None)
-    return y if n_trials is None else (y, jnp.asarray(n_trials))
+    if n_trials is not None:
+        return y, jnp.asarray(n_trials)
+    dispersion = getattr(data, "dispersion", None)
+    if dispersion is not None:
+        return y, jnp.asarray(dispersion)
+    return y
 
 
 def _check_trials(data, response):
-    """A Binomial response needs `data.n_trials`; any other response must not carry it."""
+    """A Binomial response needs `data.n_trials` and a NegativeBinomial response needs
+    `data.dispersion`; any other response must carry neither."""
     base = response.base if isinstance(response, Smoothed) else response
     has = getattr(data, "n_trials", None) is not None
     if isinstance(base, Binomial) and not has:
@@ -451,6 +465,29 @@ def _check_trials(data, response):
             f"data carries n_trials but the response is {type(base).__name__}; use the "
             "Binomial response (family='binomial') or drop the trial counts."
         )
+    has_r = getattr(data, "dispersion", None) is not None
+    if isinstance(base, NegativeBinomial) and not has_r:
+        raise ValueError(
+            "NegativeBinomial response needs the plug-in dispersion: prep_data(X, y, "
+            "dispersion=...) (front door: fit_glm_susie(X, y, family='negative_binomial'), "
+            "which estimates it under the null model unless dispersion= is given)."
+        )
+    if has_r and not isinstance(base, NegativeBinomial):
+        raise ValueError(
+            f"data carries a dispersion but the response is {type(base).__name__}; use the "
+            "NegativeBinomial response (family='negative_binomial') or drop it."
+        )
+
+
+def _nb_link_shift(data, fs):
+    """NegativeBinomial: the kernels work in eta' = eta - log r, so the link shift -log r_i
+    joins the fixed offset once, at state construction, and the plug-in dispersion is
+    recorded on the family state. No-op for every other family."""
+    r = getattr(data, "dispersion", None)
+    if r is None:
+        return fs
+    r = jnp.asarray(r)
+    return replace(fs, glm_offset=jnp.asarray(fs.glm_offset) - jnp.log(r), dispersion=r)
 
 
 def _aux(data, state, include_intercept_var=True, include_ri_var=True):
@@ -972,6 +1009,7 @@ def initialize_state(data, L=1, response: ResponseModel = Bernoulli(), family_st
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
     _check_trials(data, response)
     fs = _init_nuisance(data, _init_random_intercept(GLMFamilyState(**kw), n))
+    fs = _nb_link_shift(data, fs)
     _check_covariates(data, fs)
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],
@@ -996,6 +1034,7 @@ def initialize_state_mean_message(data, L=1, response: ResponseModel = Bernoulli
     kw = {"response": response, **({} if family_state_kwargs is None else dict(family_state_kwargs))}
     _check_trials(data, response)
     fs = _init_nuisance(data, _init_random_intercept(GLMFamilyState(**kw), n))
+    fs = _nb_link_shift(data, fs)
     _check_covariates(data, fs)
     state = GIBSSState(
         single_effects=[_empty_effect(p, prior_variance) for _ in range(L)],

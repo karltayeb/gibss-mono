@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Generic, TypeVar
 
-import jax
 import numpy as np
 import jax.numpy as jnp
 

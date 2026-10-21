@@ -16,7 +16,7 @@ import numpy as np
 import jax.numpy as jnp
 import polars as pl
 
-from .response import Poisson, Smoothed
+from .response import Smoothed
 
 __all__ = ["FitSummary", "summarize_fit"]
 
@@ -24,7 +24,13 @@ __all__ = ["FitSummary", "summarize_fit"]
 # Matches the greedy-L stopping threshold (`fit_ibss_greedy` tol_L).
 _ACTIVE_LOG_BF = 1.0
 
-_FAMILY = {"Bernoulli": "logistic", "Poisson": "poisson", "Gaussian": "gaussian"}
+_FAMILY = {
+    "Bernoulli": "logistic",
+    "Binomial": "binomial",
+    "NegativeBinomial": "negative_binomial",
+    "Poisson": "poisson",
+    "Gaussian": "gaussian",
+}
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,8 @@ class FitSummary:
     random_intercept: str | None = None
     # fixed covariates (if any): one row per column of Z -- posterior mean and sd of gamma.
     covariates: pl.DataFrame | None = None
+    # NegativeBinomial: the plug-in dispersion (size r) the fit used; None otherwise.
+    dispersion: str | None = None
 
     def __repr__(self) -> str:
         head = [
@@ -56,6 +64,8 @@ class FitSummary:
         ]
         if self.random_intercept is not None:
             head.append(f"  random intercept: {self.random_intercept}")
+        if self.dispersion is not None:
+            head.append(f"  dispersion (plug-in): {self.dispersion}")
         if self.covariates is not None:
             cov = "  ".join(
                 f"{r['covariate']}={r['mean']:.3g} +/- {r['sd']:.3g}"
@@ -111,6 +121,16 @@ def _covariate_table(fs, names: Sequence[str] | None) -> pl.DataFrame | None:
     if len(labels) != k:
         raise ValueError(f"covariate_names has {len(labels)} entries for {k} covariates.")
     return pl.DataFrame({"covariate": labels, "mean": gamma, "sd": sd})
+
+
+def _dispersion_header(fs) -> str | None:
+    r = getattr(fs, "dispersion", None)
+    if r is None:
+        return None
+    a = np.asarray(r)
+    if a.ndim == 0 or np.all(a == a.flat[0]):
+        return f"r={float(a.flat[0]):.4g}"
+    return f"per-row (median r={float(np.median(a)):.4g})"
 
 
 def _random_intercept_header(fs) -> str | None:
@@ -252,6 +272,7 @@ def summarize_fit(
         coverage=coverage,
         random_intercept=_random_intercept_header(fs),
         covariates=_covariate_table(fs, covariate_names),
+        dispersion=_dispersion_header(fs),
     )
 
 
