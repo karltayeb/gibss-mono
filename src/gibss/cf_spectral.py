@@ -68,8 +68,12 @@ and the reference factor depend on the row only through membership in `B_j`, so
 
 `zeta` the reference's own row factor (phi, 1 or gamma), `S, Z` the group sums over `B_j`
 and its complement from ONE `M^T B` (Sp)MM per effect update. Each Newton step on `(m,
-s)` is then O(p ntau), with no `n` in it. A dense continuous design collapses the same
-way after interpolating `h` in x at Chebyshev nodes of each column's range
+s)` is then O(p ntau), with no `n` in it. A design whose columns take a FEW values (a
+dosage matrix in 0/1/2, a categorical code) collapses the same way over its K levels
+(`LevelDesign`): one `M^T B_k` product per nonzero level `k` -- O(nnz ntau) in all on a
+BCOO, exactly -- with the baseline level (each column's most common value; the implicit
+zero of a BCOO) as the complement and the reference's anchor. A dense continuous design
+collapses after interpolating `h` in x at Chebyshev nodes of each column's range
 (`ChebDesign`), or runs per entry (`DenseDesign`, O(n p ntau) per step).
 
 The grid ladder
@@ -93,12 +97,14 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import sparse as jsparse
 from jax.ops import segment_sum
 
 from ._numerics import _ndtr
 from .cf_offset import (
     CharFnOffset,
+    _binary_matmul,
     _effect_cf,
     _frequency_grid,
     _mixture_tail_Tmax,
@@ -116,6 +122,8 @@ __all__ = [
     "CharFnSpectral",
     "ChebDesign",
     "DenseDesign",
+    "LevelDesign",
+    "MAX_LEVELS",
     "Reference",
     "SpectralAux",
     "TwoLevelDesign",
@@ -127,6 +135,8 @@ __all__ = [
     "glm_spectral_ser",
     "grid_error",
     "ladder_ntau",
+    "level_design",
+    "level_factor",
     "ones_design",
     "spectral_ntau",
     "spectral_null_loglik",
@@ -188,12 +198,17 @@ class Reference:
 
 def _factor_ab(ref: Reference, u, ell):
     """`(a, b)` of the reference CF factor `q = exp(i t a m - t^2 b s^2 / 2)` at design
-    level `u`, anchored at `ell` (module docstring)."""
+    level `u`, anchored at `ell` (module docstring). The Gaussian reference's `b = u^2 -
+    ell^2` is floored at 0: a level closer to 0 than the anchor (a centered 0/1 column
+    present in more than half the rows, a dosage level below its baseline) would give the
+    reference law a negative variance `V + b s^2` -- not a law, its CF grows in t and the
+    closed form breaks down (NaN past `1 + s_k^2 w = 0`). `b = 0` keeps Q a Gaussian, so
+    the identity stays exact; only the residual is a little larger there."""
     if ref.kind == "null":
         return jnp.zeros_like(u), jnp.zeros_like(u)
     if ref.kind == "plugin":
         return u - ell, jnp.zeros_like(u)
-    return u - ell, u * u - ell * ell
+    return u - ell, jnp.maximum(u * u - ell * ell, 0.0)
 
 
 def _zeta(ref: Reference, aux):
@@ -266,6 +281,133 @@ def ones_design(n: int):
     return TwoLevelDesign(
         jnp.ones((n, 1)), jnp.zeros(1), jnp.ones(1), jnp.arange(n), jnp.zeros(n, dtype=int)
     )
+
+
+MAX_LEVELS = 16  # most distinct values per column a design may take and still collapse
+
+
+class LevelDesign(NamedTuple):
+    """A design whose columns take at most `MAX_LEVELS` distinct values, collapsed over
+    them: `levels` (K, p) are the values column j takes, level 0 its BASELINE (the most
+    common value; the implicit zero of a BCOO, `-c_j` centered) and the reference's anchor,
+    levels 1..K-1 its other values ascending (`active` (K, p) marks the ones a column
+    actually has; the rest repeat the baseline with empty groups). Group membership:
+    dense, `idx` (n, p) int8 holds each entry's level index; BCOO, `parts` holds one 0/1
+    BCOO (n, p) per nonzero level (their nnz sum to the design's). `rows, cols, lvl` index
+    the support set (every entry off its baseline) for the reference's closed-form sums;
+    `lo, hi` (p,) are the extreme values present (the grid's reach). The two-level case is
+    `TwoLevelDesign`, the same collapse without the level axis."""
+
+    idx: Any
+    parts: Any
+    levels: Any
+    active: Any
+    rows: Any
+    cols: Any
+    lvl: Any
+    lo: Any
+    hi: Any
+
+    @property
+    def K(self) -> int:
+        return self.levels.shape[0]
+
+
+def level_design(X, colmean=None, max_levels=MAX_LEVELS):
+    """The level collapse of a design (`LevelDesign`), or None if a column takes more than
+    `max_levels` distinct values. Dense: every column's values as they are (centered or
+    not), baseline = its mode. BCOO: the stored values (a dosage's 1/2, a code), baseline =
+    the implicit zero; `colmean` (p,) shifts every level by `-c_j` (the sparse path's
+    implicit centering). Built once per fit with NumPy (the data are concrete)."""
+    if isinstance(X, jsparse.BCOO):
+        return _level_design_bcoo(X, colmean, max_levels)
+    return _level_design_dense(np.asarray(X), max_levels)
+
+
+def _level_design_bcoo(X, colmean, max_levels):
+    n, p = X.shape
+    data = np.asarray(X.data)
+    idx = np.asarray(X.indices)
+    keep = data != 0.0  # an explicitly stored zero is the baseline
+    data, idx = data[keep], idx[keep]
+    vals = np.unique(data)
+    if vals.shape[0] > max_levels - 1:
+        return None
+    K = vals.shape[0] + 1
+    c = np.zeros(p) if colmean is None else np.asarray(colmean, dtype=float)
+    levels = np.empty((K, p))
+    levels[0] = -c
+    levels[1:] = vals[:, None] - c[None, :]
+    lvl = np.searchsorted(vals, data) + 1  # level index of every stored entry
+    counts = np.zeros((K, p))
+    np.add.at(counts, (lvl, idx[:, 1]), 1.0)
+    counts[0] = n - counts[1:].sum(0)
+    active = counts > 0
+    parts = tuple(
+        jsparse.BCOO(
+            (jnp.ones(int(np.sum(lvl == k))), jnp.asarray(idx[lvl == k])), shape=(n, p)
+        )
+        for k in range(1, K)
+    )
+    return _finish_level_design(None, parts, levels, active, idx[:, 0], idx[:, 1], lvl)
+
+
+def _level_design_dense(X, max_levels):
+    n, p = X.shape
+    shift = X.min(axis=0)
+    rel = X - shift[None, :]  # column values relative to the column minimum
+    vals = np.unique(rel)
+    if vals.shape[0] > max_levels:
+        return None
+    # global index of each entry's relative value, and per-column counts
+    gidx = np.zeros((n, p), dtype=np.int64)
+    counts = np.zeros((vals.shape[0], p))
+    for g, v in enumerate(vals):
+        hit = rel == v
+        gidx[hit] = g
+        counts[g] = hit.sum(0)
+    if int((counts > 0).sum(0).max()) > max_levels:
+        return None
+    base = np.argmax(counts, axis=0)  # the mode: the baseline level of each column
+    # per-column order: baseline first, then the column's other values ascending
+    key = np.where(np.arange(vals.shape[0])[:, None] == base[None, :], -1, counts * 0 + np.arange(vals.shape[0])[:, None])
+    key = np.where(counts > 0, key, np.inf)  # absent values sort last
+    order = np.argsort(key, axis=0, kind="stable")  # (G, p): global index at each slot
+    K = int((counts > 0).sum(0).max())
+    order = order[:K]
+    levels = np.take_along_axis(vals[:, None] + shift[None, :], order, axis=0)  # (K, p)
+    active = np.take_along_axis(counts, order, axis=0) > 0
+    levels = np.where(active, levels, levels[0][None, :])  # absent slots repeat the base
+    slot_of = np.full((vals.shape[0], p), 0, dtype=np.int64)
+    np.put_along_axis(slot_of, order, np.arange(K)[:, None] + np.zeros((K, p), dtype=np.int64), axis=0)
+    idx = np.take_along_axis(slot_of, gidx, axis=0).astype(np.int8)  # (n, p) level index
+    rows, cols = np.nonzero(idx != 0)
+    return _finish_level_design(idx, None, levels, active, rows, cols, idx[rows, cols].astype(np.int64))
+
+
+def _finish_level_design(idx, parts, levels, active, rows, cols, lvl):
+    present = np.where(active, levels, np.nan)
+    lo = np.nanmin(present, axis=0)
+    hi = np.nanmax(present, axis=0)
+    return LevelDesign(
+        None if idx is None else jnp.asarray(idx),
+        parts,
+        jnp.asarray(levels),
+        jnp.asarray(active.astype(float)),
+        jnp.asarray(np.asarray(rows)),
+        jnp.asarray(np.asarray(cols)),
+        jnp.asarray(np.asarray(lvl)),
+        jnp.asarray(lo),
+        jnp.asarray(hi),
+    )
+
+
+def _level_members(design, k):
+    """The 0/1 membership matrix of nonzero level `k` (dense (n, p) float, or the BCOO
+    part): the `B` of the `M^T B` product."""
+    if design.parts is not None:
+        return design.parts[k - 1]
+    return (design.idx == k).astype(jnp.float64) * design.active[k][None, :]
 
 
 class DenseDesign(NamedTuple):
@@ -428,7 +570,8 @@ def _edge(ref: Reference, M0, M1, M2, E0, E1, V0, ell, m, s):
     With `Dmu = mu_P - mu_Q` and `Ds2 = s_P^2 - s_Q^2` per row (module docstring), the
     limit is `sum_i s_i [-Ds2_i/2 - Dmu_i eta_i]` and the affine term `sum_i s_i Dmu_i /
     2`. Per reference, `Dmu = (u - a) m` and `Ds2 = (V - V_zeta) + (u^2 - a^2) m^2 + (u^2
-    - b) s^2`, which reduce to the moment combinations below."""
+    - b) s^2`, which reduce to the moment combinations below. For the per-entry dense
+    kernel (`ell = 0`, the only caller): `b = u^2` holds there, never floored."""
     if ref.kind == "null":  # a = b = 0, V_zeta = V
         dmu_eta, dmu, dq_m, dq_s, dV = E1, M1, M2, M2, 0.0
     elif ref.kind == "plugin":  # a = u - ell, b = 0, V_zeta = 0
@@ -437,6 +580,21 @@ def _edge(ref: Reference, M0, M1, M2, E0, E1, V0, ell, m, s):
     else:  # a = u - ell, b = u^2 - ell^2, V_zeta = V
         dmu_eta, dmu = ell * E0, ell * M0
         dq_m, dq_s, dV = 2.0 * ell * M1 - ell**2 * M0, ell**2 * M0, 0.0
+    return _edge_assemble(dmu_eta, dmu, dq_m, dq_s, dV, m, s)
+
+
+def _edge_level(ref: Reference, u, a, b, ng, eg, vg, m, s):
+    """`_edge` for one level of a collapsed design: every row in the group sits at the
+    same `u` with the reference's `(a, b)` (`_factor_ab`, so the Gaussian floor on `b` is
+    honored), and the group moments are `ng = sum s`, `eg = sum s eta`, `vg = sum s V`.
+    `Dmu = (u - a) m`, `Ds2 = (V - V_zeta) + (u^2 - a^2) m^2 + (u^2 - b) s^2`."""
+    dmu_eta, dmu = (u - a) * eg, (u - a) * ng
+    dq_m, dq_s = (u * u - a * a) * ng, (u * u - b) * ng
+    dV = vg if ref.kind == "plugin" else 0.0  # V_zeta = 0 under the plug-in, else V
+    return _edge_assemble(dmu_eta, dmu, dq_m, dq_s, dV, m, s)
+
+
+def _edge_assemble(dmu_eta, dmu, dq_m, dq_s, dV, m, s):
     zero = jnp.zeros_like(m)
     lim = jnp.stack(
         [
@@ -476,9 +634,10 @@ def _ref_weights(ref, aux, offset, s):
 
 
 class SupportClosed(NamedTuple):
-    """The reference's closed-form sum over a two-level design's support set: entry
-    `(rows[e], cols[e])` has row weight `sw`, offset `eta`, offset variance `V`, and the
-    column's anchored `a = hi - lo`, `b = hi^2 - lo^2`."""
+    """The reference's closed-form sum over a collapsed design's support set: entry `e`
+    (row `rows[e]`, column `cols[e]`) has row weight `sw`, offset `eta`, offset variance
+    `V`, and its anchored `(a, b)` from `_factor_ab` (two-level: at `hi` anchored at `lo`;
+    K-level: at its level anchored at the baseline)."""
 
     cols: Any
     sw: Any
@@ -503,10 +662,12 @@ def _closed_prepare(ref, design, aux, offset, s):
         return None
     if isinstance(design, TwoLevelDesign):
         r, c = design.rows, design.cols
-        return SupportClosed(
-            c, s[r], offset[r], aux.V[r], design.hi - design.lo,
-            design.hi**2 - design.lo**2,
-        )
+        a, b = _factor_ab(ref, design.hi, design.lo)
+        return SupportClosed(c, s[r], offset[r], aux.V[r], a[c], b[c])
+    if isinstance(design, LevelDesign):
+        r, c = design.rows, design.cols
+        a, b = _factor_ab(ref, design.levels[design.lvl, c], design.levels[0][c])
+        return SupportClosed(c, s[r], offset[r], aux.V[r], a, b)
     d = _dense_of(design)
     return EntryClosed(d.Xb, s, offset, aux.V)
 
@@ -557,7 +718,7 @@ def _closed_terms(ref, closed, m, s):
         return jnp.zeros((6, p))
     if isinstance(closed, SupportClosed):
         c = closed.cols
-        a, b = closed.a[c], closed.b[c]
+        a, b = closed.a, closed.b
         z = closed.eta + a * m[c]
         if ref.kind == "plugin":
             ch = _plugin_channels(z, a, closed.sw)
@@ -647,6 +808,37 @@ def _collapse(ref, design, aux, offset, base):
         jnp.stack([hi, lo]), S, Zs, jnp.stack([n1, n0]), jnp.stack([e1, e0]),
         jnp.stack([v1, v0]), lo, _closed_prepare(ref, design, aux, offset, s),
     )
+    return pre, ytil
+
+
+def _collapse_levels(ref, design, aux, offset, base):
+    """K-level collapse (`LevelDesign`): the group sums of every nonzero level from one
+    `M^T B_k` product each (`M` as in `_collapse`), the baseline's as the remainder of
+    the row totals. Exact: the levels ARE the column values."""
+    ntau = aux.phi.shape[1]
+    W, y, s = _row_weights(aux, offset, base)
+    Z = _ref_weights(ref, aux, offset, s)
+    cols = [jnp.real(W), jnp.imag(W)]
+    if Z is not None:
+        cols += [jnp.real(Z), jnp.imag(Z)]
+    cols.append(jnp.stack([s, s * offset, s * aux.V, y], axis=1))
+    M = jnp.concatenate(cols, axis=1)
+    tot = jnp.sum(M, axis=0)
+    K = design.K
+    R = [M.T @ _level_members(design, k) for k in range(1, K)]  # (c, p) each
+    R0 = tot[:, None] - sum(R)
+    R = jnp.stack([R0] + R)  # (K, c, p)
+    S = (R[:, :ntau] + 1j * R[:, ntau : 2 * ntau]).transpose(0, 2, 1)  # (K, p, ntau)
+    off = 2 * ntau
+    if Z is not None:
+        Zs = (R[:, off : off + ntau] + 1j * R[:, off + ntau : off + 2 * ntau]).transpose(0, 2, 1)
+        off += 2 * ntau
+    else:
+        Zs = S
+    ng, eg, vg, yg = R[:, off], R[:, off + 1], R[:, off + 2], R[:, off + 3]
+    u = design.levels
+    ytil = jnp.sum(u * yg, axis=0)  # sum_i y_i xt_ij
+    pre = LevelPre(u, S, Zs, ng, eg, vg, u[0], _closed_prepare(ref, design, aux, offset, s))
     return pre, ytil
 
 
@@ -746,6 +938,8 @@ def _prepare(ref, design, aux, offset, base):
         return _dense_prepare(ref, design, aux, offset, base)
     if isinstance(design, ChebDesign):
         return _cheb_prepare(ref, design, aux, offset, base)
+    if isinstance(design, LevelDesign):
+        return _collapse_levels(ref, design, aux, offset, base)
     return _collapse(ref, design, aux, offset, base)
 
 
@@ -769,7 +963,7 @@ def _level_sums(ref, pre, aux, m, s):
         Q = jnp.exp(1j * t * a * mm - 0.5 * t**2 * b * ss**2)
         QZ = Q * Z
         trap = trap - _channels(a, b, ss, t, jnp.real(QZ), jnp.imag(QZ), cv, c1, c2, 1)
-        lim_u, aff_u = _edge(ref, ng, u * ng, u * u * ng, eg, u * eg, vg, ell, m, s)
+        lim_u, aff_u = _edge_level(ref, u, a[:, 0], b[:, 0], ng, eg, vg, m, s)
         return (trap, lim + lim_u, aff + aff_u), None
 
     zero = jnp.zeros((6, m.shape[0]))
@@ -935,8 +1129,8 @@ def _newton_step(T, ytil, inv_pv, m, s):
 def glm_spectral_ser(design, aux, offset, prior_variance, base=Bernoulli(), ref=Reference(),
                      n_iter=100, tol=1e-8, init=None):
     """Gaussian-VI SER (CAVI in Q2) by Newton in `(m, s)` on the spectral surrogate:
-    collapsed on a `TwoLevelDesign` or `ChebDesign`, per entry on a `DenseDesign`, under
-    the reference `ref`.
+    collapsed on a `TwoLevelDesign`, `LevelDesign` or `ChebDesign`, per entry on a
+    `DenseDesign`, under the reference `ref`.
 
     `init = (m, v)` warm-starts the solve (default `(0, prior_variance)`, the vi_gh
     convention). Each Newton proposal is accepted only if it raises the column's
@@ -1015,6 +1209,39 @@ def glm_spectral_ser(design, aux, offset, prior_variance, base=Bernoulli(), ref=
     elbo_rel = jnp.where(ok, m * ytil - (T[0] - T00) - kl, 0.0)
     err = _grid_error(ref, design, aux, pre, m, s)
     return m, v, elbo_rel, kl, err
+
+
+# ----------------------------------------------------------------------------------------
+# K-level collapse: the per-effect CF factor
+# ----------------------------------------------------------------------------------------
+
+
+@jax.jit
+def level_factor(design, alpha, mu, var, tau):
+    """One effect's CF factor `phi_l,i(t) = sum_c alpha_c exp(i t x_ic mu_c - t^2 x_ic^2
+    var_c / 2)` on a `LevelDesign`, exactly, by the baseline + support split of
+    `cf_offset._binary_terms` per level: with `g_kc` the phase at level `u_kc`,
+
+        phi_l,i = sum_c alpha_c g_0c + sum_{k >= 1} sum_c B_k,ic alpha_c (g_kc - g_0c),
+
+    one `B_k @ D_k` (Sp)MM per nonzero level and no per-entry transcendental. Returns
+    (n, ntau) complex."""
+    t = tau[None, :]
+    lev = design.levels[..., None]  # (K, p, 1)
+    g = jnp.exp(1j * t * lev * mu[None, :, None] - 0.5 * t**2 * lev**2 * var[None, :, None])
+    a = alpha[None, :, None]
+    base = jnp.sum(a[0] * g[0], axis=0)  # (ntau,)
+    D = a * (g[1:] - g[0][None])  # (K - 1, p, ntau)
+    n = design.idx.shape[0] if design.parts is None else design.parts[0].shape[0]
+    phi = jnp.zeros((n, tau.shape[0]), jnp.complex128) + base[None, :]
+    for k in range(1, design.K):
+        phi = phi + _binary_matmul(_level_members(design, k), jnp.zeros_like(base), D[k - 1])
+    return phi
+
+
+def _level_factor_fn(design):
+    """The `factor` builder of `offset_cf` / `offset_cf_sparse` on a `LevelDesign`."""
+    return lambda x, alpha, mu, var, tau: level_factor(design, alpha, mu, var, tau)
 
 
 # ----------------------------------------------------------------------------------------
@@ -1193,7 +1420,9 @@ class _ReachMark:
 class CharFnSpectral(CharFnOffset):
     """CAVI in Q2 by the spectral effect update (module docstring): Newton in (m, s) on
     the fixed-grid Fourier surrogate, collapsed on a two-level design (0/1, possibly
-    centered) or a Chebyshev-in-x collapse of a dense design, per entry otherwise.
+    centered), on the levels of a few-valued design (`LevelDesign`: a 0/1/2 dosage, a
+    code; dense or BCOO, exact) or by a Chebyshev-in-x collapse of a dense continuous
+    design, per entry otherwise.
 
     `reference` picks the Fourier residual's reference law: "null" (the sum is the
     evidence itself), "plugin" (point mass at the plug-in shift, logistic cumulant) or
@@ -1252,19 +1481,23 @@ class CharFnSpectral(CharFnOffset):
 
     def design(self, X, colmean=None):
         """Cached kernel design for `X`: the two-level split when every column takes at
-        most two values (the collapsed kernel), else, for a dense `X`, the per-entry
-        `DenseDesign`. A sparse `X` must be two-level (0/1 set membership)."""
+        most two values, the level collapse when at most `MAX_LEVELS` (both exact, the
+        collapsed kernel), else, for a dense `X`, the per-entry `DenseDesign`. A sparse `X`
+        must collapse (at most `MAX_LEVELS - 1` distinct stored values)."""
         key = (id(X), None if colmean is None else id(colmean))
         hit = self._designs.get(key)
         if hit is not None and hit[0] is X:
             return hit[1]
         d = two_level_design(X, colmean)
         if d is None:
+            d = level_design(X, colmean)
+        if d is None:
             if isinstance(X, jsparse.BCOO):
                 raise ValueError(
-                    "offset_integration='cf_spectral' on a sparse design needs 0/1 set "
-                    "membership (every stored entry 1); pass a dense X for general values, "
-                    "or use method='cf_cavi'."
+                    "offset_integration='cf_spectral' on a sparse design needs columns with "
+                    f"at most {MAX_LEVELS} distinct values (0/1 set membership, a 0/1/2 "
+                    "dosage, a code); pass a dense X for continuous values, or use "
+                    "method='cf_cavi'."
                 )
             d = dense_design(X)
         self._designs[key] = (X, d)
@@ -1308,16 +1541,19 @@ class CharFnSpectral(CharFnOffset):
             # the plug-in: every offset (the effects' AND the intercept's) at its mean
             zero = jnp.zeros(n)
             return SpectralAux(y, jnp.ones((n, tau.shape[0]), jnp.complex128), zero, tau, wq, psi)
+        level = isinstance(design, LevelDesign)
         if sparse:
             phi, _, V = offset_cf_sparse(
                 X, effects, tau, n=n, offset_var=offset_var, colmean=colmean,
-                keys=keys, cache=memo,
+                keys=keys, cache=memo, factor=_level_factor_fn(design) if level else None,
             )
         else:
             eff = [(X,) + tuple(e) for e in effects]
             factor = None
             if isinstance(design, DenseDesign) and self.dense_kernel == "chebyshev":
                 factor = self._cheb_factor_fn(design, base, y, tau, wq, psi)
+            elif level:
+                factor = _level_factor_fn(design)
             phi, _, V = offset_cf(eff, tau, n=n, offset_var=offset_var, keys=keys,
                                   cache=memo, factor=factor)
         return SpectralAux(y, phi, V, tau, wq, psi)

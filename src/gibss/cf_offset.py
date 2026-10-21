@@ -805,7 +805,7 @@ def _effect_factor_sparse(X, alpha, mu, var, tau, colmean, binary, entry_chunk):
 
 def offset_cf_sparse(
     X, effects, tau, n=None, entry_chunk=1 << 15, offset_var=0.0,
-    colmean=None, feat_chunk=None, keys=None, cache=None,
+    colmean=None, feat_chunk=None, keys=None, cache=None, factor=None,
 ):
     """Zero-mean offset CF on a sparse (BCOO) design via the zero-clumping identity
 
@@ -819,7 +819,8 @@ def offset_cf_sparse(
     `segment_sum` over the BCOO entries, chunked (`entry_chunk`) to bound peak memory at
     `O(entry_chunk * ntau)`. `effects` is a list of `(alpha, mu, var)` (each (p,)); X is
     shared. Returns `(phi, s, V)` -- `phi` (n, ntau) centered. `keys`/`cache` memoize the
-    per-effect factors across tables (`_FactorCache`).
+    per-effect factors across tables (`_FactorCache`). `factor(X, alpha, mu, var, tau)`
+    replaces the per-effect builder on a non-0/1 design (as in `offset_cf`).
 
     Centering (`colmean` (p,) given): the off-support value is no longer 0 but `-c_j`,
     so the "1 +" collapse fails. Split the centered value into a row-independent baseline
@@ -849,9 +850,14 @@ def offset_cf_sparse(
         alpha, mu, var = jnp.asarray(alpha), jnp.asarray(mu), jnp.asarray(var)
         refs = (alpha, mu, var)
         mom = lambda r=refs: _sparse_effect_moments(op, *r, c_arr)  # noqa: E731
-        fac = lambda r=refs: _effect_factor_sparse(  # noqa: E731
-            X, *r, tau, c_arr, binary, entry_chunk
-        )
+        if factor is not None and not binary:
+            # a caller-supplied builder for a non-0/1 design (the spectral smoother's
+            # level collapse: one SpMM per level, no per-entry transcendental)
+            fac = lambda r=refs: factor(X, *r, tau)  # noqa: E731
+        else:
+            fac = lambda r=refs: _effect_factor_sparse(  # noqa: E731
+                X, *r, tau, c_arr, binary, entry_chunk
+            )
         if cache is None:
             mean, v = mom()
             f = fac()

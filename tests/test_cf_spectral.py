@@ -1,6 +1,7 @@
 """Spectral CAVI-in-Q2 effect update (`cf_spectral`): Newton in (m, s) on the fixed-grid
 Fourier surrogate, under the null / plug-in / Gaussian reference, collapsed on two-level
-designs and the Chebyshev-in-x collapse, per entry on general dense designs.
+designs, on the levels of few-valued designs (0/1/2 dosages) and the Chebyshev-in-x
+collapse, per entry on general dense designs.
 
 Ground truth is independent of every CF code path: the leave-one-out offset is a product
 of small Gaussian mixtures, so enumerating its components and adding the effect's own
@@ -27,9 +28,11 @@ from jax.experimental import sparse as jsparse
 from gibss._numerics import _ndtr
 from gibss.cf_offset import CharFnOffset, _effect_cf
 from gibss.cf_spectral import (
+    MAX_LEVELS,
     CharFnSpectral,
     ChebDesign,
     DenseDesign,
+    LevelDesign,
     Reference,
     _prepare,
     _spectral_terms,
@@ -40,6 +43,8 @@ from gibss.cf_spectral import (
     dense_design,
     glm_spectral_ser,
     ladder_ntau,
+    level_design,
+    level_factor,
     ones_design,
     spectral_null_loglik,
     two_level_design,
@@ -78,6 +83,11 @@ def _problem(rng, layout, n=14, p=4, L=2):
     B[0, :] = 1.0  # no empty column
     if layout in ("dense_continuous", "dense_cheb"):  # every entry distinct: no collapse
         B = rng.normal(size=(n, p)) * np.exp(rng.normal(size=p) * 0.5)
+    if "levels" in layout:  # a dosage: 0/1/2, one column 0/2 only, one column 0/1 only
+        B = rng.integers(0, 3, size=(n, p)).astype(float)
+        B[:, 1] = 2.0 * (B[:, 1] > 0)
+        B[:, 2] = (B[:, 2] > 1) * 1.0
+        B[:3, 0] = [0.0, 1.0, 2.0]  # every level present in column 0
     c = B.mean(0)
     others = []
     for _ in range(L):
@@ -141,7 +151,8 @@ def _setup(layout, family, ref, seed=0):
 
 
 LAYOUTS = ["dense01", "dense_centered", "bcoo", "bcoo_centered", "dense_continuous",
-           "dense_cheb"]
+           "dense_cheb", "dense_levels", "dense_levels_centered", "bcoo_levels",
+           "bcoo_levels_centered"]
 
 
 @pytest.mark.parametrize("ref", REFS, ids=REF_IDS)
@@ -276,11 +287,118 @@ def test_two_level_design_detection():
     assert two_level_design(jsparse.BCOO.fromdense(jnp.asarray(2.0 * B))) is None
     sm = CharFnSpectral()
     assert isinstance(sm.design(jnp.asarray(rng.normal(size=(20, 5)))), DenseDesign)
-    with pytest.raises(ValueError, match="0/1 set membership"):
-        sm.design(jsparse.BCOO.fromdense(jnp.asarray(2.0 * B)))
+    # a {0, 2} BCOO is not 0/1 membership but it IS two-valued: the level collapse takes it
+    assert isinstance(sm.design(jsparse.BCOO.fromdense(jnp.asarray(2.0 * B))), LevelDesign)
+    with pytest.raises(ValueError, match="distinct values"):
+        sm.design(jsparse.BCOO.fromdense(jnp.asarray(rng.normal(size=(20, 5)))))
     one = ones_design(7)
     assert one.rows.shape == (7,) and float(one.lo[0]) == 0.0 and float(one.hi[0]) == 1.0
     assert ladder_ntau(33) == 33 and ladder_ntau(34) == 65 and ladder_ntau(5) == 33
+
+
+def test_level_design_detection():
+    rng = np.random.default_rng(3)
+    n, p = 40, 6
+    X = rng.integers(0, 3, size=(n, p)).astype(float)
+    X[:, 4] = 2.0 * (X[:, 4] > 0)  # {0, 2}: two values, but not 0/1
+    X[:, 5] = 0.0
+    X[:5, 5] = 1.0  # a sparse 0/1 column: its mode is 0
+    d = level_design(X)
+    assert d.K == 3 and d.parts is None and d.idx.dtype == jnp.int8
+    lev, act = np.asarray(d.levels), np.asarray(d.active).astype(bool)
+    for j in range(p):
+        vals, counts = np.unique(X[:, j], return_counts=True)
+        assert lev[0, j] == vals[np.argmax(counts)]  # baseline = the mode
+        assert set(lev[:, j][act[:, j]]) == set(vals)
+        assert np.all(lev[:, j][~act[:, j]] == lev[0, j])  # absent slots repeat the base
+    # the index matrix reproduces X, and the support set is every off-baseline entry
+    idx = np.asarray(d.idx)
+    np.testing.assert_allclose(np.take_along_axis(lev, idx, axis=0), X)
+    assert d.rows.shape[0] == int((idx != 0).sum())
+    np.testing.assert_allclose(np.asarray(d.lo), X.min(0))
+    np.testing.assert_allclose(np.asarray(d.hi), X.max(0))
+    # BCOO: the stored values are the levels, the implicit zero the baseline; colmean shifts
+    c = X.mean(0)
+    db = level_design(jsparse.BCOO.fromdense(jnp.asarray(X)), colmean=jnp.asarray(c))
+    assert db.K == 3 and db.idx is None and len(db.parts) == 2
+    assert sum(int(pt.nse) for pt in db.parts) == int((X != 0).sum())
+    np.testing.assert_allclose(np.asarray(db.levels), np.array([0.0, 1.0, 2.0])[:, None] - c[None, :])
+    np.testing.assert_allclose(np.asarray(db.parts[0].todense()), X == 1.0)
+    np.testing.assert_allclose(np.asarray(db.parts[1].todense()), X == 2.0)
+    assert np.asarray(db.active)[2, 5] == 0.0 and np.asarray(db.active)[1, 4] == 0.0
+    np.testing.assert_allclose(np.asarray(db.hi), X.max(0) - c)
+    # too many values: None (dense falls through to DenseDesign; BCOO raises in design())
+    assert level_design(rng.normal(size=(n, p))) is None
+    many = np.arange(n * p).reshape(n, p) % (MAX_LEVELS + 1)
+    assert level_design(many.astype(float)) is None
+    assert level_design(np.where(many < MAX_LEVELS, many, 0).astype(float)) is not None
+
+
+@pytest.mark.parametrize("ref", REFS, ids=REF_IDS)
+def test_level_collapse_equals_the_exact_dense_kernel(ref):
+    """On a 0/1/2 design the level collapse, dense or BCOO, gives the exact per-entry
+    kernel's sums (and null) to roundoff; so does the level CF factor."""
+    rng = np.random.default_rng(11)
+    n, p = 300, 8
+    X = rng.integers(0, 3, size=(n, p)).astype(float)
+    X[:, 0] = 2.0 * (X[:, 0] > 0)
+    y = jnp.asarray((rng.uniform(size=n) < 0.3).astype(float))
+    eta = jnp.asarray(rng.normal(size=n) * 0.7 - 0.8)
+    a = np.exp(rng.normal(size=p))
+    others = [(jnp.asarray(a / a.sum()), jnp.asarray(rng.normal(size=p) * 0.5),
+               jnp.asarray(np.exp(rng.normal(size=p)) * 0.1))]
+    sm = CharFnSpectral(reference=ref.kind, mixture_order=ref.order, dense_kernel="exact")
+    m = jnp.asarray(np.linspace(-1.2, 1.2, p))
+    v = jnp.full(p, 3e-2)
+    s = jnp.sqrt(v)
+    exact = dense_design(jnp.asarray(X))
+    aux = sm.build_spectral_aux(Bernoulli(), y, jnp.asarray(X), others, eta, exact, (m, v))
+    zero = jnp.zeros(p)
+
+    def rel(d, pre_d):  # the value channel is defined up to the anchor's constant: take
+        T = np.array(_spectral_terms(ref, d, aux, pre_d, m, s))  # it relative to the null
+        T[0] -= np.asarray(_spectral_terms(ref, d, aux, pre_d, zero, zero))[0]
+        return T
+
+    pre, ytil = _prepare(ref, exact, aux, eta, Bernoulli())
+    T_exact = rel(exact, pre)
+    Xb = jsparse.BCOO.fromdense(jnp.asarray(X))
+    for d in (level_design(X), level_design(Xb)):
+        assert isinstance(d, LevelDesign)
+        pre_l, ytil_l = _prepare(ref, d, aux, eta, Bernoulli())
+        np.testing.assert_allclose(rel(d, pre_l), T_exact, rtol=1e-10, atol=1e-9)
+        np.testing.assert_allclose(np.asarray(ytil_l), np.asarray(ytil), rtol=1e-12)
+        f = level_factor(d, *others[0], aux.tau)
+        np.testing.assert_allclose(np.asarray(f), np.asarray(_effect_cf((jnp.asarray(X),) + others[0], aux.tau)),
+                                   rtol=1e-12, atol=1e-12)
+    # and the smoother picks the level collapse for both layouts (centered too)
+    assert isinstance(sm.design(jnp.asarray(X - X.mean(0))), LevelDesign)
+    assert isinstance(sm.design(Xb, jnp.asarray(X.mean(0))), LevelDesign)
+
+
+def test_dosage_fit_bcoo_equals_dense_and_matches_cf_cavi():
+    """The front door on a 0/1/2 dosage: the BCOO and dense designs both collapse over
+    levels and give the same fit; it agrees with the generic CF-table CAVI."""
+    rng = np.random.default_rng(12)
+    n, p, causal = 400, 10, 2
+    maf = rng.uniform(0.1, 0.4, size=p)
+    X = (rng.binomial(2, maf, size=(n, p))).astype(float)
+    y = rng.binomial(1, 1 / (1 + np.exp(-(-1.0 + 1.2 * X[:, causal])))).astype(float)
+    kw = dict(L=2, max_iter=8)
+    for method in ("cf_cavi_spectral", "spectral_point_offset", "spectral_gaussian_offset"):
+        dense = fit_glm_susie(X, y, method=method, **kw)
+        bcoo = fit_glm_susie(jsparse.BCOO.fromdense(jnp.asarray(X)), y, method=method, **kw)
+        for ea, eb in zip(dense.single_effects, bcoo.single_effects):
+            np.testing.assert_allclose(np.asarray(ea.alpha), np.asarray(eb.alpha), atol=1e-9)
+            np.testing.assert_allclose(np.asarray(ea.mu), np.asarray(eb.mu), atol=1e-8)
+            fa, fb = np.asarray(ea.feature_log_marginal), np.asarray(eb.feature_log_marginal)
+            np.testing.assert_allclose(fa, fb, atol=1e-8)
+        assert float(dense.single_effects[0].alpha[causal]) > 0.95
+    spec = fit_glm_susie(jsparse.BCOO.fromdense(jnp.asarray(X)), y, method="cf_cavi_spectral", **kw)
+    cf = fit_glm_susie(X, y, method="cf_cavi", **kw)
+    for ea, eb in zip(spec.single_effects, cf.single_effects):
+        np.testing.assert_allclose(np.asarray(ea.alpha), np.asarray(eb.alpha), atol=1e-4)
+        np.testing.assert_allclose(np.asarray(ea.mu), np.asarray(eb.mu), atol=1e-3)
 
 
 @pytest.mark.parametrize("ref", REFS, ids=REF_IDS)
@@ -613,8 +731,8 @@ def test_fit_matches_reference_with_model_extras(extra):
 def test_front_door_guards():
     rng = np.random.default_rng(6)
     B, y = _sparse_logit(rng, 120, 10)
-    with pytest.raises(ValueError, match="0/1 set membership"):
-        fit_glm_susie(jsparse.BCOO.fromdense(jnp.asarray(2.0 * B)), y, L=2,
+    with pytest.raises(ValueError, match="distinct values"):
+        fit_glm_susie(jsparse.BCOO.fromdense(jnp.asarray(B * rng.normal(size=B.shape))), y, L=2,
                       method="cf_cavi_spectral")
     with pytest.raises(ValueError, match="profiled"):
         fit_glm_susie(B, y, L=2, method="cf_cavi_spectral", intercept="profiled")

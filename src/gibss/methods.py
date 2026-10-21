@@ -120,7 +120,8 @@ _SMOOTHERS = {
         M=cfg["compress_degree"], order=cfg["mixture_order"]
     ),
     # cf_spectral: the same CAVI in Q2 with the effect b folded into the CF, so the effect
-    # update is one Fourier sum per column (logistic only; sparse X must be 0/1).
+    # update is one Fourier sum per column (logistic only; sparse X must take at most
+    # cf_spectral.MAX_LEVELS distinct values per column: 0/1 membership, a 0/1/2 dosage).
     # `spectral_reference` picks the Fourier residual's reference law (null / plugin /
     # gaussian; the gaussian one runs under the order-`mixture_order` probit mixture).
     "cf_spectral": lambda cfg: CharFnSpectral(
@@ -177,8 +178,9 @@ PRESETS = {
         "mixture_order": 8,
     },
     # the same CAVI-in-Q2 fixed point by the spectral effect update: no Chebyshev table,
-    # no GH over b. On a two-level (0/1, possibly centered) design each Newton step costs
-    # O(p ntau) independent of n; on any other dense design, O(n p ntau) per entry.
+    # no GH over b. On a two-level (0/1, possibly centered) or few-valued (0/1/2 dosage,
+    # a code; dense or BCOO) design each Newton step costs O(p ntau) independent of n,
+    # exactly; on a continuous dense design, a Chebyshev-in-x collapse or O(n p ntau).
     "cf_cavi_spectral": {"variational_family": "gaussian", "offset_integration": "cf_spectral"},
     # the same fixed point with the plug-in point mass as the Fourier residual's reference
     # (the sum carries only the gIBSS plug-in error, so the grid ladder stops lower)...
