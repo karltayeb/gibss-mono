@@ -64,6 +64,7 @@ __all__ = [
     "NegativeBinomial",
     "PGMixture",
     "Poisson",
+    "PoissonGamma",
     "ProbitMixture",
     "ResponseModel",
     "SelfNormQuad",
@@ -1421,6 +1422,94 @@ class LogNormal(Smoother):
     def shift_sums(self, base, offset, aux, op=None):
         y, ov = aux
         return log_link_shift_sums(y, offset, offset + 0.5 * jnp.asarray(ov), op=op)
+
+
+@dataclass(frozen=True)
+class PoissonGamma(Smoother):
+    r"""Local Poisson-Gamma augmentation of the negative binomial: the NB row as a Poisson
+    row with a Gamma-distributed exposure, with the exposure's variational factor tuned per
+    row AND per candidate feature (the Poisson-side analogue of the local JJ / Polya-Gamma
+    tilt). Requires the `NegativeBinomial` base. aux = (y, ov), the engine's usual
+    `(observation leaf, offset variance)` pair (see the note on `ov` below).
+
+    Augmentation. NB(y | mu = e^eta, r) is y | w ~ Poisson(w e^eta), w ~ Gamma(r, r). With
+    a mean-field factor q(w) the Poisson side sees `y eta - E[w] e^eta`, and the optimal
+    factor given q(b) is Gamma(r + y, r + E_q[e^eta]). Collapsing q(w) at its optimum gives
+    the per-row evidence lower bound
+
+        E_q log NB(y | eta) >= y E[eta] - (y + r) log(r + E_q[e^eta]) + c(y, r),
+
+    which is the NB log-likelihood with e^eta replaced by its posterior mean inside the
+    log (Jensen on log(r + e^eta); exact as r -> inf, the Poisson limit, where it is the
+    `LogNormal` identity). Under a Gaussian law for the predictor's uncertainty the mean
+    is `E e^eta = e^{E eta + V/2}`, so in the kernels' shifted variable eta' = eta - log r
+    (the NB link shift rides in `glm_offset`) the bound is the NB logistic cumulant at a
+    SHIFTED predictor:
+
+        Ahat(eta'; ov) = (y + r) softplus(eta' + ov/2),   loglik = y eta' - Ahat.
+
+    Local. In the Gaussian-VI kernel (`vi`) the per-entry variance is `x^2 v + ov`, so the
+    exposure factor is tuned at the candidate feature's own posterior N(m_j, v_j) -- one
+    q(w_i | gamma = j) per (row, feature), like the entry-shaped tilt of localjj -- and the
+    evidence is the collapsed bound at that fixed point. The returned `weight` is NOT the
+    bound's curvature `(y + r) s (1 - s)` but the AUGMENTATION's weight `E[w] e^{eta + V/2}
+    = (y + r) s`, `s = sigmoid(eta' + ov/2)`: the Poisson row's curvature at the latent
+    exposure, an MM majorizer of the bound (log-concave: monotone Newton), and exactly the
+    quantity whose per-entry sum is the latent-given Gaussian-VI precision -- so the `vi`
+    kernel's `1/v = 1/pv + sum x^2 weight` fixed point IS the local Poisson-Gamma CAVI
+    (alternating q(w | j) and q(b | j) to convergence), with no new kernel. With the exact
+    curvature instead, the variance step would be Price's theorem applied to a bound that is
+    not a Gaussian convolution, and its fixed point would be no augmentation at all.
+
+    `offset_law` is how the OTHER effects (and the shared intercept's factor) enter
+    `E_q[e^eta]`:
+      "mixture"  -- their actual Gaussian-mixture law, through the exact zero-mean log-MGF
+                    `logkappa` (`poisson_offset.log_kappa_*`, memoized per effect slot):
+                    the engine hands `ov := 2 logkappa`, so `ov/2` is the log-MGF and the
+                    bound is the collapsed mean-field bound exactly.
+      "gaussian" -- the moment-matched Gaussian of the leave-one-out message, `ov` = its
+                    variance (the localjj convention; the log-MGF is then `ov/2`).
+    Either way the second aux leaf is TWICE the zero-mean log-MGF of the offset law, which
+    for a Gaussian offset is its variance -- the natural per-entry accumulator for an
+    exponential cumulant, and what lets the kernels add the effect's own `x^2 v` unchanged.
+
+    Certified (a Jensen lower bound, tight at zero predictor variance) and convex. The
+    free-form `quad` kernel can run it too (the bound is pointwise in eta'), where the
+    latent is then tuned per quadrature node of b; the Gaussian `vi` kernel is the local
+    augmentation proper. The Polya-Gamma counterpart (Gaussian base problem) is
+    `JJFixed`/`JJEnvelope` on the same NB base: the JJ tilt IS the PG factor's parameter.
+
+    Caveat -- posterior spread. The mean field over (b, w) ignores the coupling between the
+    exposure and the effect, and the augmentation weight `(y + r) s` exceeds the NB
+    curvature `(y + r) s (1 - s)` by the factor `1 / (1 - s)` with `s = mu / (mu + r)`. The
+    effect posteriors are therefore too narrow by roughly that factor in variance: at
+    mu ~ 3 r the posterior sd is about half the exact Q2 one (cf_cavi), while the posterior
+    means and the credible sets are close. The Polya-Gamma route (localjj) does not have
+    this deficit at moderate counts; the deficit shrinks as r -> inf (Poisson limit)."""
+
+    offset_law: str = "mixture"
+    certified = True
+
+    def __post_init__(self):
+        if self.offset_law not in ("mixture", "gaussian"):
+            raise ValueError(
+                f"PoissonGamma offset_law must be 'mixture' or 'gaussian'; got {self.offset_law!r}"
+            )
+
+    def validate(self, base):
+        if not isinstance(base, NegativeBinomial):
+            raise TypeError(
+                "PoissonGamma is the Poisson-Gamma augmentation of the negative binomial; it "
+                f"needs the NegativeBinomial base, got {type(base).__name__}. (A Poisson base "
+                "has no overdispersion to augment: use LogNormal.)"
+            )
+
+    def terms(self, base, eta, aux):
+        y, ov = aux
+        y, s = base.unpack(y)  # s = y + r: the per-row scale of the logistic cumulant
+        z = eta + 0.5 * jnp.asarray(ov)  # eta' + log E[e^{o}] (zero-mean offset law)
+        sig = jax.nn.sigmoid(z)
+        return y * eta - s * jax.nn.softplus(z), y - s * sig, s * sig
 
 
 @dataclass(frozen=True)

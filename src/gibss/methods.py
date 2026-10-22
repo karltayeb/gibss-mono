@@ -42,6 +42,7 @@ from .response import (
     NegativeBinomial,
     PGMixture,
     Poisson,
+    PoissonGamma,
     ProbitMixture,
     ResponseModel,
     Smoothed,
@@ -110,6 +111,14 @@ _SMOOTHERS = {
     # but needs two bivariate normal orthants per component, ~10x the cost.
     "probit_mixture": lambda cfg: ProbitMixture(order=cfg["mixture_order"]),
     "pg_mixture": lambda cfg: PGMixture(order=cfg["mixture_order"]),
+    # poisson_gamma: the negative binomial by its Poisson-Gamma augmentation (NB only), the
+    # exposure factor tuned locally -- per row and per candidate feature, like the localjj
+    # tilt -- so the base regression problem is Poisson; closed form, no quadrature. The
+    # other effects enter through their exact mixture log-MGF ("poisson_gamma") or the
+    # moment-matched Gaussian of the leave-one-out message ("poisson_gamma_gaussian", the
+    # localjj convention). Its Polya-Gamma counterpart (base problem Gaussian) is "jj".
+    "poisson_gamma": lambda cfg: PoissonGamma(offset_law="mixture"),
+    "poisson_gamma_gaussian": lambda cfg: PoissonGamma(offset_law="gaussian"),
     # cf: exact characteristic-function offset builder (CAVI in Q2, gaussian only).
     # "compress" (above) doubles as the Q2 peel builder (gaussian) and the Q1 fold
     # (unconstrained); _resolve routes on variational_family.
@@ -223,6 +232,32 @@ PRESETS = {
     # mode end z ("two_point"), or all four conditions at s ("null")
     "adjusted_two_point": {"offset_integration": "adjusted", "_adjusted_rule": "two_point"},
     "adjusted_null": {"offset_integration": "adjusted", "_adjusted_rule": "null"},
+    # Negative binomial SuSiE by data augmentation (NB is the default family of both). Three
+    # routes, named by the base regression problem each reduces to; `family=
+    # "negative_binomial"` with any logistic method (the default quad kernel, localjj,
+    # cf_cavi, the spectral presets, ...) is the first:
+    #   logistic      -- NB(y | mu, r) = Binomial(y + r "trials", sigmoid(eta - log r)):
+    #                    the logistic cumulant at scale y + r, exact; no augmentation.
+    #   poisson_gamma -- y | w ~ Poisson(w e^eta), w ~ Gamma(r, r): the Poisson problem with
+    #                    a Gamma exposure factor q(w_i | gamma = j) tuned per row and
+    #                    candidate feature (local); closed-form Gaussian-VI effect updates on
+    #                    the collapsed bound y eta - (y + r) log(r + E e^eta) (Jensen).
+    #   polya_gamma   -- NB(y | psi) = 2^-(y+r) e^{kappa psi} E_w[e^{-w psi^2 / 2}],
+    #                    w ~ PG(y + r, 0): the Gaussian (conjugate) problem with the PG factor
+    #                    q(w_i | gamma = j) = PG(y + r, xi_ij) tuned per row and feature. The
+    #                    PG factor's parameter IS the Jaakkola-Jordan tilt, so this is localjj
+    #                    on the NB base (kernel 'jj'); globaljj is the row-global mean field
+    #                    q(b) q(w) of the same augmentation.
+    "poisson_gamma": {
+        "family": "negative_binomial",
+        "variational_family": "gaussian",
+        "offset_integration": "poisson_gamma",
+    },
+    "polya_gamma": {
+        "family": "negative_binomial",
+        "variational_family": "gaussian",
+        "offset_integration": "jj",
+    },
     "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
     "score": {
         "offset_integration": "taylor_fixed",
@@ -358,6 +393,13 @@ def _resolve(cfg):
                 "offset_integration='compress_selfnorm' for EXACT free-form CAVI in Q1, "
                 "or variational_family='gaussian' for CAVI in Q2."
             )
+        elif integ in ("poisson_gamma", "poisson_gamma_gaussian"):
+            if not isinstance(base, NegativeBinomial):
+                raise ValueError(
+                    f"offset_integration={integ!r} is the Poisson-Gamma augmentation of the "
+                    f"negative binomial; it needs family='negative_binomial' (got {fam!r})."
+                )
+            response = Smoothed(base, _SMOOTHERS[integ](cfg))
         elif integ == "compress_selfnorm":
             # EXACT free-form CAVI in Q1: fold each OTHER effect (and the intercept) against
             # its TRUE non-Gaussian quadrature posterior. Like the "cf" seam above, the
@@ -501,6 +543,10 @@ def fit_glm_susie(
         fit_glm_susie(X, y, family="negative_binomial",
                       offset=log_size_factor)        # NB SuSiE, null-model plug-in r
         fit_glm_susie(X, y, dispersion=r_hat)        # NB SuSiE at a given r (or per-row r_i)
+        fit_glm_susie(X, y, dispersion=r_hat,
+                      method="poisson_gamma")        # NB by the local Poisson-Gamma augmentation
+        fit_glm_susie(X, y, dispersion=r_hat,
+                      method="polya_gamma")          # NB by the local Polya-Gamma augmentation
         fit_glm_susie(X, y, family="poisson",
                       intercept="profiled")          # profiled Poisson SuSiE
         fit_glm_susie(X, y, family=Smoothed(Bernoulli(), GH(5)))  # object escape

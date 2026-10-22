@@ -65,6 +65,7 @@ from .response import (
     MixtureGH,
     NegativeBinomial,
     Poisson,
+    PoissonGamma,
     ResponseModel,
     Smoothed,
 )
@@ -469,6 +470,71 @@ def compute_elbo_jj(
     jj_ll = y * eta - scale * (jax.nn.softplus(xi) + 0.5 * (eta - xi))
     base_measure = _base_measure(base, leaf) if include_base_measure else 0.0
     expected_loglik = float(jnp.sum(jj_ll)) + base_measure
+    elbo = expected_loglik - kl - intercept_kl - ri_kl
+    if return_breakdown:
+        return ELBOBreakdown(
+            elbo=elbo, expected_loglik=expected_loglik, kl=kl,
+            intercept_kl=intercept_kl, base_measure=base_measure, is_q1=False,
+        )
+    return elbo
+
+
+def compute_elbo_poisson_gamma(
+    data, state, *, offset_law: str = "mixture", include_base_measure: bool = True,
+    return_breakdown: bool = False, score_intercept=None,
+):
+    r"""Poisson-Gamma lower bound to the Q2 ELBO of a Gaussian-effect negative binomial
+    state, with the exposure factors fit optimally on the fly -- the NB counterpart of
+    `compute_elbo_jj` for the other augmentation (`response.PoissonGamma`).
+
+    Augmenting NB(y | e^eta, r) as y | w ~ Poisson(w e^eta), w ~ Gamma(r, r) with a mean-field
+    factor q(w_i) per row and collapsing each factor at its optimum Gamma(r + y, r + E_q e^eta)
+    gives, per row,
+
+        E_q[log p(y_i | eta_i)] >= y_i E[eta_i] - (y_i + r_i) log(r_i + E_q[e^{eta_i}]) + c(y_i, r_i),
+
+    Jensen's inequality on log(r + e^eta) (tight at zero predictor variance, and the exact
+    log-normal identity in the Poisson limit r -> inf). `E_q[e^eta] = e^{E eta + logkappa}`
+    with `logkappa` the full posterior's zero-mean log-MGF: under `offset_law="mixture"` the
+    exact Gaussian-mixture MGF over ALL effects plus the shared / random intercepts' Gaussian
+    spread (the same analytic fold the Poisson ELBO uses; the bound is then a certified lower
+    bound on the exact ELBO of this `q`), under "gaussian" the moment-matched `Var[eta] / 2`
+    (what a `poisson_gamma_gaussian` fit's kernels see; not a certified bound in general).
+    The KLs and the intercept handling (`score_intercept`) are those of `compute_elbo_gaussian`.
+
+    Because it is a lower bound to the exact log-likelihood of the SAME `q`, the result is
+    `<=` `compute_elbo` / `compute_elbo_gaussian` on this state. Negative binomial base only;
+    Gaussian effects only (`b_nodes is None`). Returns a float or an `ELBOBreakdown`."""
+    if offset_law not in ("mixture", "gaussian"):
+        raise ValueError(f"offset_law must be 'mixture' or 'gaussian'; got {offset_law!r}")
+    base, eta, intercept_var, intercept_kl, ri_var, ri_kl, kl, effects = _q2_gaussian_pieces(
+        data, state, score_intercept=score_intercept
+    )
+    if not isinstance(base, NegativeBinomial):
+        raise TypeError(
+            "compute_elbo_poisson_gamma is the Poisson-Gamma bound of the negative binomial; "
+            f"got {type(base).__name__}."
+        )
+    from .glm import _poisson_gamma_log_mgf, _response_aux  # circular-import guard
+
+    leaf = _response_aux(data)  # (y, dispersion)
+    y, scale = base.unpack(leaf)  # scale = y + r
+    offset_var = intercept_var + jnp.asarray(ri_var)
+    if offset_law == "mixture":
+        # exact zero-mean log-MGF over all effects (+ the homogeneous Gaussian factors); the
+        # fit's own memo is reused when the state was fit by the PoissonGamma smoother
+        fs = state.family_state
+        smoother = getattr(fs.response, "smoother", None)
+        if not isinstance(smoother, PoissonGamma):
+            smoother = PoissonGamma()
+        logk = _poisson_gamma_log_mgf(data, state, smoother, None, offset_var)
+    else:
+        logk = 0.5 * (jnp.asarray(state.total_message.var) + offset_var)
+    # eta is in the kernels' shifted variable eta' = eta - log r (the link shift rides in
+    # glm_offset), where the bound is y eta' - (y + r) softplus(eta' + logkappa)
+    ll = y * eta - scale * jax.nn.softplus(eta + logk)
+    base_measure = _base_measure(base, leaf) if include_base_measure else 0.0
+    expected_loglik = float(jnp.sum(ll)) + base_measure
     elbo = expected_loglik - kl - intercept_kl - ri_kl
     if return_breakdown:
         return ELBOBreakdown(

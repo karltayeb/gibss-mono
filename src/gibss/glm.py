@@ -44,8 +44,13 @@ from .cf_spectral import (
 from .poisson_offset import (
     PoissonLogNormalOffset,
     PoissonSelfNormOffset,
+    _TermCache,
     glm_vi_poisson_center_ser,
     glm_vi_poisson_ser,
+    log_kappa_dense,
+    log_kappa_q1_dense,
+    log_kappa_q1_sparse,
+    log_kappa_sparse,
 )
 from .linear import (  # noqa: F401 (prep_data re-export)
     is_bcoo,
@@ -60,6 +65,7 @@ from .response import (
     CompressSelfNorm,
     NegativeBinomial,
     Poisson,
+    PoissonGamma,
     ResponseModel,
     Smoothed,
 )
@@ -490,17 +496,28 @@ def _nb_link_shift(data, fs):
     return replace(fs, glm_offset=jnp.asarray(fs.glm_offset) - jnp.log(r), dispersion=r)
 
 
-def _aux(data, state, include_intercept_var=True, include_ri_var=True):
+def _aux(data, state, include_intercept_var=True, include_ri_var=True, exclude_effect=None):
     """Kernel aux: y; a Smoothed response adds the offset variance (and, for
     row-parameterized schemes under the quadrature/profile kernels, the per-row
     parameter tuned by update_row_param_step -- the jj kernel builds its own
-    per-entry tilt instead)."""
+    per-entry tilt instead).
+
+    The Poisson-Gamma smoother's "mixture" offset law replaces the Gaussian-moment
+    variance by twice the exact zero-mean log-MGF of the effects' mixture laws (its aux
+    contract): the OTHER effects for an effect update (`exclude_effect` = the slot being
+    refit), all effects for the intercept, plus the homogeneous Gaussian factors the
+    variance would have carried (shared intercept v0, random intercept v_i)."""
     y = _response_aux(data)
     fs = state.family_state
     if not isinstance(fs.response, Smoothed):
         return y
-    ov = _offset_var(state, include_intercept_var, include_ri_var)
     smoother = fs.response.smoother
+    if isinstance(smoother, PoissonGamma) and smoother.offset_law == "mixture":
+        gauss = 0.0 if isinstance(state.total_message, MeanMessage) else (
+            (_nuisance_var(fs) if include_intercept_var else 0.0) + _ri_var(state, include_ri_var)
+        )
+        return y, 2.0 * _poisson_gamma_log_mgf(data, state, smoother, exclude_effect, gauss)
+    ov = _offset_var(state, include_intercept_var, include_ri_var)
     if smoother.takes_row_param and fs.kernel != "jj":
         return y, ov, jax.tree_util.tree_map(jnp.asarray, fs.row_param)
     return y, ov
@@ -515,6 +532,57 @@ def _intercept_ov(state):
         return 0.0
     nv = _nuisance_var(fs)
     return float(nv) if jnp.ndim(nv) == 0 else nv
+
+
+def _poisson_gamma_cache(smoother):
+    """The per-fit memo of per-effect log-MGF terms for a PoissonGamma smoother (lazily
+    attached: the smoother is a frozen dataclass in `response`, the memo lives here)."""
+    cache = getattr(smoother, "_log_mgf_cache", None)
+    if cache is None:
+        cache = _TermCache()
+        object.__setattr__(smoother, "_log_mgf_cache", cache)
+    return cache
+
+
+def _poisson_gamma_log_mgf(data, state, smoother, exclude_effect, offset_var):
+    """Per-row zero-mean log-MGF `log E[e^{o - E o}]` (n,) of the effects' laws (all but
+    `exclude_effect`) plus one homogeneous zero-mean Gaussian N(0, offset_var): the
+    PoissonGamma "mixture" offset law. Gaussian effects fold by the closed-form mixture MGF
+    (`log_kappa_dense/sparse`), free-form (quad) effects by the exact node sum
+    (`log_kappa_q1_*`); a centered BCOO design takes the baseline+support split. Per-effect
+    terms are memoized by slot (`_TermCache`), so a sweep builds each once."""
+    effects = list(state.single_effects)
+    keys = [j for j in range(len(effects)) if j != exclude_effect]
+    eff = [effects[j] for j in keys]
+    X = data.X
+    n = X.shape[0]
+    cache = _poisson_gamma_cache(smoother)
+    cbar = getattr(data, "column_center", None)
+    if any(e.b_nodes is not None for e in eff):
+        node_eff = [
+            (jnp.asarray(e.b_nodes).T, jnp.asarray(e.log_node_weight).T)
+            for e in eff if e.b_nodes is not None
+        ]
+        node_keys = [k for k, e in zip(keys, eff) if e.b_nodes is not None]
+        # memo validity keys: the STORED node arrays (the fold consumes transposed views)
+        refs = [(e.b_nodes, e.log_node_weight) for e in eff if e.b_nodes is not None]
+        if is_bcoo(X):
+            logk = log_kappa_q1_sparse(
+                X, node_eff, n, colmean=cbar, keys=node_keys, cache=cache, refs=refs
+            )
+        else:
+            logk = log_kappa_q1_dense(X, node_eff, n, keys=node_keys, cache=cache, refs=refs)
+        return logk + 0.5 * jnp.asarray(offset_var)
+    if is_bcoo(X):
+        return log_kappa_sparse(
+            X, [(e.alpha, e.mu, e.var) for e in eff], offset_var=offset_var,
+            colmean=cbar, keys=keys, cache=cache,
+        )
+    Xd = jnp.asarray(X)
+    return log_kappa_dense(
+        [(Xd, e.alpha, e.mu, e.var) for e in eff], n, offset_var=offset_var,
+        keys=keys, cache=cache,
+    )
 
 
 def _gh_expand(effect, order):
@@ -1872,7 +1940,7 @@ def update_effect_index_step(data, l, state):
     elif mode == "q1":
         aux = _selfnorm_effect_aux(data, state, l)
     else:
-        aux = _aux(data, state)
+        aux = _aux(data, state, exclude_effect=l)
     new_effect = _fit_effect(
         data, fs, aux, offset, effect.prior_variance, fs.quadrature_order
     )

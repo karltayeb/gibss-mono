@@ -9,6 +9,12 @@
 >   Negative binomial counts: `family="negative_binomial"` with a plug-in dispersion
 >   (estimated once under the null model, or `dispersion=` a number / per-row array);
 >   it is the logistic cumulant at `eta - log r`, so every logistic method applies.
+>   Two more routes to the same model by data augmentation, each with the latent factor
+>   tuned per row and per candidate feature (local, like localjj): `method="poisson_gamma"`
+>   (Poisson base problem with a Gamma exposure; `response.PoissonGamma` on the `vi` kernel)
+>   and `method="polya_gamma"` (Gaussian base problem; the Polya-Gamma factor's parameter is
+>   the JJ tilt, so this is localjj on the NB base). `elbo.compute_elbo_poisson_gamma` and
+>   `elbo.compute_elbo_jj` are their collapsed bounds; `compute_elbo` is the exact ELBO.
 >   Fixed covariates: `covariates=Z` (dense (n, k)) adjusts for Z with one Gaussian
 >   nuisance factor over (intercept, gamma) -- shared-intercept mode, plug-in and
 >   exact Q2 CAVI, dense and sparse X; also on `cox_poisson.fit_cox_susie`.
