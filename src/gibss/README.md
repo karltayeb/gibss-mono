@@ -15,6 +15,13 @@
 >   and `method="polya_gamma"` (Gaussian base problem; the Polya-Gamma factor's parameter is
 >   the JJ tilt, so this is localjj on the NB base). `elbo.compute_elbo_poisson_gamma` and
 >   `elbo.compute_elbo_jj` are their collapsed bounds; `compute_elbo` is the exact ELBO.
+>   Stochastic CAVI in Q2: `method="sampled_cavi"` (`offset_integration="sampled"`,
+>   `offset_samples=S`, `seed=`) draws the other effects' configurations from their
+>   posteriors and fits each feature's Gaussian q by the Salimans-Knowles regression on
+>   Gauss-Hermite nodes, with the plug-in point as control variate (`gibss.sampled_offset`).
+>   One kernel for every family: exactly linear SuSiE on `family="gaussian"`, an unbiased
+>   stochastic version of the exact Q2 CAVI update on a GLM, about (1 + S) times the
+>   plug-in kernel's cost. It redraws every sweep, so `max_iter` is its budget.
 >   Fixed covariates: `covariates=Z` (dense (n, k)) adjusts for Z with one Gaussian
 >   nuisance factor over (intercept, gamma) -- shared-intercept mode, plug-in and
 >   exact Q2 CAVI, dense and sparse X; also on `cox_poisson.fit_cox_susie`.

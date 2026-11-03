@@ -22,6 +22,7 @@ import warnings
 from . import glm
 from .cf_offset import CharFnGaussRef, CharFnOffset, CharFnSelfNorm
 from .cf_spectral import CharFnSpectral
+from .sampled_offset import SampledOffset
 from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
 from .negbin import estimate_null_dispersion
@@ -149,6 +150,13 @@ _SMOOTHERS = {
         M=cfg["compress_degree"], offset_law="point",
         reference=cfg["spectral_reference"], mixture_order=cfg["mixture_order"],
     ),
+    # sampled: stochastic CAVI in Q2 by the Salimans-Knowles regression on GH nodes, the
+    # other effects' offset drawn from their posteriors (`offset_samples` configurations
+    # per update) with the plug-in point as a first-order control variate. One kernel for
+    # every family: exactly linear SuSiE on the Gaussian base (the sampled terms vanish
+    # identically there), an unbiased stochastic update of the exact Q2 CAVI target on a
+    # GLM, at roughly (1 + offset_samples) times the plug-in kernel's cost.
+    "sampled": lambda cfg: SampledOffset(n_samples=cfg["offset_samples"]),
 }
 
 _DEFAULTS = {
@@ -161,6 +169,7 @@ _DEFAULTS = {
     "mixture_order": 5,  # components of the probit_mixture / pg_mixture logistic tables
     "compress_degree": 48,  # Chebyshev degree M for the compress/cf offset tables
     "spectral_reference": "null",  # cf_spectral residual reference: "null" | "plugin" | "gaussian"
+    "offset_samples": 1,  # sampled: configurations of the other effects drawn per update
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
@@ -216,6 +225,10 @@ PRESETS = {
         "variational_family": "gaussian",
         "offset_integration": "spectral_point",
     },
+    # stochastic CAVI in Q2: the other effects' offset sampled from their posteriors
+    # (`offset_samples` draws per update, default 1) around the plug-in point as control
+    # variate; exactly linear SuSiE on family='gaussian' (see `sampled_offset`).
+    "sampled_cavi": {"variational_family": "gaussian", "offset_integration": "sampled"},
     # exact free-form CAVI in Q1 through the CF product over the node laws (the CF
     # replacement for offset_integration="compress_selfnorm").
     "cf_cavi_q1": {"variational_family": "unconstrained", "offset_integration": "cf"},
@@ -289,7 +302,7 @@ def _resolve(cfg):
         # object passed through verbatim: offset_integration args not consulted
         response = fam
         if vfam == "gaussian" and isinstance(response, Smoothed) and isinstance(
-            response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset)
+            response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset, SampledOffset)
         ):
             # an explicit Q2 offset-table response (the object form of cf_cavi /
             # compress_cavi): it needs the vi_gh kernel, whose aux is the table -- the
@@ -310,6 +323,21 @@ def _resolve(cfg):
                 f"unknown offset_integration {integ!r}; "
                 f"options: {['none', *sorted(_SMOOTHERS)]}"
             )
+        elif integ == "sampled":
+            # stochastic CAVI in Q2 by the sampled-offset kernel (SampledOffset): Gaussian q
+            # only; every base family, the Gaussian included (there the update is exactly
+            # linear SuSiE's: the sampled terms vanish identically, see `sampled_offset`).
+            if vfam != "gaussian":
+                raise ValueError(
+                    "offset_integration='sampled' is a Q2 update; it needs "
+                    "variational_family='gaussian'."
+                )
+            if cfg["intercept"] == "profiled":
+                raise ValueError(
+                    "offset_integration='sampled' supports intercept='shared' or 'null', "
+                    "not 'profiled'."
+                )
+            return Smoothed(base, _SMOOTHERS["sampled"](cfg)), "vi_gh"
         elif fam == "gaussian":
             raise ValueError(
                 "family='gaussian' has a quadratic cumulant: offset integration "
@@ -499,7 +527,9 @@ def fit_glm_susie(
     effect_quadrature_points=None,
     mixture_order=None,
     background=None,
+    offset_samples=None,  # sampled: configurations of the other effects drawn per update
     # plain values (no preset interaction, ordinary defaults)
+    seed=0,  # PRNG seed of the sampled-offset update (offset_integration='sampled')
     center=None,  # pre-center columns; None = on wherever supported (see below)
     trials=None,  # Binomial: per-row trial counts n_i (y_i = successes); selects family=
     # 'binomial' unless a family is named. Every method/kernel applies: the logistic
@@ -607,6 +637,7 @@ def fit_glm_susie(
             "effect_quadrature_points": effect_quadrature_points,
             "mixture_order": mixture_order,
             "background": background,
+            "offset_samples": offset_samples,
         }.items()
         if v is not None
     }
@@ -724,6 +755,7 @@ def fit_glm_susie(
             "prior_variance_scale": prior_variance_scale,
             "max_prior_variance": max_prior_variance,
             "skl_tolerance": tol,
+            "offset_sample_seed": int(seed),
         },
     )
     if initial_state is not None:

@@ -372,6 +372,11 @@ class BaseSERState:
     # it valid, and `effect_to_numpy` drops it (a host snapshot must not pin a design-sized
     # message, and a warm start re-derives it against its own data).
     cached_message: Any = None
+    # Kernel-specific per-feature diagnostics (a dict of (p,) arrays), or None. The sampled
+    # offset kernel stores `regression_rss` (the weighted residual of its quadratic fit in b:
+    # zero exactly when the Gaussian approximation in b is exact) and `sample_var` (the
+    # across-draw variance of E_q F_j over S: the Monte Carlo error on the feature's ELBO).
+    diagnostics: Any = None
 
     def get_cs(self, coverage: float = 0.95) -> tuple[int, ...]:
         """Indices of the smallest set of features with sum(alpha) >= coverage."""
@@ -461,6 +466,8 @@ class GIBSSState(Generic[T_FamilyState, T_Message]):
 def _to_numpy_leaf(x):
     if x is None or isinstance(x, (str, bool)):
         return x
+    if isinstance(x, dict):
+        return {k: _to_numpy_leaf(v) for k, v in x.items()}
     a = np.asarray(x)
     return float(a) if a.ndim == 0 else a
 

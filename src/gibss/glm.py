@@ -35,6 +35,7 @@ from .engine import (
 )
 from ._numerics import _gh_rule
 from .cf_offset import CharFnOffset, CharFnSelfNorm
+from .sampled_offset import SampledOffset, glm_sampled_ser, sample_offset_deviations
 from .cf_spectral import (
     CharFnSpectral,
     glm_spectral_ser,
@@ -256,6 +257,12 @@ class GLMFamilyState:
     covariate_eta: object = 0.0  # (n,) Z @ covariate_mean (scalar 0.0 = none)
     nuisance_cov: object = None  # (d, d) joint posterior covariance of (b0, gamma)
     nuisance_var: object = None  # (n,) w_i' V w_i; None = intercept-only (use intercept_var)
+    # offset_sample_seed / offset_sample_key: the PRNG state of the sampled-offset update
+    # (`Smoothed(base, SampledOffset())`, see `sampled_offset`). The key is split and
+    # written back at every effect and intercept update, so a fit is a deterministic
+    # function of the seed; None until the first draw (then PRNGKey(offset_sample_seed)).
+    offset_sample_seed: int = 0
+    offset_sample_key: object = None
 
     def __post_init__(self):
         legacy = {"profile": "quad", "vi_profile": "vi", "linear_profile": "linear"}
@@ -278,14 +285,26 @@ class GLMFamilyState:
             # Compress (quadrature peel) hand vi_gh the 7-tuple table; the analytic Poisson
             # smoother hands (y, logkappa) -- both are opaque pytrees consumed via `terms`.
             ok = (not isinstance(self.response, Smoothed)) or isinstance(
-                self.response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset)
+                self.response.smoother,
+                (CharFnOffset, Compress, PoissonLogNormalOffset, SampledOffset),
             )
             if not ok:
                 raise ValueError(
                     "kernel='vi_gh' needs response = Smoothed(base, CharFnOffset()|"
-                    "Compress()|PoissonLogNormalOffset()) for exact CAVI in Q2, or a plain "
-                    f"base for the plug-in Q2 (offset_integration='none'); got "
+                    "Compress()|PoissonLogNormalOffset()|SampledOffset()) for CAVI in Q2, "
+                    "or a plain base for the plug-in Q2 (offset_integration='none'); got "
                     f"{self.response!r}."
+                )
+        if isinstance(getattr(self.response, "smoother", None), SampledOffset):
+            if self.intercept == "profiled":
+                raise ValueError(
+                    "offset_integration='sampled' supports intercept='shared' or 'null' "
+                    "(the profiled intercept re-fits b0 per feature inside the kernel)."
+                )
+            if self.random_intercept:
+                raise NotImplementedError(
+                    "offset_integration='sampled' does not support random_intercept yet "
+                    "(its per-row factor update needs the sampled offset of all effects)."
                 )
         if self.intercept not in ("shared", "profiled", "null"):
             raise ValueError(
@@ -1051,6 +1070,11 @@ def _check_covariates(data, fs):
             "'compress_selfnorm'/'cf'): the self-normalized fold has no per-row "
             "offset-variance seam."
         )
+    if isinstance(getattr(fs.response, "smoother", None), SampledOffset):
+        raise NotImplementedError(
+            "offset_integration='sampled' does not support fixed covariates yet (the joint "
+            "(b0, gamma) factor's draw is not a scalar per sample)."
+        )
     W, _ = _nuisance_design(data, fs)
     if int(jnp.linalg.matrix_rank(W)) < W.shape[1]:
         raise ValueError(
@@ -1231,7 +1255,7 @@ def _intercept_point(data, state):
     # (intercept="null"): the effects are empty at b=0, so the offset-integrated cumulant
     # IS the base -- fit the null intercept on the base response with plain y.
     if isinstance(response, Smoothed) and isinstance(
-        response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset)
+        response.smoother, (CharFnOffset, Compress, PoissonLogNormalOffset, SampledOffset)
     ):
         response = response.base
         aux = _response_aux(data)
@@ -1327,7 +1351,7 @@ def _cavi_mode(fs):
                     and the aggregate-message offset."""
     if fs.kernel == "vi_gh":
         smoother = fs.response.smoother if isinstance(fs.response, Smoothed) else None
-        exact = (CharFnOffset, Compress, PoissonLogNormalOffset)
+        exact = (CharFnOffset, Compress, PoissonLogNormalOffset, SampledOffset)
         return "q2" if isinstance(smoother, exact) else "q2_plugin"
     if isinstance(
         getattr(fs.response, "smoother", None),
@@ -1356,6 +1380,10 @@ def _estimate_shared_intercept(data, state):
     # Gaussian q(b0, gamma) = N(m, V) over W = [1 | Z]: closed-form KL against N(0, tau I).
     # Inference in Q2 (exact or plug-in) owes the b0 component its Q2 update, the
     # Gaussian-VI factor; the point/Laplace strategy is for the non-variational routes.
+    if mode == "q2" and isinstance(fs.response.smoother, SampledOffset):
+        # the sampled kernel on the ones column; it advances the fit's PRNG key
+        m, V, key = _intercept_sampled(data, state)
+        return {**_nuisance_fields(data, fs, m, V), "offset_sample_key": key}
     fit = _intercept_gaussian if mode in ("q2", "q2_plugin") else _intercept_point
     m, V = fit(data, state)
     return _nuisance_fields(data, fs, m, V)
@@ -1901,6 +1929,70 @@ def _fit_effect_spectral(data, state, l, offset, prior_variance):
     return build_ser_state(mu, var, log_bf, kl, prior_variance, null_log_marginal=null)
 
 
+def _sample_key(fs):
+    """The fit's PRNG key for the sampled-offset update: the stored key, or the seed's."""
+    key = fs.offset_sample_key
+    return jax.random.PRNGKey(int(fs.offset_sample_seed)) if key is None else key
+
+
+def _fit_effect_sampled(data, state, l, offset, prior_variance):
+    """Effect update by the sampled CAVI-in-Q2 kernel (`SampledOffset`, see
+    `sampled_offset`): the other effects' configurations are drawn from their current
+    posteriors (plus the shared intercept's N(0, v0)), and the per-feature Gaussian q is the
+    Salimans-Knowles regression fixed point with the plug-in point as control variate. The
+    offset mean rides in `offset`. Returns `(effect, key)`, the advanced PRNG key."""
+    fs = state.family_state
+    sm = fs.response.smoother
+    iv = _intercept_ov(state)
+    if jnp.ndim(iv) != 0:
+        raise NotImplementedError(
+            "offset_integration='sampled' does not support fixed covariates yet."
+        )
+    others = [
+        (e.alpha, e.mu, e.var)
+        for j, e in enumerate(state.single_effects) if j != l
+    ]
+    key, sub = jax.random.split(_sample_key(fs))
+    dev = sample_offset_deviations(sub, data.op, others, sm.n_samples, iv, _ri_var(state))
+    e = state.single_effects[l]
+    # warm start at the effect's last posterior (a fresh effect has var = 0: cold start at
+    # (0, prior_variance)); the regression is exact for a quadratic F from any start.
+    mu0, var0 = jnp.asarray(e.mu), jnp.asarray(e.var)
+    warm = jnp.isfinite(mu0) & jnp.isfinite(var0) & (var0 > 0)
+    init = (jnp.where(warm, mu0, 0.0), jnp.where(warm, var0, prior_variance))
+    mu, var, log_bf, kl, null, diag = glm_sampled_ser(
+        as_operator(data.X), _response_aux(data), jnp.asarray(offset), dev, prior_variance,
+        fs.response.base, init, order=sm.order, n_iter=sm.n_iter, tol=sm.tol,
+        center=getattr(data, "column_center", None), degree=sm.degree,
+    )
+    effect = build_ser_state(mu, var, log_bf, kl, prior_variance, null_log_marginal=float(null))
+    return replace(effect, diagnostics=diag), key
+
+
+def _intercept_sampled(data, state):
+    """The shared intercept q(b0) = N(m0, v0) by the sampled kernel: b0 is a column of ones
+    whose offset is every effect (drawn from their posteriors; the random intercept's
+    variance would fold here too). Warm-started at the current factor. Returns `(m, V,
+    key)` with m (1,), V (1, 1)."""
+    fs = state.family_state
+    sm = fs.response.smoother
+    n = jnp.shape(jnp.asarray(data.y))[0]
+    effects = [(e.alpha, e.mu, e.var) for e in state.single_effects]
+    key, sub = jax.random.split(_sample_key(fs))
+    dev = sample_offset_deviations(sub, data.op, effects, sm.n_samples, 0.0, _ri_var(state))
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
+    total_mean = jnp.broadcast_to(jnp.asarray(total_mean, dtype=jnp.float64), (n,))
+    m0 = jnp.asarray(fs.intercept_value, dtype=jnp.float64).reshape(1)
+    v0 = jnp.asarray(fs.intercept_var, dtype=jnp.float64).reshape(1)
+    v0 = jnp.where(v0 > 0, v0, 1.0)
+    m, v, _, _, _, _ = glm_sampled_ser(
+        as_operator(jnp.ones((n, 1))), _response_aux(data), total_mean, dev,
+        fs.intercept_prior_variance, fs.response.base, (m0, v0),
+        order=sm.order, n_iter=sm.n_iter, tol=sm.tol,
+    )
+    return m, v.reshape(1, 1), key
+
+
 def _intercept_spectral(data, state, total_mean):
     """The shared intercept q(b0) = N(m0, v0) by the spectral kernel: b0 is a column of
     ones, so the collapse is the plain row total. Its offset is every effect (plus the
@@ -1935,6 +2027,10 @@ def update_effect_index_step(data, l, state):
     if mode == "q2" and isinstance(fs.response.smoother, CharFnSpectral):
         new_effect = _fit_effect_spectral(data, state, l, offset, effect.prior_variance)
         return replace_effect_in_gibss_state(state, l, new_effect)
+    if mode == "q2" and isinstance(fs.response.smoother, SampledOffset):
+        new_effect, key = _fit_effect_sampled(data, state, l, offset, effect.prior_variance)
+        state = replace_effect_in_gibss_state(state, l, new_effect)
+        return replace(state, family_state=replace(fs, offset_sample_key=key))
     if mode == "q2":
         aux = _offset_table_aux(data, state, l)
     elif mode == "q1":
