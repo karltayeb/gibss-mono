@@ -35,7 +35,12 @@ from .engine import (
 )
 from ._numerics import _gh_rule
 from .cf_offset import CharFnOffset, CharFnSelfNorm
-from .sampled_offset import SampledOffset, glm_sampled_ser, sample_offset_deviations
+from .sampled_offset import (
+    SampledOffset,
+    glm_sampled_ser,
+    sample_offset_deviations,
+    within_offset_variance,
+)
 from .cf_spectral import (
     CharFnSpectral,
     glm_spectral_ser,
@@ -1953,7 +1958,7 @@ def _fit_effect_sampled(data, state, l, offset, prior_variance):
         for j, e in enumerate(state.single_effects) if j != l
     ]
     key, sub = jax.random.split(_sample_key(fs))
-    dev = sample_offset_deviations(sub, data.op, others, sm.n_samples, iv, _ri_var(state))
+    draws, variances = _sampled_draws(data, state, others, sub, iv)
     e = state.single_effects[l]
     # warm start at the effect's last posterior (a fresh effect has var = 0: cold start at
     # (0, prior_variance)); the regression is exact for a quadratic F from any start.
@@ -1961,12 +1966,37 @@ def _fit_effect_sampled(data, state, l, offset, prior_variance):
     warm = jnp.isfinite(mu0) & jnp.isfinite(var0) & (var0 > 0)
     init = (jnp.where(warm, mu0, 0.0), jnp.where(warm, var0, prior_variance))
     mu, var, log_bf, kl, null, diag = glm_sampled_ser(
-        as_operator(data.X), _response_aux(data), jnp.asarray(offset), dev, prior_variance,
-        fs.response.base, init, order=sm.order, n_iter=sm.n_iter, tol=sm.tol,
-        center=getattr(data, "column_center", None), degree=sm.degree,
+        as_operator(data.X), _response_aux(data), jnp.asarray(offset), draws, prior_variance,
+        sm.gaussian_response(fs.response.base), init, order=sm.order, n_iter=sm.n_iter,
+        tol=sm.tol, center=getattr(data, "column_center", None), degree=sm.degree,
+        **variances,
     )
     effect = build_ser_state(mu, var, log_bf, kl, prior_variance, null_log_marginal=float(null))
     return replace(effect, diagnostics=diag), key
+
+
+def _sampled_draws(data, state, effects, key, intercept_var):
+    """The draws of the sampled kernel for an update whose offset is `effects` (plus the
+    shared intercept's N(0, intercept_var) and the random intercept), and the variance
+    keywords `glm_sampled_ser` takes with them: none for the vanilla variate; the marginal
+    offset variance (the current message variance plus the Gaussian terms: the variate's
+    reference, so its expectation is gIBSS-GO at that variance) and the within-configuration
+    variance for the Rao-Blackwellized one."""
+    fs = state.family_state
+    sm = fs.response.smoother
+    ri = _ri_var(state)
+    draws = sample_offset_deviations(
+        key, data.op, effects, sm.n_samples, intercept_var, ri,
+        rao_blackwellize=sm.rao_blackwellize,
+    )
+    if not sm.rao_blackwellize:
+        return draws, {}
+    n = jnp.shape(jnp.asarray(data.y))[0]
+    ov = jnp.asarray(state.total_message.var) + intercept_var + ri
+    return draws, dict(
+        offset_var=jnp.broadcast_to(ov, (n,)),
+        within_var=within_offset_variance(data.op, effects, intercept_var, ri),
+    )
 
 
 def _intercept_sampled(data, state):
@@ -1979,16 +2009,16 @@ def _intercept_sampled(data, state):
     n = jnp.shape(jnp.asarray(data.y))[0]
     effects = [(e.alpha, e.mu, e.var) for e in state.single_effects]
     key, sub = jax.random.split(_sample_key(fs))
-    dev = sample_offset_deviations(sub, data.op, effects, sm.n_samples, 0.0, _ri_var(state))
+    draws, variances = _sampled_draws(data, state, effects, sub, 0.0)  # own factor excluded
     total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
     total_mean = jnp.broadcast_to(jnp.asarray(total_mean, dtype=jnp.float64), (n,))
     m0 = jnp.asarray(fs.intercept_value, dtype=jnp.float64).reshape(1)
     v0 = jnp.asarray(fs.intercept_var, dtype=jnp.float64).reshape(1)
     v0 = jnp.where(v0 > 0, v0, 1.0)
     m, v, _, _, _, _ = glm_sampled_ser(
-        as_operator(jnp.ones((n, 1))), _response_aux(data), total_mean, dev,
-        fs.intercept_prior_variance, fs.response.base, (m0, v0),
-        order=sm.order, n_iter=sm.n_iter, tol=sm.tol,
+        as_operator(jnp.ones((n, 1))), _response_aux(data), total_mean, draws,
+        fs.intercept_prior_variance, sm.gaussian_response(fs.response.base), (m0, v0),
+        order=sm.order, n_iter=sm.n_iter, tol=sm.tol, **variances,
     )
     return m, v.reshape(1, 1), key
 

@@ -47,11 +47,14 @@ FIXED = dict(estimate_prior_variance=False, prior_variance=1.0)
 
 
 # --------------------------------------------------------------- Gaussian = linear SuSiE
+@pytest.mark.parametrize("method", ["sampled_cavi", "sampled_cavi_rb"])
 @pytest.mark.parametrize("layout", ["dense", "bcoo", "bcoo_centered"])
-def test_gaussian_family_is_exactly_linear_susie(layout):
+def test_gaussian_family_is_exactly_linear_susie(layout, method):
     """With a quadratic log likelihood the control-variate remainder is b-free and
     feature-free, so the sampled kernel returns the linear SuSiE update to roundoff -- for
-    any draws (here two per update) -- and the whole fit matches method='linear'."""
+    any draws (here two per update) -- and the whole fit matches method='linear'. Both
+    variates: the vanilla (gIBSS) and the Rao-Blackwellized (gIBSS-GO) control variates
+    are b-free there too."""
     rng = np.random.default_rng(1)
     X, beta = _design(rng, n=160, p=9, idx=[1, 6], val=[1.5, -1.0])
     if layout != "dense":
@@ -61,9 +64,7 @@ def test_gaussian_family_is_exactly_linear_susie(layout):
     center = layout == "bcoo_centered"
     kw = dict(L=3, max_iter=25, tol=1e-12, center=center, **FIXED)
     ref = fit_glm_susie(Xin, y, method="linear", **kw)
-    smp = fit_glm_susie(
-        Xin, y, method="sampled_cavi", family="gaussian", offset_samples=2, **kw
-    )
+    smp = fit_glm_susie(Xin, y, method=method, family="gaussian", offset_samples=2, **kw)
     np.testing.assert_allclose(np.asarray(smp.alpha), np.asarray(ref.alpha), atol=1e-11)
     np.testing.assert_allclose(np.asarray(smp.mu), np.asarray(ref.mu), atol=1e-11)
     np.testing.assert_allclose(_stack(smp, "var"), _stack(ref, "var"), atol=1e-11)
@@ -149,9 +150,82 @@ def test_no_draw_spread_reduces_to_plugin_gaussian_vi():
     np.testing.assert_allclose(np.asarray(lbf), np.asarray(lbf_ref), atol=1e-7)
 
 
+# ------------------------------------------------------------- Rao-Blackwellized variate
+def test_rb_degenerate_draws_reduce_to_gaussian_offset_kernel():
+    """With a single configuration of probability one the RB draw is deterministic (d = 0,
+    dvar = 0, within = marginal variance) and the kernel IS the Gaussian-offset SER: the
+    `vi` kernel on the probit-mixture-smoothed family at the same per-row variance
+    (gIBSS-GO's effect update)."""
+    from gibss.response import ProbitMixture
+    from gibss.response_ser import glm_vi_ser
+
+    rng = np.random.default_rng(12)
+    X, beta = _design(rng, n=200, p=7, idx=[1], val=[1.4])
+    y = (rng.uniform(size=X.shape[0]) < _sigmoid(X @ beta - 0.4)).astype(float)
+    offset = 0.3 * rng.standard_normal(X.shape[0])
+    V = jnp.asarray(0.2 + 0.3 * rng.uniform(size=X.shape[0]))
+    op = as_operator(jnp.asarray(X))
+    resp = Smoothed(Bernoulli(), ProbitMixture(order=8))
+    m_go, v_go, lbf_go, _ = glm_vi_ser(op, (jnp.asarray(y), V), jnp.asarray(offset), 1.0, resp)
+    z = jnp.zeros((1, X.shape[0]))
+    m, v, lbf, *_ = glm_sampled_ser(
+        op, jnp.asarray(y), jnp.asarray(offset), (z, z), 1.0, resp,
+        (jnp.zeros(7), jnp.ones(7)), order=15, n_iter=200, tol=1e-12,
+        offset_var=V, within_var=V,
+    )
+    np.testing.assert_allclose(np.asarray(m), np.asarray(m_go), atol=1e-9)
+    np.testing.assert_allclose(np.asarray(v), np.asarray(v_go), rtol=1e-7)
+    np.testing.assert_allclose(np.asarray(lbf), np.asarray(lbf_go), atol=1e-9)
+
+
+def test_rb_is_closer_to_exact_cavi_than_vanilla_at_equal_draws():
+    """The RB variate spends its draws on the non-Gaussian part of the offset law only, so
+    at one draw per update it sits much nearer the exact Q2 CAVI fixed point than the
+    vanilla variate (which also samples the Gaussian within-configuration spread)."""
+    rng = np.random.default_rng(13)
+    X, beta = _design(rng, n=200, p=8, idx=[2, 5], val=[1.6, -1.2])
+    y = (rng.uniform(size=X.shape[0]) < _sigmoid(X @ beta - 0.4)).astype(float)
+    kw = dict(L=2, max_iter=15, **FIXED)
+    exact = fit_glm_susie(X, y, method="cf_cavi_spectral", tol=1e-10, **kw)
+    mu_ex = np.asarray(exact.mu)
+
+    def err(st):
+        return float(np.max(np.abs(np.asarray(st.mu) - mu_ex)))
+
+    e_va, e_rb = [], []
+    for seed in range(3):
+        e_va.append(err(fit_glm_susie(X, y, method="sampled_cavi", seed=seed, **kw)))
+        rb = fit_glm_susie(X, y, method="sampled_cavi_rb", seed=seed, **kw)
+        e_rb.append(err(rb))
+        assert float(np.max(rb.single_effects[0].diagnostics["sample_var"])) == 0.0  # S = 1
+    assert np.mean(e_rb) < 0.5 * np.mean(e_va)
+    assert max(e_rb) < 2e-2
+    assert exact.family_state.intercept_var > 0  # the intercept's spread is integrated
+
+
+def test_rb_object_escape_and_scheme_validation():
+    from gibss.response import GH
+
+    rng = np.random.default_rng(14)
+    X, beta = _design(rng, n=60, p=4, idx=[0], val=[1.0])
+    y = (rng.uniform(size=X.shape[0]) < _sigmoid(X @ beta)).astype(float)
+    sm = SampledOffset(rao_blackwellize=True, gaussian_scheme=GH(order=7))
+    st = fit_glm_susie(
+        X, y, L=1, max_iter=2, family=Smoothed(Bernoulli(), sm),
+        variational_family="gaussian", **FIXED,
+    )
+    assert np.all(np.isfinite(np.asarray(st.mu)))
+    assert isinstance(sm.gaussian_response(Bernoulli()).smoother, GH)
+    with pytest.raises(TypeError, match="gaussian_scheme"):
+        SampledOffset(rao_blackwellize=True, gaussian_scheme=3)
+    with pytest.raises(ValueError, match="variational_family='gaussian'"):
+        fit_glm_susie(X, y, offset_integration="sampled_rb")
+
+
 # ------------------------------------------------------------------------ layouts, seeds
+@pytest.mark.parametrize("method", ["sampled_cavi", "sampled_cavi_rb"])
 @pytest.mark.parametrize("center", [False, True])
-def test_dense_and_sparse_agree(center):
+def test_dense_and_sparse_agree(center, method):
     """A 0/1 design fit dense and as BCOO (centered: the off-support rows go through the
     Chebyshev background surrogate) gives the same fit at the same seed."""
     rng = np.random.default_rng(5)
@@ -161,8 +235,8 @@ def test_dense_and_sparse_agree(center):
     beta[3] = 1.5
     y = (rng.uniform(size=n) < _sigmoid(X @ beta - 0.3)).astype(float)
     kw = dict(L=2, max_iter=6, center=center, seed=7, **FIXED)
-    d = fit_glm_susie(X, y, method="sampled_cavi", **kw)
-    s = fit_glm_susie(jsparse.BCOO.fromdense(jnp.asarray(X)), y, method="sampled_cavi", **kw)
+    d = fit_glm_susie(X, y, method=method, **kw)
+    s = fit_glm_susie(jsparse.BCOO.fromdense(jnp.asarray(X)), y, method=method, **kw)
     np.testing.assert_allclose(np.asarray(s.alpha), np.asarray(d.alpha), atol=1e-10)
     np.testing.assert_allclose(np.asarray(s.mu), np.asarray(d.mu), atol=1e-10)
     assert abs(s.family_state.intercept_value - d.family_state.intercept_value) < 1e-10
@@ -204,19 +278,20 @@ def test_sampled_deviations_have_zero_mean_under_q():
 
 
 # ---------------------------------------------------------------- families, ELBO, errors
-def test_other_families_and_elbo_run():
+@pytest.mark.parametrize("method", ["sampled_cavi", "sampled_cavi_rb"])
+def test_other_families_and_elbo_run(method):
     rng = np.random.default_rng(9)
     X, beta = _design(rng, n=120, p=5, idx=[0], val=[0.8])
     kw = dict(L=2, max_iter=3, **FIXED)
     yp = rng.poisson(np.exp(X @ beta - 0.5))
-    stp = fit_glm_susie(X, yp, method="sampled_cavi", family="poisson", **kw)
+    stp = fit_glm_susie(X, yp, method=method, family="poisson", **kw)
     assert np.all(np.isfinite(np.asarray(stp.mu)))
     trials = rng.integers(1, 6, size=X.shape[0])
     yb = rng.binomial(trials, _sigmoid(X @ beta))
-    stb = fit_glm_susie(X, yb, method="sampled_cavi", trials=trials, **kw)
+    stb = fit_glm_susie(X, yb, method=method, trials=trials, **kw)
     assert np.all(np.isfinite(np.asarray(stb.mu)))
     yl = (rng.uniform(size=X.shape[0]) < _sigmoid(X @ beta)).astype(float)
-    st = fit_glm_susie(X, yl, method="sampled_cavi", **kw)
+    st = fit_glm_susie(X, yl, method=method, **kw)
     data = glm.prep_data(X, yl, center=True)
     assert np.isfinite(compute_elbo(data, st))
 

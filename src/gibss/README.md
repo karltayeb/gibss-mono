@@ -22,6 +22,10 @@
 >   One kernel for every family: exactly linear SuSiE on `family="gaussian"`, an unbiased
 >   stochastic version of the exact Q2 CAVI update on a GLM, about (1 + S) times the
 >   plug-in kernel's cost. It redraws every sweep, so `max_iter` is its budget.
+>   `method="sampled_cavi_rb"` is the Rao-Blackwellized variant: only the configuration
+>   is drawn, the Gaussian part is integrated through the family's Gaussian-offset
+>   smoother, and the control variate is gIBSS-GO instead of gIBSS, so the draws go to
+>   the offset law's non-Gaussian part alone (one GO pass per draw).
 >   Fixed covariates: `covariates=Z` (dense (n, k)) adjusts for Z with one Gaussian
 >   nuisance factor over (intercept, gamma) -- shared-intercept mode, plug-in and
 >   exact Q2 CAVI, dense and sparse X; also on `cox_poisson.fit_cox_susie`.

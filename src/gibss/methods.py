@@ -157,6 +157,13 @@ _SMOOTHERS = {
     # identically there), an unbiased stochastic update of the exact Q2 CAVI target on a
     # GLM, at roughly (1 + offset_samples) times the plug-in kernel's cost.
     "sampled": lambda cfg: SampledOffset(n_samples=cfg["offset_samples"]),
+    # sampled_rb: the Rao-Blackwellized variate -- draw the configuration only, integrate
+    # the Gaussian b | gamma (and the intercept) through the family's Gaussian-offset
+    # smoother, control variate = the moment-matched Gaussian offset (gIBSS-GO). The draws
+    # are spent on the offset law's non-Gaussian part alone; one GO pass per draw.
+    "sampled_rb": lambda cfg: SampledOffset(
+        n_samples=cfg["offset_samples"], rao_blackwellize=True
+    ),
 }
 
 _DEFAULTS = {
@@ -229,6 +236,9 @@ PRESETS = {
     # (`offset_samples` draws per update, default 1) around the plug-in point as control
     # variate; exactly linear SuSiE on family='gaussian' (see `sampled_offset`).
     "sampled_cavi": {"variational_family": "gaussian", "offset_integration": "sampled"},
+    # the same with the Rao-Blackwellized variate: gIBSS-GO plus an unbiased estimate of
+    # gIBSS-GO's error (the configuration is drawn, the Gaussian part integrated).
+    "sampled_cavi_rb": {"variational_family": "gaussian", "offset_integration": "sampled_rb"},
     # exact free-form CAVI in Q1 through the CF product over the node laws (the CF
     # replacement for offset_integration="compress_selfnorm").
     "cf_cavi_q1": {"variational_family": "unconstrained", "offset_integration": "cf"},
@@ -323,21 +333,21 @@ def _resolve(cfg):
                 f"unknown offset_integration {integ!r}; "
                 f"options: {['none', *sorted(_SMOOTHERS)]}"
             )
-        elif integ == "sampled":
+        elif integ in ("sampled", "sampled_rb"):
             # stochastic CAVI in Q2 by the sampled-offset kernel (SampledOffset): Gaussian q
             # only; every base family, the Gaussian included (there the update is exactly
             # linear SuSiE's: the sampled terms vanish identically, see `sampled_offset`).
             if vfam != "gaussian":
                 raise ValueError(
-                    "offset_integration='sampled' is a Q2 update; it needs "
+                    f"offset_integration={integ!r} is a Q2 update; it needs "
                     "variational_family='gaussian'."
                 )
             if cfg["intercept"] == "profiled":
                 raise ValueError(
-                    "offset_integration='sampled' supports intercept='shared' or 'null', "
+                    f"offset_integration={integ!r} supports intercept='shared' or 'null', "
                     "not 'profiled'."
                 )
-            return Smoothed(base, _SMOOTHERS["sampled"](cfg)), "vi_gh"
+            return Smoothed(base, _SMOOTHERS[integ](cfg)), "vi_gh"
         elif fam == "gaussian":
             raise ValueError(
                 "family='gaussian' has a quadratic cumulant: offset integration "
