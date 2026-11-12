@@ -1980,6 +1980,9 @@ _PG_MIXTURES = {
 }
 
 
+_INV_SQRT_2PI = 1.0 / np.sqrt(2.0 * np.pi)
+
+
 def _mixture_table(table, order, name):
     if order not in table:
         raise ValueError(f"{name}: order must be one of {sorted(table)}; got {order!r}")
@@ -2024,20 +2027,27 @@ class ProbitMixture(_LogisticMixtureBase):
     def __post_init__(self):
         _mixture_table(_PROBIT_MIXTURES, self.order, "ProbitMixture")
 
+    def _components(self, eta, var):
+        """Per component k: `(pi_k, q_k = s_k / r_k, z_k, Phi(z_k), phi(z_k))` at offset
+        variance `var`. A Python loop over the K components rather than a stacked (K, ...)
+        axis: callers reduce the terms over rows in one fused pass
+        (`DenseOperator.local_moments`), and XLA fuses K elementwise accumulations into it
+        but not a nested sum over a stacked axis (2x slower at K = 8)."""
+        s_tab, pi_tab, _ = _mixture_table(_PROBIT_MIXTURES, self.order, "ProbitMixture")
+        var = jnp.asarray(var)
+        for s, pi in zip(s_tab, pi_tab):
+            q = s / jnp.sqrt(1.0 + s * s * var)
+            z = q * eta
+            yield pi, q, z, _ndtr(z), jnp.exp(-0.5 * z * z) * _INV_SQRT_2PI
+
     def terms(self, base, eta, aux):
         y, ov = aux
         y, scale = base.unpack(y)  # scale: per-row trial count (1 for Bernoulli)
-        s, pi, _ = _mixture_table(_PROBIT_MIXTURES, self.order, "ProbitMixture")
-        lead = (-1,) + (1,) * jnp.ndim(eta)
-        s = jnp.asarray(s).reshape(lead)
-        pi = jnp.asarray(pi).reshape(lead)
-        r = jnp.sqrt(1.0 + s**2 * jnp.asarray(ov)[None, ...])
-        z = s * eta[None, ...] / r
-        cdf = _ndtr(z)
-        pdf = jnp.exp(-0.5 * z * z) / jnp.sqrt(2.0 * jnp.pi)
-        ahat = jnp.sum(pi * (r / s) * (z * cdf + pdf), 0)
-        a1 = jnp.sum(pi * cdf, 0)
-        a2 = jnp.sum(pi * (s / r) * pdf, 0)
+        ahat = a1 = a2 = 0.0
+        for pi, q, z, cdf, pdf in self._components(eta, ov):
+            ahat = ahat + pi * (z * cdf + pdf) / q
+            a1 = a1 + pi * cdf
+            a2 = a2 + pi * q * pdf
         return y * eta - scale * ahat, y - scale * a1, scale * a2
 
     def integrated_terms(self, base, eta, aux, ve):
@@ -2057,21 +2067,14 @@ class ProbitMixture(_LogisticMixtureBase):
         needs the kernel's full order."""
         y, ov = aux
         y, scale = base.unpack(y)
-        s, pi, _ = _mixture_table(_PROBIT_MIXTURES, self.order, "ProbitMixture")
-        lead = (-1,) + (1,) * jnp.ndim(eta)
-        s = jnp.asarray(s).reshape(lead)
-        pi = jnp.asarray(pi).reshape(lead)
         ve = jnp.asarray(ve)
-        r = jnp.sqrt(1.0 + s**2 * (jnp.asarray(ov) + ve)[None, ...])
-        z = s * eta[None, ...] / r
-        cdf = _ndtr(z)
-        pdf = jnp.exp(-0.5 * z * z) / jnp.sqrt(2.0 * jnp.pi)
-        q = s / r
-        ahat = jnp.sum(pi * (z * cdf + pdf) / q, 0)
-        a1 = jnp.sum(pi * cdf, 0)
-        a2 = jnp.sum(pi * q * pdf, 0)
-        a3 = -jnp.sum(pi * q**2 * z * pdf, 0)
-        a4 = jnp.sum(pi * q**3 * (z * z - 1.0) * pdf, 0)
+        ahat = a1 = a2 = a3 = a4 = 0.0
+        for pi, q, z, cdf, pdf in self._components(eta, jnp.asarray(ov) + ve):
+            ahat = ahat + pi * (z * cdf + pdf) / q
+            a1 = a1 + pi * cdf
+            a2 = a2 + pi * q * pdf
+            a3 = a3 - pi * q**2 * z * pdf
+            a4 = a4 + pi * q**3 * (z * z - 1.0) * pdf
         return (
             y * eta - scale * ahat,
             y - scale * a1,
