@@ -69,6 +69,7 @@ from .response import (
     Binomial,
     Compress,
     CompressSelfNorm,
+    JJEnvelope,
     NegativeBinomial,
     Poisson,
     PoissonGamma,
@@ -1239,6 +1240,68 @@ def _intercept_gaussian(data, state, order=15, n_iter=50, tol=1e-8):
     )
 
 
+@partial(jax.jit, static_argnames=("response", "n_iter", "tol"))
+def _intercept_vi_solve(W, total_mean, aux, inv_tau, m_init, response, n_iter, tol):
+    """Gaussian-VI Newton solve for the shared factor q = N(m, V) over `W = [1 | Z]` under
+    a single-Gaussian scheme, the "vi" kernel's merge applied to the factor: row i sees
+    w_i' (b0, gamma) ~ N(w_i' m, w_i' V w_i), independent of the offset N(0, ov_i), so the
+    expectation is the scheme itself at variance `w_i' V w_i + ov_i` (no quadrature over
+    the factor). Newton on m against the smoothed score plus the prior; V = (W' diag(E w)
+    W + I/tau)^-1 (Price). `aux = (y, ov)`; ov = 0 under the point law. Returns (m, V)."""
+    y, ov = aux
+
+    def smoothed(m, V):
+        rv = jnp.sum((W @ V) * W, axis=1)  # (n,) w_i' V w_i
+        _, g, w = response.terms(total_mean + W @ m, (y, rv + ov))
+        return g, w
+
+    def body(s):
+        m, V, _, it = s
+        g, w = smoothed(m, V)
+        H = _nuisance_hessian(W, w, inv_tau)
+        step = _clip_step(W, jnp.linalg.solve(H, W.T @ g - inv_tau * m))
+        return m + step, jnp.linalg.inv(H), jnp.max(jnp.abs(step)), it + 1
+
+    d = W.shape[1]
+    _, w0 = smoothed(m_init, jnp.zeros((d, d)))
+    V0 = jnp.linalg.inv(_nuisance_hessian(W, w0, inv_tau))
+    m, V, _, _ = jax.lax.while_loop(
+        lambda s: (s[3] < n_iter) & (s[2] > tol), body, (m_init, V0, jnp.inf, 0)
+    )
+    return m, V
+
+
+def _intercept_vi(data, state, n_iter=50, tol=1e-8):
+    """Shared-factor strategy of the "vi" kernel: Gaussian VI for q(b0, gamma) = N(m, V)
+    under the fit's offset law, as the effects are solved. The offset is every effect plus
+    the random intercept, at N(mean, ov) under offset_law="gaussian" and at its mean
+    (ov = 0, the mean-only message) under "point"; the factor's own spread is integrated
+    in both, merged with the offset into one Gaussian. Returns (m, V)."""
+    fs = state.family_state
+    W, has_icpt = _nuisance_design(data, fs)
+    inv_tau = 1.0 / fs.intercept_prior_variance
+    total_mean = jnp.asarray(state.total_message.mean) + fs.glm_offset + _ri_mean(fs)
+    y, ov = _aux(data, state, include_intercept_var=False)
+    return _intercept_vi_solve(
+        W, total_mean, (y, jnp.asarray(ov)), jnp.asarray(inv_tau),
+        _nuisance_init(fs, has_icpt), fs.response, n_iter, tol,
+    )
+
+
+def _vi_merged_intercept(fs):
+    """Does the shared factor take the "vi" kernel's merged Gaussian-VI update? Yes for a
+    single-Gaussian scheme (GH, the logistic mixtures, Taylor, MacKay, LogNormal), whose
+    terms read `(y, variance)`; the JJ bound and the Poisson-Gamma augmentation keep their
+    own intercept routes."""
+    sm = getattr(fs.response, "smoother", None)
+    return (
+        fs.kernel == "vi"
+        and sm is not None
+        and not sm.takes_row_param
+        and not isinstance(sm, (JJEnvelope, PoissonGamma))
+    )
+
+
 def _intercept_point(data, state):
     """Shared-factor strategy -- plug-in point/Laplace (classic gIBSS), kernel-agnostic.
     Concave MAP Newton for (b0, gamma) over the nuisance design W = [1 | Z] on the
@@ -1389,7 +1452,12 @@ def _estimate_shared_intercept(data, state):
         # the sampled kernel on the ones column; it advances the fit's PRNG key
         m, V, key = _intercept_sampled(data, state)
         return {**_nuisance_fields(data, fs, m, V), "offset_sample_key": key}
-    fit = _intercept_gaussian if mode in ("q2", "q2_plugin") else _intercept_point
+    if _vi_merged_intercept(fs):
+        fit = _intercept_vi
+    elif mode in ("q2", "q2_plugin"):
+        fit = _intercept_gaussian
+    else:
+        fit = _intercept_point
     m, V = fit(data, state)
     return _nuisance_fields(data, fs, m, V)
 

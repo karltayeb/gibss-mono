@@ -66,14 +66,44 @@ def test_gh_and_probit_mixture_agree_under_each_law(data):
 
 
 def test_point_gh_is_the_plugin_q2_fit(data):
-    # with the intercept frozen at the null fit, the merged GH(15) at x^2 v equals GH(15)
-    # over b on the plain base (the vi_gh plug-in kernel): same integral, other solver
+    # the merged GH(15) at x^2 v equals GH(15) over b on the plain base (the vi_gh plug-in
+    # kernel), and both fit q(b0) by Gaussian VI at the effects' means: one fit, two solvers
     X, y = data
-    kw = {**G, "intercept": "null"}
-    merged = fit_glm_susie(X, y, offset_integration="gh", offset_law="point", **kw)
-    vi_gh = fit_glm_susie(X, y, offset_integration="none", **kw)
+    merged = fit_glm_susie(X, y, offset_integration="gh", offset_law="point", **G)
+    vi_gh = fit_glm_susie(X, y, offset_integration="none", **G)
     assert merged.family_state.kernel == "vi" and vi_gh.family_state.kernel == "vi_gh"
     assert _gap(merged, vi_gh) < 1e-6
+    fm, fv = merged.family_state, vi_gh.family_state
+    assert abs(fm.intercept_value - fv.intercept_value) < 1e-7
+    assert abs(fm.intercept_var - fv.intercept_var) < 1e-9
+
+
+@pytest.mark.parametrize("law", ["point", "gaussian"])
+def test_intercept_is_gaussian_vi_under_the_law(data, law):
+    # q(b0) = N(m0, v0) is the Gaussian-VI stationary point of the merged expectation:
+    # the loglik at eta_i = mean_i + m0 under N(0, v0 + ov_i), ov_i the effects' and the
+    # random intercept's variance under "gaussian", 0 under "point". Checked against an
+    # independent GH(100) on the Bernoulli loglik.
+    X, y = data
+    s = fit_glm_susie(X, y, **PM, offset_law=law, random_intercept=True,
+                      random_intercept_variance=0.5, **G)
+    fs = s.family_state
+    assert glm._vi_merged_intercept(fs)
+    # re-solve q(b0) against the final effects (the sweep moved them after its last solve)
+    m, V = glm._intercept_vi(glm.prep_data(X, y, center=True), s)
+    m0, v0 = float(m[0]), float(V[0, 0])
+    assert abs(m0 - fs.intercept_value) < 1e-4  # and the fit is near that point
+    ov = np.asarray(glm._offset_var(s, include_intercept_var=False))
+    assert (np.min(ov) > 0) == (law == "gaussian")
+    mean = np.asarray(s.total_message.mean) + np.asarray(glm._ri_mean(fs)) + m0
+    u, w = np.polynomial.hermite.hermgauss(100)
+    eta = mean[:, None] + np.sqrt(2 * (v0 + ov))[:, None] * u[None, :]
+    sig = 1 / (1 + np.exp(-eta))
+    g = ((y[:, None] - sig) * w).sum(1) / np.sqrt(np.pi)
+    curv = (sig * (1 - sig) * w).sum(1) / np.sqrt(np.pi)
+    inv_tau = 1 / fs.intercept_prior_variance
+    assert abs(g.sum() - inv_tau * m0) < 1e-6  # the mixture's 6e-9 per row, summed
+    assert abs(1 / v0 - (curv.sum() + inv_tau)) / curv.sum() < 1e-6
 
 
 def test_dense_and_sparse_centered_agree(data):
