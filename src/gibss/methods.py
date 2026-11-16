@@ -22,7 +22,6 @@ import warnings
 from . import glm
 from .cf_offset import CharFnGaussRef, CharFnOffset, CharFnSelfNorm
 from .cf_spectral import CharFnSpectral
-from .sampled_offset import SampledOffset
 from .engine import fit_ibss, fit_ibss_greedy, warm_start_effects
 from .linear import is_bcoo
 from .negbin import estimate_null_dispersion
@@ -50,6 +49,7 @@ from .response import (
     Taylor,
     TaylorFixed,
 )
+from .sampled_offset import SampledOffset
 
 __all__ = ["PRESETS", "fit_glm_susie"]
 
@@ -177,11 +177,14 @@ _DEFAULTS = {
     "compress_degree": 48,  # Chebyshev degree M for the compress/cf offset tables
     "spectral_reference": "null",  # cf_spectral residual reference: "null" | "plugin" | "gaussian"
     "offset_samples": 1,  # sampled: configurations of the other effects drawn per update
+    # the law of the random offset a single-Gaussian scheme integrates: None = the scheme's
+    # own ("gaussian" for a smoother, the plug-in mean for "none"); "point" puts EVERY
+    # offset component at its mean (other effects, intercept/covariates, random intercept)
+    "offset_law": None,
     "background": "exact",  # "exact" | "chebyshev" (profiled or centered kernels; the
     # front door resolves this adaptively by layout when the user leaves it unspecified)
     # preset-only knobs (no public argument; reachable via method=)
     "_anchor": "update",  # taylor_fixed expansion anchor: "update" | "null"
-    "_mean_message": False,  # working-model mode: drop the message variance
     "_adjusted_target": "gh",  # adjusted targets E_o A^(k)(z + o): "gh" | "taylor"
     "_adjusted_rule": "one_point",  # adjusted matching rule: "one_point" | "two_point" | "null"
 }
@@ -281,7 +284,7 @@ PRESETS = {
         "variational_family": "gaussian",
         "offset_integration": "jj",
     },
-    "irls": {"offset_integration": "taylor_fixed", "_mean_message": True},
+    "irls": {"offset_integration": "taylor_fixed", "offset_law": "point"},
     "score": {
         "offset_integration": "taylor_fixed",
         "_anchor": "null",
@@ -492,6 +495,35 @@ def _resolve(cfg):
     return response, "vi"
 
 
+# schemes indexed by the offset variance alone (pointwise, one Gaussian): `offset_law`
+# chooses that variance. The rest fix their own law (CAVI tables, sampled, spectral,
+# augmentations, the JJ kernels, adjusted's targets) and reject it.
+_LAW_SCHEMES = (
+    "none", "gh", "taylor2", "lognormal", "mackay", "probit_mixture", "pg_mixture",
+    "taylor_fixed",
+)
+
+
+def _check_offset_law(cfg):
+    """Validate `offset_law` against the resolved scheme (see `fit_glm_susie`)."""
+    law, integ = cfg["offset_law"], cfg["offset_integration"]
+    if law is None:
+        return
+    if law not in ("point", "gaussian"):
+        raise ValueError(f"offset_law must be 'point' or 'gaussian'; got {law!r}.")
+    if integ not in _LAW_SCHEMES:
+        raise ValueError(
+            f"offset_law applies to the single-Gaussian schemes {list(_LAW_SCHEMES)}; "
+            f"offset_integration={integ!r} fixes its own offset law (for the spectral "
+            "kernel pick method='spectral_point_offset' / 'spectral_gaussian_offset')."
+        )
+    if law == "gaussian" and integ == "none":
+        raise ValueError(
+            "offset_law='gaussian' needs a scheme to integrate the offset: set "
+            "offset_integration (e.g. 'gh' or 'probit_mixture')."
+        )
+
+
 def _resolve_dispersion(dispersion, y, offset, covariates):
     """The NegativeBinomial plug-in r as a positive float or (n,) array: estimated under the
     null model for None / "null", validated otherwise."""
@@ -509,7 +541,9 @@ def _resolve_dispersion(dispersion, y, offset, covariates):
             )
         return est.dispersion
     if isinstance(dispersion, str):
-        raise ValueError(f"dispersion must be 'null', a number or an (n,) array; got {dispersion!r}")
+        raise ValueError(  # noqa: TRY004 - a str other than "null" is a bad value
+            f"dispersion must be 'null', a number or an (n,) array; got {dispersion!r}"
+        )
     r = _np.asarray(dispersion, dtype=float)
     if r.ndim == 1 and r.shape[0] != _np.shape(y)[0]:
         raise ValueError(
@@ -538,6 +572,7 @@ def fit_glm_susie(
     mixture_order=None,
     background=None,
     offset_samples=None,  # sampled: configurations of the other effects drawn per update
+    offset_law=None,  # "point" | "gaussian": the offset law of a single-Gaussian scheme (below)
     # plain values (no preset interaction, ordinary defaults)
     seed=0,  # PRNG seed of the sampled-offset update (offset_integration='sampled')
     center=None,  # pre-center columns; None = on wherever supported (see below)
@@ -604,6 +639,23 @@ def fit_glm_susie(
     quadrature, convex at every variance, mean error within 0.016 of the exact offset.
     For the Poisson family offset_integration="lognormal" is the exact single-Gaussian
     offset, e^{eta + ov/2}, closed form and certified; "gh" only approximates it.
+
+    `offset_law` picks the law a single-Gaussian scheme integrates the random offset
+    under. "gaussian" (the default for every scheme) is N(mean, ov): the other effects'
+    message variance plus the shared intercept's/covariates' and the random intercept's.
+    "point" puts EVERY one of them at its mean (ov = 0). With
+    variational_family="gaussian" the effect b ~ N(m, v) and the offset merge into one
+    Gaussian of per-entry variance x^2 v + ov, integrated once per entry by the scheme
+    (the "vi" kernel, no quadrature over b), so the two laws are gIBSS and gIBSS-GO in
+    the Gaussian family, by GH on the true cumulant or exactly on the probit mixture:
+
+        fit_glm_susie(X, y, variational_family="gaussian", offset_integration="gh",
+                      offset_law="point")             # gIBSS, GH(15) on the true loglik
+        fit_glm_susie(X, y, variational_family="gaussian",
+                      offset_integration="probit_mixture", mixture_order=8)  # gIBSS-GO
+
+    The CAVI / sampled / spectral / augmentation schemes fix their own offset law (e.g.
+    method="spectral_point_offset"), so `offset_law` is rejected there.
     Axis arguments not consulted by the resolved configuration are ignored (tuning
     knobs), but combinations implying a wrong model are rejected -- see `_resolve`.
 
@@ -648,6 +700,7 @@ def fit_glm_susie(
             "mixture_order": mixture_order,
             "background": background,
             "offset_samples": offset_samples,
+            "offset_law": offset_law,
         }.items()
         if v is not None
     }
@@ -670,6 +723,7 @@ def fit_glm_susie(
         cfg["family"] = "negative_binomial"  # likewise dispersion= means NegativeBinomial
 
     response, kernel = _resolve(cfg)
+    _check_offset_law(cfg)
     base = response.base if isinstance(response, Smoothed) else response
     if isinstance(base, NegativeBinomial):
         if trials is not None:
@@ -742,7 +796,9 @@ def fit_glm_susie(
         X, y, center=center, n_trials=trials, covariates=covariates, dispersion=dispersion
     )
     init = (
-        glm.initialize_state_mean_message if cfg["_mean_message"] else glm.initialize_state
+        glm.initialize_state_mean_message
+        if cfg["offset_law"] == "point"
+        else glm.initialize_state
     )
     greedy = L == "auto"
     L_alloc = (min(20, X.shape[1]) if max_L is None else int(max_L)) if greedy else int(L)
