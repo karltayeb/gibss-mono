@@ -129,3 +129,16 @@ def test_irls_is_the_point_law(data):
     X, y = data
     s = fit_glm_susie(X, y, method="irls", L=2, max_iter=3)
     assert isinstance(s.total_message, MeanMessage)
+
+
+def test_point_gh_matches_plugin_q2_with_covariates(data):
+    # the merged Gaussian-VI factor over W = [1 | Z] (d x d V) against vi_gh's GH solve
+    X, y = data
+    Z = np.random.default_rng(7).normal(size=(X.shape[0], 2))
+    merged = fit_glm_susie(X, y, offset_integration="gh", offset_law="point",
+                           covariates=Z, **G)
+    vi_gh = fit_glm_susie(X, y, offset_integration="none", covariates=Z, **G)
+    assert _gap(merged, vi_gh) < 1e-6
+    fm, fv = merged.family_state, vi_gh.family_state
+    np.testing.assert_allclose(fm.covariate_mean, fv.covariate_mean, atol=1e-7)
+    np.testing.assert_allclose(fm.nuisance_cov, fv.nuisance_cov, atol=1e-9)
